@@ -34,6 +34,20 @@ default:
   interruptible: true
   tags:
   - company
+  # Share Zig's local cache (build artifacts + fetched deps) across
+  # jobs on the same branch. `key` is the branch slug so feature
+  # branches do not contaminate each other's caches; `policy:
+  # pull-push` lets every job reuse the cache and push updates back
+  # for the next job. The `.zig-cache/` directory is the only thing
+  # we need to round-trip: it holds compiled object files and the
+  # fetched contents of build.zig.zon dependencies (wal, uuid,
+  # thread_pool), so re-runs avoid re-cloning and re-compiling the
+  # dep set.
+  cache:
+    key: "$CI_COMMIT_REF_SLUG"
+    paths:
+    - .zig-cache/
+    policy: pull-push
 
 include:
   # Security scanning
@@ -56,11 +70,17 @@ include:
     paths: "src/ tests/ examples/ benchmarks/"
 
   # Zig build (Linux): static lib + CLI + check-compile.
+  # `build_options: "build"` runs the actual `zig build` step which
+  # links the static lib + CLI artifact (the default step graph also
+  # exercises the type-check pass). The previous value `"build check"`
+  # was shell-split into two args and resolved to only the `check`
+  # step under the catalog wrapper, so no artifact was actually being
+  # produced or verified.
 - component: gitlab.com/devnw/ci-catalog/zig-build@v1.22.0
   inputs:
     stage: build
     zig_version: "0.16.0"
-    build_options: "build check"
+    build_options: "build"
 
   # Zig tests — Linux matrix across optimize modes + integration + stress.
 - component: gitlab.com/devnw/ci-catalog/zig-test@v1.22.0
