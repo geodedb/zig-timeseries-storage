@@ -129,6 +129,14 @@ pub const Compactor = struct {
 
             try writer.writeBlock(series_id, merged_points.items);
         }
+
+        // Durability ordering: the merged segment MUST be fsynced
+        // before the engine updates the manifest to reference it.
+        // We fsync here, inside the compactor, so every caller of
+        // `compactSegments` gets the guarantee uniformly. The engine
+        // then performs its manifest commit after we return. See
+        // P-IO-003 / Q-REL-008.
+        try writer.sync();
     }
 };
 

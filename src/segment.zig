@@ -119,6 +119,23 @@ pub const SegmentWriter = struct {
         self.file.close(self.io_ctx);
     }
 
+    /// Force every previously-written byte to durable storage by
+    /// issuing fsync(2) (or the platform equivalent) against the
+    /// underlying file. Callers must invoke this BEFORE the segment
+    /// is referenced from the manifest — without the fsync, a crash
+    /// between manifest commit and the kernel's background flush
+    /// would leave the manifest pointing at a segment whose blocks
+    /// have not actually hit disk yet (P-IO-003 / Q-REL-008).
+    ///
+    /// `deinit` deliberately does NOT call this for you: closing the
+    /// file is a cleanup operation, while fsyncing is a durability
+    /// operation, and the two have different semantics. The engine's
+    /// flush and compaction paths call `sync` explicitly at the
+    /// correct point in the commit ordering.
+    pub fn sync(self: *SegmentWriter) !void {
+        try self.file.sync(self.io_ctx);
+    }
+
     /// Appends a block of points for a series.
     pub fn writeBlock(self: *SegmentWriter, series_id: types.SeriesId, points: []const types.Point) !void {
         if (points.len == 0) return;
@@ -338,4 +355,33 @@ test "Segment: decodePoints refuses oversized data_len" {
     const blk = (try it.next()).?;
 
     try std.testing.expectError(error.BlockTooLarge, blk.decodePoints(allocator));
+}
+
+test "SegmentWriter.sync survives a roundtrip" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path);
+    const seg_path = try std.fmt.allocPrint(allocator, "{s}/sync.tsseg", .{path});
+    defer allocator.free(seg_path);
+
+    {
+        var w = try SegmentWriter.init(allocator, seg_path);
+        defer w.deinit();
+        try w.writeBlock(1, &.{
+            .{ .ts = 100, .value = 1 },
+            .{ .ts = 200, .value = 2 },
+        });
+        try w.sync();
+    }
+
+    // After sync + close, the reader should still see the block.
+    var r = try SegmentReader.init(allocator, seg_path);
+    defer r.deinit();
+    var it = r.iterator();
+    const blk = (try it.next()) orelse return error.MissingBlock;
+    try std.testing.expectEqual(@as(u32, 2), blk.header.stats.count);
 }

@@ -646,6 +646,13 @@ pub const Engine = struct {
             try writer.writeBlock(entry.key_ptr.*, entry.value_ptr.items);
         }
 
+        // Durability ordering: fsync the segment file BEFORE adding
+        // it to the manifest. A crash between manifest commit and the
+        // OS background flush would otherwise leave the manifest
+        // referencing a segment whose blocks have not actually
+        // landed on disk (Q-REL-008 / P-IO-003).
+        try writer.sync();
+
         {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
