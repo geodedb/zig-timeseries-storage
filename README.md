@@ -3,14 +3,33 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Zig](https://img.shields.io/badge/Zig-0.16.0+-orange.svg)](https://ziglang.org/)
 
-A Zig library for timeseries-storage
+An embedded LSM-style time-series storage engine written in Zig. Points
+are first written to a crash-safe WAL and an in-memory memtable, then
+flushed to immutable on-disk segment files; background compaction merges
+level-0 segments into larger level-1 segments to keep read amplification
+bounded. Per-block payloads are encoded with Gorilla (delta-of-delta on
+timestamps, XOR on values) for compact storage and fast scans.
 
 ## Features
 
-- **Zero dependencies**: pure Zig standard library only
 - **Library + CLI**: ships as both a Zig module and a standalone binary
+- **Crash-safe WAL** with CRC32C-protected records and per-flush checkpoints
+- **Gorilla-encoded segments** (delta-of-delta + XOR) for compact storage
+- **Background flush and compaction** on a shared thread pool
 - **Cross-platform**: Linux, macOS, Windows
 - **Well tested**: unit, integration, and stress test suites
+
+## Dependencies
+
+This engine builds on three small Zig libraries pinned in
+`build.zig.zon`; they are fetched automatically by the Zig package
+manager during the first build.
+
+| Dependency | Role |
+| ---------- | ---- |
+| [`wal`](https://gitlab.com/devnw/zig/wal) | Append-only write-ahead log with CRC-protected framing, used as the durability primitive for every mutation. |
+| [`uuid`](https://gitlab.com/devnw/zig/uuid) | Generates the per-store time-series UUID stamped into the manifest so WAL segments cannot be cross-mounted between stores. |
+| [`thread_pool`](https://gitlab.com/devnw/zig/thread-pool) | Bounded worker pool that runs background flush and compaction jobs without blocking the appender thread. |
 
 ## Installation
 
@@ -42,9 +61,39 @@ exe.root_module.addImport("timeseries_storage", timeseries_storage.module("times
 ```zig
 const std = @import("std");
 const timeseries_storage = @import("timeseries_storage");
+const thread_pool = @import("thread_pool");
 
 pub fn main() !void {
-    try timeseries_storage.init(.{ .debug = true });
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The engine submits background flush and compaction work to a
+    // caller-owned thread pool so the appender thread is never blocked
+    // by I/O. Sharing one pool across multiple engines is fine.
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 2 });
+    defer pool.deinit();
+
+    var engine = try timeseries_storage.engine.Engine.init(
+        allocator,
+        .{ .data_dir = "/var/lib/myapp/ts", .max_memtable_points = 100_000 },
+        &pool,
+    );
+    defer engine.deinit();
+
+    const series_id: timeseries_storage.types.SeriesId = 0x0000_0000_0000_0000_0000_0000_0000_0001;
+    const points = [_]timeseries_storage.types.Point{
+        .{ .ts = 1_700_000_000_000, .value = 42 },
+        .{ .ts = 1_700_000_000_100, .value = 43 },
+    };
+    try engine.appendPoints(series_id, &points);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var it = try engine.queryPoints(arena.allocator(), series_id, 1_700_000_000_000, 1_700_000_001_000);
+    while (it.next()) |pt| {
+        std.debug.print("{d} -> {d}\n", .{ pt.ts, pt.value });
+    }
 }
 ```
 

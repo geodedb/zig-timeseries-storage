@@ -3,23 +3,21 @@
 
 //! # timeseries-storage
 //!
-//! A Zig library for timeseries-storage
+//! An embedded LSM-style time-series storage engine. Every mutation is
+//! first appended to a CRC32C-protected write-ahead log and inserted
+//! into an in-memory memtable; when the memtable hits its point
+//! threshold it is rotated and a background worker flushes it to an
+//! immutable on-disk segment file. Background compaction merges
+//! level-0 segments into larger level-1 segments to keep read
+//! amplification bounded. Per-block payloads are encoded with Gorilla
+//! (delta-of-delta on timestamps, XOR on values) for compact storage
+//! and fast scans.
 //!
-//! ## Features
-//!
-//! - Feature 1
-//! - Feature 2
-//! - Feature 3
-//!
-//! ## Quick Start
-//!
-//! ```zig
-//! const timeseries_storage = @import("timeseries_storage");
-//!
-//! pub fn main() !void {
-//!     try timeseries_storage.init(.{});
-//! }
-//! ```
+//! The public surface is exposed as Zig sub-modules (`engine`,
+//! `segment`, `wal_manager`, `manifest`, `memtable`, `iterator`,
+//! `compaction`, `encoding/gorilla`, `types`); see
+//! [docs/ts-storage-spec.md](../docs/ts-storage-spec.md) for the
+//! on-disk format and [README.md](../README.md) for a Quick Start.
 //!
 //! ## License
 //!
