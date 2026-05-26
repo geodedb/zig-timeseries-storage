@@ -55,7 +55,20 @@ pub const Config = EngineConfig;
 /// the user-supplied `thread_pool.ThreadPool`. `deinit` must not be
 /// called concurrently with any other operation.
 pub const Engine = struct {
-    lock: std.Io.RwLock = std.Io.RwLock.init,
+    /// Exclusive lock protecting every other field on the struct.
+    /// Previously a `RwLock`, but the engine's shared-lock usages were
+    /// all brief reads that the lock-then-cv wait pattern needs to be
+    /// paired with a `Condition`, which `std.Io.Condition` only knows
+    /// how to pair with an `Io.Mutex`. Switching to a plain mutex
+    /// removes a class of spin loops and simplifies reasoning.
+    mu: std.Io.Mutex = std.Io.Mutex.init,
+    /// Broadcast whenever a background flush or compaction worker
+    /// clears its in-flight flag (`flushing_mem = null` or
+    /// `compaction_running = false`). Waiters in `deinit`, `flush`,
+    /// and the back-pressure branch of `appendPoints` use this to
+    /// block efficiently instead of `Thread.yield`-spinning. Pair
+    /// with `mu`.
+    done_cv: std.Io.Condition = std.Io.Condition.init,
     allocator: Allocator,
     config: EngineConfig,
     wal: wal_manager.WalManager,
@@ -152,17 +165,16 @@ pub const Engine = struct {
     pub fn deinit(self: *Engine) void {
         const io = std.Io.Threaded.global_single_threaded.io();
 
-        // Wait for all background tasks to finish
-        while (true) {
-            self.lock.lockSharedUncancelable(io);
-            const done = (self.flushing_mem == null and !self.compaction_running);
-            self.lock.unlockShared(io);
-            if (done) break;
-            std.Thread.yield() catch {};
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+
+        // Wait for all background tasks to finish. Park on the condition
+        // variable so we burn no CPU; workers broadcast it as they
+        // clear `flushing_mem` / `compaction_running`.
+        while (self.flushing_mem != null or self.compaction_running) {
+            self.done_cv.waitUncancelable(io, &self.mu);
         }
 
-        self.lock.lockUncancelable(io);
-        defer self.lock.unlock(io);
         self.wal.deinit();
         self.man.deinit();
         self.active_mem.deinit();
@@ -226,8 +238,8 @@ pub const Engine = struct {
         };
 
         const io = std.Io.Threaded.global_single_threaded.io();
-        self.lock.lockUncancelable(io);
-        defer self.lock.unlock(io);
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
 
         // Capture the assigned LSN. We do not surface it from
         // appendPoints today, but having it bound to a named local
@@ -242,10 +254,12 @@ pub const Engine = struct {
         // Write to Memtable
         try self.active_mem.insert(series_id, points);
 
+        // Back-pressure: if a flush is in flight AND we've already
+        // tripped the next-flush threshold, park on the cv until the
+        // worker clears `flushing_mem`. Burning CPU here used to
+        // contend with the worker doing the actual flush.
         while (self.active_mem.shouldFlush() and self.flushing_mem != null) {
-            self.lock.unlock(io);
-            std.Thread.yield() catch {};
-            self.lock.lockUncancelable(io);
+            self.done_cv.waitUncancelable(io, &self.mu);
         }
 
         if (self.active_mem.shouldFlush()) {
@@ -264,10 +278,11 @@ pub const Engine = struct {
         self.flushInternal() catch |err| {
             std.debug.print("Background flush failed: {any}\n", .{err});
             const io = std.Io.Threaded.global_single_threaded.io();
-            self.lock.lockUncancelable(io);
+            self.mu.lockUncancelable(io);
             if (self.flushing_mem) |*fm| fm.deinit();
             self.flushing_mem = null;
-            self.lock.unlock(io);
+            self.done_cv.broadcast(io);
+            self.mu.unlock(io);
         };
     }
 
@@ -289,31 +304,30 @@ pub const Engine = struct {
     /// the call may be retried.
     pub fn flush(self: *Engine) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
-        self.lock.lockUncancelable(io);
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+
         if (self.active_mem.point_count > 0) {
+            // Wait for any in-flight flush to release the flushing slot.
             while (self.flushing_mem != null) {
-                self.lock.unlock(io);
-                std.Thread.yield() catch {};
-                self.lock.lockUncancelable(io);
+                self.done_cv.waitUncancelable(io, &self.mu);
             }
             self.flushing_mem = self.active_mem;
             self.active_mem = memtable.Memtable.init(self.allocator, self.config.max_memtable_points);
             _ = self.pool.submit(flushWorker, self, .{}) catch |err| {
                 self.flushing_mem.?.deinit();
                 self.flushing_mem = null;
-                self.lock.unlock(io);
+                // Wake any concurrent waiters that might be parked
+                // because we briefly held `flushing_mem` non-null.
+                self.done_cv.broadcast(io);
                 return err;
             };
         }
-        self.lock.unlock(io);
 
-        // Wait for all flushing to complete
-        while (true) {
-            self.lock.lockSharedUncancelable(io);
-            const done = (self.flushing_mem == null);
-            self.lock.unlockShared(io);
-            if (done) break;
-            std.Thread.yield() catch {};
+        // Wait for our submitted flush (and any prior ones still
+        // running) to complete.
+        while (self.flushing_mem != null) {
+            self.done_cv.waitUncancelable(io, &self.mu);
         }
     }
 
@@ -322,15 +336,16 @@ pub const Engine = struct {
         var min_ts: i64 = std.math.maxInt(i64);
         var max_ts: i64 = std.math.minInt(i64);
 
-        self.lock.lockSharedUncancelable(io);
+        self.mu.lockUncancelable(io);
         var mem = self.flushing_mem orelse return;
-        self.lock.unlockShared(io);
+        self.mu.unlock(io);
 
         if (mem.point_count == 0) {
-            self.lock.lockUncancelable(io);
+            self.mu.lockUncancelable(io);
             mem.deinit();
             self.flushing_mem = null;
-            self.lock.unlock(io);
+            self.done_cv.broadcast(io);
+            self.mu.unlock(io);
             return;
         }
 
@@ -344,9 +359,9 @@ pub const Engine = struct {
             }
         }
 
-        self.lock.lockUncancelable(io);
+        self.mu.lockUncancelable(io);
         const seg_id = self.man.getNextSegmentId();
-        self.lock.unlock(io);
+        self.mu.unlock(io);
 
         const seg_name = try segment.segmentPath(self.allocator, self.config.data_dir, seg_id);
         defer self.allocator.free(seg_name);
@@ -360,8 +375,8 @@ pub const Engine = struct {
         }
 
         {
-            self.lock.lockUncancelable(io);
-            defer self.lock.unlock(io);
+            self.mu.lockUncancelable(io);
+            defer self.mu.unlock(io);
 
             try self.man.addSegment(.{
                 .id = seg_id,
@@ -376,6 +391,7 @@ pub const Engine = struct {
 
             mem.deinit();
             self.flushing_mem = null;
+            self.done_cv.broadcast(io);
         }
 
         self.triggerCompaction() catch |err| {
@@ -394,20 +410,23 @@ pub const Engine = struct {
 
     fn triggerCompaction(self: *Engine) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
-        self.lock.lockSharedUncancelable(io);
+        self.mu.lockUncancelable(io);
         var l0_count: usize = 0;
         for (self.man.segments.items) |seg| {
             if (seg.level == 0) l0_count += 1;
         }
-        self.lock.unlockShared(io);
+        self.mu.unlock(io);
 
         if (l0_count >= kL0CompactionThreshold) {
-            self.lock.lockUncancelable(io);
-            defer self.lock.unlock(io);
+            self.mu.lockUncancelable(io);
+            defer self.mu.unlock(io);
             if (!self.compaction_running) {
                 self.compaction_running = true;
                 _ = self.pool.submit(compactionWorker, self, .{}) catch {
                     self.compaction_running = false;
+                    // No worker actually ran, so wake anyone parked
+                    // on the "compaction_running == false" predicate.
+                    self.done_cv.broadcast(io);
                 };
             }
         }
@@ -419,9 +438,10 @@ pub const Engine = struct {
             std.debug.print("Background compaction failed: {any}\n", .{err});
         };
         const io = std.Io.Threaded.global_single_threaded.io();
-        self.lock.lockUncancelable(io);
+        self.mu.lockUncancelable(io);
         self.compaction_running = false;
-        self.lock.unlock(io);
+        self.done_cv.broadcast(io);
+        self.mu.unlock(io);
     }
 
     fn compactL0(self: *Engine) !void {
@@ -432,8 +452,8 @@ pub const Engine = struct {
         var new_seg_id: usize = 0;
 
         {
-            self.lock.lockUncancelable(io);
-            defer self.lock.unlock(io);
+            self.mu.lockUncancelable(io);
+            defer self.mu.unlock(io);
 
             for (self.man.segments.items) |seg| {
                 if (seg.level == 0) {
@@ -469,8 +489,8 @@ pub const Engine = struct {
         try compactor.compactSegments(paths.items, out_path);
 
         {
-            self.lock.lockUncancelable(io);
-            defer self.lock.unlock(io);
+            self.mu.lockUncancelable(io);
+            defer self.mu.unlock(io);
 
             var new_segments = std.ArrayListUnmanaged(manifest.SegmentMeta).empty;
             for (self.man.segments.items) |seg| {
@@ -546,8 +566,8 @@ pub const Engine = struct {
         var merge_it = try arena.create(iterator.MergeIterator);
         merge_it.* = iterator.MergeIterator.init(arena);
 
-        self.lock.lockSharedUncancelable(io);
-        defer self.lock.unlockShared(io);
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
 
         // 1. Query Active Memtable
         if (self.active_mem.series.get(series_id)) |pts| {
@@ -631,8 +651,8 @@ pub const Engine = struct {
     /// Errors: WAL fsync or manifest write errors bubble up unchanged.
     pub fn sync(self: *Engine) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
-        self.lock.lockUncancelable(io);
-        defer self.lock.unlock(io);
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
         try self.wal.sync();
         try self.man.save();
     }
