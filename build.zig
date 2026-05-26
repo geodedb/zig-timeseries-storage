@@ -144,11 +144,22 @@ pub fn build(b: *std.Build) void {
     if (tsan) e2e_tests.root_module.sanitize_thread = true;
     e2e_step.dependOn(&b.addRunArtifact(e2e_tests).step);
 
+    // WAL recovery regression tests — exercise the strict and salvage
+    // policies under `Engine.init`. Closes GAP-0005 / SEC-002 / SEC-003.
+    const wal_recovery_step = b.step("test-wal-recovery", "Run WAL recovery regression tests");
+    const wal_recovery_tests = b.addTest(.{
+        .root_module = importedModule(b, "tests/wal_recovery.zig", target, optimize, module, thread_pool),
+    });
+    wal_recovery_tests.root_module.link_libc = true;
+    if (tsan) wal_recovery_tests.root_module.sanitize_thread = true;
+    wal_recovery_step.dependOn(&b.addRunArtifact(wal_recovery_tests).step);
+
     const all_tests_step = b.step("test-all", "Run unit, integration, stress, and e2e suites");
     all_tests_step.dependOn(&b.addRunArtifact(unit_tests).step);
     all_tests_step.dependOn(&b.addRunArtifact(integration_tests).step);
     all_tests_step.dependOn(&b.addRunArtifact(stress_tests).step);
     all_tests_step.dependOn(&b.addRunArtifact(e2e_tests).step);
+    all_tests_step.dependOn(&b.addRunArtifact(wal_recovery_tests).step);
 
     // ------------------------------------------------------------------
     // Example — demonstrates library usage end-to-end.

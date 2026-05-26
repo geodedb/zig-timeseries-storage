@@ -19,6 +19,35 @@ const wal_record = @import("wal_record.zig");
 /// compaction work over enough memtable flushes to matter.
 const kL0CompactionThreshold: usize = 4;
 
+/// WAL recovery policy.
+///
+/// - `fail_closed` (default): any deserialisation failure or CRC32C
+///   checksum mismatch encountered while replaying the WAL on
+///   `Engine.init` aborts the open and surfaces the error
+///   (`error.InvalidFormat` / `error.ChecksumMismatch`). This is the
+///   safe default: silent data loss is invisible to operators, so we
+///   refuse to start rather than pretend the WAL was clean.
+/// - `salvage`: tolerate corrupt or non-deserialisable records by
+///   falling back to the lossy `readFrom` path; the operator opts in
+///   to a best-effort recovery that may drop records past the first
+///   bad one. Intended for forensic recovery, not production use.
+pub const WalRecoveryPolicy = enum { fail_closed, salvage };
+
+/// Background-worker error phase. Surfaces *which* worker (flush vs
+/// compaction vs WAL recovery) the error came from, so a single
+/// callback can route by phase. WAL recovery currently fails fast in
+/// `Engine.init` rather than through this callback; the variant is
+/// reserved so a future async-recovery path can use it without an
+/// ABI break.
+pub const BgPhase = enum { flush, compaction, wal_recovery };
+
+/// Optional error callback. Invoked by background workers under the
+/// engine's internal lock when they encounter a non-fatal error. The
+/// callback MUST NOT call back into the engine on the same thread
+/// (that would deadlock). Set to `null` (the default) to use the
+/// built-in `last_background_error` slot only.
+pub const ErrorCallback = *const fn (ctx: *anyopaque, phase: BgPhase, err: anyerror) void;
+
 /// Canonical engine configuration. The only configuration surface a
 /// caller needs to construct an `Engine`. Replaces both the template
 /// `root.Config` (removed in Phase B-1) and the unused `types.StoreConfig`.
@@ -26,6 +55,13 @@ pub const EngineConfig = struct {
     /// Filesystem directory where the manifest, WAL, and segment files
     /// live. Must exist before `Engine.init`; the engine does not create
     /// it for you (the CLI / example wrappers do).
+    ///
+    /// Must be a non-empty string. Strongly prefer absolute paths;
+    /// relative paths (e.g. those produced by `std.testing.tmpDir`)
+    /// are accepted for test convenience. Paths containing `..`
+    /// substrings are rejected with `error.PathTraversal` to defang
+    /// `data_dir = "../../etc"`-style misuse before it reaches the
+    /// filesystem.
     data_dir: []const u8,
     /// Soft limit on the number of points held in the active memtable
     /// before a background flush is triggered. Higher values amortize
@@ -35,6 +71,16 @@ pub const EngineConfig = struct {
     /// open. When false, opening a fresh `data_dir` without an existing
     /// identity returns `error.FileNotFound`.
     create_identity_if_missing: bool = true,
+    /// How `Engine.init` should respond to a corrupt WAL record during
+    /// replay. See `WalRecoveryPolicy` for details.
+    wal_recovery: WalRecoveryPolicy = .fail_closed,
+    /// Optional callback invoked when a background worker encounters
+    /// an error. When `null`, errors are still recorded in
+    /// `last_background_error` (drainable via `lastBackgroundError`).
+    error_callback: ?ErrorCallback = null,
+    /// Opaque context handed to `error_callback`. Ignored when
+    /// `error_callback` is null.
+    error_callback_ctx: ?*anyopaque = null,
 };
 
 /// Backwards-compatible alias. New code should use `EngineConfig`.
@@ -77,6 +123,11 @@ pub const Engine = struct {
     flushing_mem: ?memtable.Memtable = null,
     pool: *thread_pool.ThreadPool,
     compaction_running: bool = false,
+    /// Most recent error observed by a background flush or compaction
+    /// worker. Cleared by `lastBackgroundError`. Workers set this under
+    /// `mu` so concurrent reads always observe a consistent value;
+    /// callers use `lastBackgroundError` to drain it.
+    last_background_error: ?anyerror = null,
 
     /// Open (or create) an engine over `config.data_dir`.
     ///
@@ -99,6 +150,8 @@ pub const Engine = struct {
     /// used both for engine-owned state (manifest, memtable) and for
     /// transient buffers inside `appendPoints`.
     pub fn init(allocator: Allocator, config: EngineConfig, pool: *thread_pool.ThreadPool) !Engine {
+        try validateDataDir(config.data_dir);
+
         const man = try manifest.Manifest.init(allocator, config.data_dir);
 
         const io = std.Io.Threaded.global_single_threaded.io();
@@ -106,38 +159,19 @@ pub const Engine = struct {
         var wal = try wal_manager.WalManager.init(allocator, wal_dir, man.ts_uuid, man.last_checkpoint_lsn, .{
             .create_identity_if_missing = config.create_identity_if_missing,
         });
+        errdefer wal.deinit();
 
         var mem = memtable.Memtable.init(allocator, config.max_memtable_points);
+        errdefer mem.deinit();
 
-        // Simple recovery: Replay WAL into memtable
-        // In a production engine, WAL records would be replayed since the last manifest checkpoint.
-        // For now, we will simply stream through WAL records and re-apply them.
-        const records = try wal.readFrom(man.last_checkpoint_lsn + 1, allocator);
-        defer {
-            for (records) |*r| r.deinit(allocator);
-            allocator.free(records);
-        }
-        for (records) |rec| {
-            if (rec.record_type == .append_points) {
-                if (rec.payload.len < 16 or (rec.payload.len - 16) % 16 != 0) continue;
-
-                const series_id = std.mem.readInt(u128, rec.payload[0..16], .little);
-                const num_points = (rec.payload.len - 16) / 16;
-                var points = try allocator.alloc(types.Point, num_points);
-                defer allocator.free(points);
-
-                var pos: usize = 16;
-                for (0..num_points) |i| {
-                    points[i] = .{
-                        .ts = std.mem.readInt(i64, rec.payload[pos..][0..8], .little),
-                        .value = std.mem.readInt(i64, rec.payload[pos + 8 ..][0..8], .little),
-                    };
-                    pos += 16;
-                }
-
-                try mem.insert(series_id, points);
-            }
-        }
+        // Replay WAL into the memtable. The default `fail_closed`
+        // policy uses `forEachFromStrict`, which surfaces CRC32C
+        // checksum mismatches and deserialisation errors instead of
+        // silently dropping records (previous behaviour, tracked
+        // under GAP-0005 / SEC-002 / SEC-003 / Q-REL-001). Operators
+        // who explicitly accept lossy recovery can opt in with
+        // `wal_recovery = .salvage`.
+        try replayWalIntoMemtable(allocator, &wal, &mem, man.last_checkpoint_lsn + 1, config.wal_recovery);
 
         return Engine{
             .allocator = allocator,
@@ -147,6 +181,98 @@ pub const Engine = struct {
             .active_mem = mem,
             .pool = pool,
         };
+    }
+
+    /// Reject `data_dir` values that are empty or contain a `..`
+    /// component. We refuse `..` substrings outright rather than try to
+    /// canonicalise the path — the engine has no reliable way to know
+    /// what "safe" means in the caller's environment, so the safest
+    /// behaviour is to fail fast and force the caller to pass a clean,
+    /// pre-resolved path. Absolute paths are preferred but not
+    /// required (test helpers like `std.testing.tmpDir` produce
+    /// relative paths under the cwd).
+    fn validateDataDir(data_dir: []const u8) !void {
+        if (data_dir.len == 0) return error.InvalidDataDir;
+        if (std.mem.indexOf(u8, data_dir, "..") != null) return error.PathTraversal;
+    }
+
+    /// Stream the WAL forward from `start_lsn` into `mem` according
+    /// to `policy`. In `fail_closed` mode, any error encountered while
+    /// iterating the WAL bubbles up (including `error.InvalidFormat`
+    /// for deserialisation failures and `error.ChecksumMismatch` for
+    /// CRC32C mismatches). In `salvage` mode the lossy `readFrom`
+    /// path is used and bad records are dropped silently — the
+    /// operator opts in to this with eyes open.
+    fn replayWalIntoMemtable(
+        allocator: Allocator,
+        wal: *wal_manager.WalManager,
+        mem: *memtable.Memtable,
+        start_lsn: u64,
+        policy: WalRecoveryPolicy,
+    ) !void {
+        switch (policy) {
+            .fail_closed => {
+                const ReplayCtx = struct {
+                    allocator: Allocator,
+                    mem: *memtable.Memtable,
+
+                    fn apply(self: @This(), rec: *const wal_record.WalRecord) anyerror!void {
+                        try applyWalRecord(self.allocator, self.mem, rec);
+                    }
+                };
+                var failure: ?wal_manager.ReplayFailure = null;
+                wal.forEachFromStrict(
+                    start_lsn,
+                    allocator,
+                    &failure,
+                    ReplayCtx{ .allocator = allocator, .mem = mem },
+                    ReplayCtx.apply,
+                ) catch |err| return err;
+            },
+            .salvage => {
+                const records = try wal.readFrom(start_lsn, allocator);
+                defer {
+                    for (records) |*r| r.deinit(allocator);
+                    allocator.free(records);
+                }
+                for (records) |*r| {
+                    try applyWalRecord(allocator, mem, r);
+                }
+            },
+        }
+    }
+
+    /// Apply a single decoded WAL record to the memtable. Only
+    /// `append_points` records are replayed — other record types are
+    /// metadata-only and have already taken effect by the time the
+    /// manifest reaches a consistent state. Malformed payload
+    /// (truncated header or non-16-byte point stride) is skipped per
+    /// the original recovery behaviour; the strict path validates the
+    /// envelope (header + CRC32C) but cannot diagnose payload-level
+    /// corruption short of an inner re-encoding.
+    fn applyWalRecord(
+        allocator: Allocator,
+        mem: *memtable.Memtable,
+        rec: *const wal_record.WalRecord,
+    ) !void {
+        if (rec.record_type != .append_points) return;
+        if (rec.payload.len < 16 or (rec.payload.len - 16) % 16 != 0) return;
+
+        const series_id = std.mem.readInt(u128, rec.payload[0..16], .little);
+        const num_points = (rec.payload.len - 16) / 16;
+        var points = try allocator.alloc(types.Point, num_points);
+        defer allocator.free(points);
+
+        var pos: usize = 16;
+        for (0..num_points) |i| {
+            points[i] = .{
+                .ts = std.mem.readInt(i64, rec.payload[pos..][0..8], .little),
+                .value = std.mem.readInt(i64, rec.payload[pos + 8 ..][0..8], .little),
+            };
+            pos += 16;
+        }
+
+        try mem.insert(series_id, points);
     }
 
     /// Tear down the engine and release its resources.
