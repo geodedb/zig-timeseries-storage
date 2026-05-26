@@ -68,7 +68,15 @@ pub const SegmentIterator = struct {
         self.reader.deinit();
     }
 
-    pub fn next(self: *SegmentIterator) ?types.Point {
+    /// Fetch the next point, or `null` at end of iteration.
+    ///
+    /// Returns an error if a block read or decode fails — the
+    /// caller MUST treat that as a query failure rather than EOF.
+    /// Previously this method papered over both classes of error by
+    /// returning `null` (treating corruption as EOF) and by
+    /// substituting an empty slice when `decodePoints` failed; both
+    /// behaviours have been removed (Q-REL-009).
+    pub fn next(self: *SegmentIterator) !?types.Point {
         while (true) {
             if (self.pos < self.current_points.len) {
                 const pt = self.current_points[self.pos];
@@ -84,30 +92,15 @@ pub const SegmentIterator = struct {
                 self.current_points = &[_]types.Point{};
             }
 
-            while (self.block_it.next() catch null) |block| {
-                if (block.header.series_id != self.series_id) continue;
-                if (block.header.stats.max_ts < self.start_ts) continue;
-                if (block.header.stats.min_ts > self.end_ts) continue;
+            const maybe_block = try self.block_it.next();
+            const block = maybe_block orelse return null;
+            if (block.header.series_id != self.series_id) continue;
+            if (block.header.stats.max_ts < self.start_ts) continue;
+            if (block.header.stats.min_ts > self.end_ts) continue;
 
-                self.current_points = block.decodePoints(self.allocator) catch &[_]types.Point{};
-                self.pos = 0;
-                break;
-            } else {
-                return null;
-            }
+            self.current_points = try block.decodePoints(self.allocator);
+            self.pos = 0;
         }
-    }
-
-    pub fn iterator(self: *SegmentIterator) PointIterator {
-        return .{
-            .ptr = self,
-            .nextFn = struct {
-                fn next(ptr: *anyopaque) ?types.Point {
-                    const typed_ptr: *SegmentIterator = @ptrCast(@alignCast(ptr));
-                    return typed_ptr.next();
-                }
-            }.next,
-        };
     }
 };
 
@@ -199,6 +192,57 @@ pub const MergeIterator = struct {
         };
     }
 };
+
+test "SegmentIterator: surfaces decode errors instead of returning null" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(dir_path);
+    const seg_path = try std.fmt.allocPrint(allocator, "{s}/bad.tsseg", .{dir_path});
+    defer allocator.free(seg_path);
+
+    // Hand-craft a segment with a single block whose data_len
+    // exceeds the cap so decodePoints fails with BlockTooLarge.
+    const limits = @import("limits.zig");
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, seg_path, .{
+            .read = false,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        });
+        defer f.close(io);
+        try f.writeStreamingAll(io, &segment.SEGMENT_MAGIC);
+
+        var hdr_buf: [segment.BlockHeader.encoded_size]u8 = undefined;
+        const h = segment.BlockHeader{
+            .series_id = 1,
+            .stats = .{
+                .min_ts = 0,
+                .max_ts = 1,
+                .count = 1,
+                .min_value = 0,
+                .max_value = 1,
+                .sum = 0,
+                .first_value = 0,
+                .last_value = 0,
+            },
+            .data_len = limits.MAX_BLOCK_DATA_LEN + 1,
+        };
+        h.serialize(&hdr_buf);
+        try f.writeStreamingAll(io, &hdr_buf);
+        try f.sync(io);
+    }
+
+    var it = try SegmentIterator.init(allocator, seg_path, 1, 0, 100);
+    defer it.deinit();
+
+    // The first call to next() drives the block iterator into the
+    // bad block and must propagate the decode error rather than
+    // silently returning null.
+    try std.testing.expectError(error.BlockTooLarge, it.next());
+}
 
 test "MergeIterator with SliceIterators" {
     const allocator = std.testing.allocator;

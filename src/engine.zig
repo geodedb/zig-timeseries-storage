@@ -129,6 +129,14 @@ pub const Engine = struct {
     /// `mu` so concurrent reads always observe a consistent value;
     /// callers use `lastBackgroundError` to drain it.
     last_background_error: ?anyerror = null,
+    /// Monotonically increasing counter tracking the number of
+    /// flushes that have COMPLETED (success or failure).
+    /// `flush()` snapshots `flushes_completed` plus the number of
+    /// flushes it has either submitted or is waiting on, then waits
+    /// until the counter reaches that target. This avoids the bug
+    /// where flush() returned after "some" flush completed rather
+    /// than "the flush I scheduled" (Q-REL-010).
+    flushes_completed: u64 = 0,
 
     /// Open (or create) an engine over `config.data_dir`.
     ///
@@ -518,6 +526,10 @@ pub const Engine = struct {
             self.mu.lockUncancelable(io);
             if (self.flushing_mem) |*fm| fm.deinit();
             self.flushing_mem = null;
+            // A failed flush still counts as a completed scheduling
+            // round so flush() callers are not stuck waiting forever
+            // for a flush that errored out.
+            self.flushes_completed += 1;
             self.recordBackgroundErrorLocked(.flush, err);
             self.done_cv.broadcast(io);
             self.mu.unlock(io);
@@ -579,26 +591,46 @@ pub const Engine = struct {
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
 
+        // Snapshot the current completion counter and decide what the
+        // target value must be before we can return. The target rises
+        // by one for every flush we submit OR are already waiting on.
+        //
+        // Three cases:
+        //  1. Active memtable has data AND no flush is in flight —
+        //     submit one, target = completed + 1.
+        //  2. Active memtable has data AND a flush is in flight —
+        //     wait for the in-flight one to drain the slot, then
+        //     submit ours. Target = completed + 2 (two flushes will
+        //     finish before we can return: theirs + ours).
+        //  3. Active memtable empty AND no flush in flight — no-op
+        //     return.
+        //  4. Active memtable empty AND a flush in flight — wait for
+        //     it. Target = completed + 1.
+        var target: u64 = self.flushes_completed;
+        if (self.flushing_mem != null) target += 1;
+
         if (self.active_mem.point_count > 0) {
-            // Wait for any in-flight flush to release the flushing slot.
+            // Wait for any in-flight flush to release the slot.
             while (self.flushing_mem != null) {
                 self.done_cv.waitUncancelable(io, &self.mu);
             }
             self.flushing_mem = self.active_mem;
             self.active_mem = memtable.Memtable.init(self.allocator, self.config.max_memtable_points);
+            target = self.flushes_completed + 1;
             _ = self.pool.submit(flushWorker, self, .{}) catch |err| {
                 self.flushing_mem.?.deinit();
                 self.flushing_mem = null;
-                // Wake any concurrent waiters that might be parked
-                // because we briefly held `flushing_mem` non-null.
                 self.done_cv.broadcast(io);
                 return err;
             };
         }
 
-        // Wait for our submitted flush (and any prior ones still
-        // running) to complete.
-        while (self.flushing_mem != null) {
+        // Wait until our specific submission (and any prior one we
+        // were already waiting for) has reached the target counter.
+        // Using a counter rather than "while flushing_mem != null"
+        // closes Q-REL-010: a concurrent caller's flush completing
+        // before ours can no longer cause us to return prematurely.
+        while (self.flushes_completed < target) {
             self.done_cv.waitUncancelable(io, &self.mu);
         }
     }
@@ -616,6 +648,7 @@ pub const Engine = struct {
             self.mu.lockUncancelable(io);
             mem.deinit();
             self.flushing_mem = null;
+            self.flushes_completed += 1;
             self.done_cv.broadcast(io);
             self.mu.unlock(io);
             return;
@@ -670,6 +703,7 @@ pub const Engine = struct {
 
             mem.deinit();
             self.flushing_mem = null;
+            self.flushes_completed += 1;
             self.done_cv.broadcast(io);
         }
 
@@ -890,9 +924,21 @@ pub const Engine = struct {
     }
 
     /// Open `seg` from disk and append any overlapping blocks for
-    /// `series_id` to `merge_it`. Segment-level open/iterate errors
-    /// are best-effort skipped (per-segment), matching the pre-refactor
-    /// behaviour; this is tracked under Q-REL-003.
+    /// `series_id` to `merge_it`.
+    ///
+    /// Error handling, post Q-REL-003 / Q-REL-009 / Q-REL-010:
+    ///
+    /// - If the segment file is gone, the most likely cause is a
+    ///   benign race with a concurrent compaction worker that has
+    ///   already swapped the manifest entry. We swallow
+    ///   `error.FileNotFound` and treat the segment as empty.
+    /// - Every other open error propagates (permissions, I/O failure,
+    ///   bad magic).
+    /// - Block iterator and decode errors propagate — they indicate
+    ///   on-disk corruption that the caller should know about
+    ///   instead of silently receiving truncated results.
+    /// - Arena allocation failures propagate; the caller is the only
+    ///   place that knows how to surface them up the stack.
     fn querySegment(
         self: *Engine,
         arena: Allocator,
@@ -905,20 +951,26 @@ pub const Engine = struct {
         const p = try segment.segmentPath(self.allocator, self.config.data_dir, seg.id);
         defer self.allocator.free(p);
 
-        var seg_reader = segment.SegmentReader.init(self.allocator, p) catch return;
+        var seg_reader = segment.SegmentReader.init(self.allocator, p) catch |err| switch (err) {
+            // Benign race with compaction: the segment was just
+            // unlinked but the in-memory manifest snapshot we
+            // captured still references it. Skip.
+            error.FileNotFound => return,
+            else => return err,
+        };
         defer seg_reader.deinit();
 
         var block_it = seg_reader.iterator();
-        while (block_it.next() catch null) |block| {
+        while (try block_it.next()) |block| {
             if (block.header.series_id != series_id) continue;
             if (block.header.stats.max_ts < start_ts) continue;
             if (block.header.stats.min_ts > end_ts) continue;
 
-            const pts = block.decodePoints(arena) catch continue;
+            const pts = try block.decodePoints(arena);
             var filtered_pts = std.ArrayListUnmanaged(types.Point).empty;
             for (pts) |pt| {
                 if (pt.ts >= start_ts and pt.ts <= end_ts) {
-                    filtered_pts.append(arena, pt) catch continue;
+                    try filtered_pts.append(arena, pt);
                 }
             }
             if (filtered_pts.items.len == 0) continue;
