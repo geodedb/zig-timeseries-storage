@@ -131,7 +131,15 @@ pub const Engine = struct {
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
 
-        _ = try self.wal.appendRecord(&rec);
+        // Capture the assigned LSN. We do not surface it from
+        // appendPoints today, but having it bound to a named local
+        // (rather than discarded with `_ = try ...`) makes it
+        // trivially available for the in-memory watermark / future
+        // ack-on-commit work referenced by manifest.last_checkpoint_lsn.
+        // TODO: thread `lsn` into a per-call ack / return value when
+        // the public API grows a "wait until durable" surface.
+        const lsn = try self.wal.appendRecord(&rec);
+        _ = lsn;
 
         // Write to Memtable
         try self.active_mem.insert(series_id, points);
@@ -256,7 +264,18 @@ pub const Engine = struct {
             self.flushing_mem = null;
         }
 
-        self.triggerCompaction() catch {};
+        self.triggerCompaction() catch |err| {
+            // A failed compaction trigger is not fatal — the flush
+            // itself already succeeded and persisted a new segment.
+            // Surface the failure so it shows up in logs and on stderr
+            // instead of being silently dropped (the previous
+            // `catch {}` could mask real bugs in the manifest walk or
+            // pool submission).
+            std.debug.print(
+                "engine: triggerCompaction after flush failed: {s}\n",
+                .{@errorName(err)},
+            );
+        };
     }
 
     fn triggerCompaction(self: *Engine) !void {
@@ -363,8 +382,18 @@ pub const Engine = struct {
             try self.man.save();
         }
 
-        for (paths.items) |p| {
-            std.Io.Dir.cwd().deleteFile(io, p) catch {};
+        for (paths.items, l0_segs.items) |p, seg| {
+            std.Io.Dir.cwd().deleteFile(io, p) catch |err| {
+                // The new compacted segment is already durable and
+                // referenced by the manifest; the old L0 segment file
+                // is now an orphan on disk. Log so operators can find
+                // and reclaim the leak instead of silently dropping it
+                // on the floor.
+                std.debug.print(
+                    "engine: orphan segment {d} ({s}) deletion failed: {s}\n",
+                    .{ seg.id, p, @errorName(err) },
+                );
+            };
         }
     }
 

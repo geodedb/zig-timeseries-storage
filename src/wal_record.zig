@@ -77,7 +77,12 @@ pub const WalRecord = struct {
         const total_size = self.serializedSize();
         const buf = try allocator.alloc(u8, total_size);
         errdefer allocator.free(buf);
-        _ = self.serializeInto(buf) catch unreachable;
+        // The buffer is sized exactly to `serializedSize()`, so `serializeInto`
+        // cannot return BufferTooSmall here. Surface any future divergence
+        // (e.g. if `serializedSize` and `serializeInto` ever drift) instead of
+        // silently corrupting state with `catch unreachable`.
+        const bytes_written = try self.serializeInto(buf);
+        std.debug.assert(bytes_written == total_size);
         return buf;
     }
 
