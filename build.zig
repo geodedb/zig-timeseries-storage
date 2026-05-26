@@ -29,10 +29,30 @@ pub fn build(b: *std.Build) void {
     // ------------------------------------------------------------------
     // Library module — primary public surface for downstream consumers.
     // ------------------------------------------------------------------
+    const wal = b.dependency("wal", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("wal");
+
+    const uuid = b.dependency("uuid", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("uuid");
+
+    const thread_pool = b.dependency("thread_pool", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("thread_pool");
+
     const module = b.addModule("timeseries_storage", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "wal", .module = wal },
+            .{ .name = "uuid", .module = uuid },
+            .{ .name = "thread_pool", .module = thread_pool },
+        },
     });
 
     const static_lib = b.addLibrary(.{
@@ -79,6 +99,7 @@ pub fn build(b: *std.Build) void {
     const check_tests = b.addTest(.{
         .root_module = module,
     });
+    check_tests.root_module.link_libc = true;
     check_step.dependOn(&check_tests.step);
 
     // ------------------------------------------------------------------
@@ -88,6 +109,7 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{
         .root_module = module,
     });
+    unit_tests.root_module.link_libc = true;
     if (tsan) unit_tests.root_module.sanitize_thread = true;
     unit_step.dependOn(&b.addRunArtifact(unit_tests).step);
 
@@ -95,6 +117,7 @@ pub fn build(b: *std.Build) void {
     const integration_tests = b.addTest(.{
         .root_module = importedModule(b, "tests/integration.zig", target, optimize, module),
     });
+    integration_tests.root_module.link_libc = true;
     if (tsan) integration_tests.root_module.sanitize_thread = true;
     integration_step.dependOn(&b.addRunArtifact(integration_tests).step);
 
@@ -104,6 +127,7 @@ pub fn build(b: *std.Build) void {
     const stress_tests = b.addTest(.{
         .root_module = importedModule(b, "tests/stress.zig", target, stress_optimize, module),
     });
+    stress_tests.root_module.link_libc = true;
     if (tsan) stress_tests.root_module.sanitize_thread = true;
     stress_step.dependOn(&b.addRunArtifact(stress_tests).step);
 

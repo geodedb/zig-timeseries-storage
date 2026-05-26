@@ -3,7 +3,20 @@
     .version = "0.1.0",
     .fingerprint = 0x2bf0366724c10ce7,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .wal = .{
+            .url = "git+https://gitlab.com/devnw/zig/wal.git#6e0a640692e6fc9d7e56e04a3854798f758ad133",
+            .hash = "wal-0.1.0-EqPqpnXcAwALKsyB25l-luqNQOgYfrI_avthpcSxQtDQ",
+        },
+        .uuid = .{
+            .url = "git+https://gitlab.com/devnw/zig/uuid.git#cede45bed26d9e1c11cb0234fb0014807c9c8bef",
+            .hash = "uuid-0.1.0-tL1irrcPDAAPFdwSHWfwiKCC9lvvYGu6U0XH8efaTXP_",
+        },
+        .thread_pool = .{
+            .url = "git+https://gitlab.com/devnw/zig/thread-pool.git#v0.2.4",
+            .hash = "thread_pool-0.2.4-11B1BsqSdgD2ZmPGiEwbjSR30K8xwBlWsiLt2NKWqpUl",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

@@ -30,8 +30,17 @@ const std = @import("std");
 /// Library version. Keep in sync with build.zig.zon.
 pub const version: []const u8 = "0.1.0";
 
-// Re-export submodules here as the library grows:
-// pub const submodule = @import("submodule.zig");
+pub const types = @import("types.zig");
+pub const gorilla = @import("encoding/gorilla.zig");
+pub const segment = @import("segment.zig");
+pub const wal_record = @import("wal_record.zig");
+pub const wal_manager = @import("wal_manager.zig");
+pub const manifest = @import("manifest.zig");
+pub const memtable = @import("memtable.zig");
+pub const iterator = @import("iterator.zig");
+pub const compaction = @import("compaction.zig");
+pub const engine = @import("engine.zig");
+pub const integration = @import("integration.zig");
 
 // ============================================================================
 // Public Types

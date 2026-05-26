@@ -53,7 +53,7 @@ include:
 - component: gitlab.com/devnw/ci-catalog/zig-format@v1.22.0
   inputs:
     zig_version: "0.16.0"
-    paths: "src/ tests/ examples/"
+    paths: "src/ tests/ examples/ benchmarks/"
 
   # Zig build (Linux): static lib + CLI + check-compile.
 - component: gitlab.com/devnw/ci-catalog/zig-build@v1.22.0
