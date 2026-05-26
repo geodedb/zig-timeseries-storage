@@ -238,3 +238,151 @@ test "wal recovery: data_dir with traversal segment rejected" {
     }, &pool);
     try std.testing.expectError(error.PathTraversal, result);
 }
+
+test "segment verification: fail_closed rejects missing segment" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    // Create an engine, force a flush so a segment lands on disk,
+    // then tear down cleanly.
+    {
+        var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+        defer pool.deinit();
+
+        var eng = try lib.Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 5,
+        }, &pool);
+        defer eng.deinit();
+
+        const pts = [_]lib.types.Point{
+            .{ .ts = 1, .value = 10 },
+            .{ .ts = 2, .value = 20 },
+        };
+        try eng.appendPoints(7, &pts);
+        try eng.flush();
+        try std.testing.expect(eng.man.segments.items.len >= 1);
+    }
+
+    // Delete the segment file that the manifest still references.
+    // The first segment a fresh engine flushes always has id 1, so
+    // we can construct the path directly without enumerating.
+    const seg1_path = try std.fmt.allocPrint(allocator, "{s}/1.tsseg", .{data_dir});
+    defer allocator.free(seg1_path);
+    try std.Io.Dir.cwd().deleteFile(io, seg1_path);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    const result = lib.Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 100,
+    }, &pool);
+    try std.testing.expectError(error.SegmentFileMissing, result);
+}
+
+test "segment verification: fail_closed rejects bad magic" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    // Bring up an engine, flush a real segment so the manifest
+    // references it, then deliberately overwrite the segment's
+    // magic bytes with garbage.
+    {
+        var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+        defer pool.deinit();
+
+        var eng = try lib.Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 5,
+        }, &pool);
+        defer eng.deinit();
+
+        const pts = [_]lib.types.Point{
+            .{ .ts = 1, .value = 10 },
+            .{ .ts = 2, .value = 20 },
+            .{ .ts = 3, .value = 30 },
+            .{ .ts = 4, .value = 40 },
+            .{ .ts = 5, .value = 50 },
+        };
+        try eng.appendPoints(8, &pts);
+        try eng.flush();
+    }
+
+    // Overwrite the first segment's magic bytes (id 1, see other
+    // test for rationale).
+    const seg1_path = try std.fmt.allocPrint(allocator, "{s}/1.tsseg", .{data_dir});
+    defer allocator.free(seg1_path);
+    {
+        const f = try std.Io.Dir.cwd().openFile(io, seg1_path, .{ .mode = .read_write });
+        defer f.close(io);
+        const garbage: [8]u8 = .{ 'X', 'X', 'X', 'X', 'X', 'X', 'X', 'X' };
+        try f.writePositionalAll(io, &garbage, 0);
+        try f.sync(io);
+    }
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    const result = lib.Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 100,
+    }, &pool);
+    try std.testing.expectError(error.SegmentCorrupted, result);
+}
+
+test "segment verification: salvage tolerates missing segment" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    {
+        var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+        defer pool.deinit();
+
+        var eng = try lib.Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 5,
+        }, &pool);
+        defer eng.deinit();
+
+        const pts = [_]lib.types.Point{
+            .{ .ts = 1, .value = 10 },
+            .{ .ts = 2, .value = 20 },
+        };
+        try eng.appendPoints(7, &pts);
+        try eng.flush();
+    }
+
+    const seg1_path = try std.fmt.allocPrint(allocator, "{s}/1.tsseg", .{data_dir});
+    defer allocator.free(seg1_path);
+    try std.Io.Dir.cwd().deleteFile(io, seg1_path);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var eng = try lib.Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 100,
+        .wal_recovery = .salvage,
+    }, &pool);
+    defer eng.deinit();
+
+    // The bad segment must have been pruned from the in-memory
+    // manifest under salvage mode.
+    try std.testing.expectEqual(@as(usize, 0), eng.man.segments.items.len);
+}

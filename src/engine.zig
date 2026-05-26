@@ -153,7 +153,15 @@ pub const Engine = struct {
     pub fn init(allocator: Allocator, config: EngineConfig, pool: *thread_pool.ThreadPool) !Engine {
         try validateDataDir(config.data_dir);
 
-        const man = try manifest.Manifest.init(allocator, config.data_dir);
+        var man = try manifest.Manifest.init(allocator, config.data_dir);
+        errdefer man.deinit();
+
+        // Verify the on-disk segments referenced by the manifest before
+        // we accept any traffic. In `fail_closed` mode any missing or
+        // corrupt segment aborts the open; in `salvage` mode the
+        // segment is silently dropped from the in-memory manifest so
+        // the engine can come up. Closes GAP-0006.
+        try verifySegments(allocator, &man, config.data_dir, config.wal_recovery);
 
         const io = std.Io.Threaded.global_single_threaded.io();
         const wal_dir = try std.Io.Dir.cwd().openDir(io, config.data_dir, .{});
@@ -182,6 +190,85 @@ pub const Engine = struct {
             .active_mem = mem,
             .pool = pool,
         };
+    }
+
+    /// Iterate every segment referenced by `man` and prove that the
+    /// underlying file exists, starts with `SEGMENT_MAGIC`, and is at
+    /// least one block-header long. The block header sanity check
+    /// catches the case where the magic was written but the writer
+    /// died before the first block landed.
+    ///
+    /// In `fail_closed` mode any failure aborts the open. In
+    /// `salvage` mode the broken segment is removed from the
+    /// in-memory manifest (no on-disk change) so the engine can come
+    /// up; this is documented as a recovery escape hatch.
+    fn verifySegments(
+        allocator: Allocator,
+        man: *manifest.Manifest,
+        data_dir: []const u8,
+        policy: WalRecoveryPolicy,
+    ) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+
+        var kept = std.ArrayListUnmanaged(manifest.SegmentMeta).empty;
+        defer kept.deinit(allocator);
+        try kept.ensureTotalCapacity(allocator, man.segments.items.len);
+
+        for (man.segments.items) |seg| {
+            const path = try segment.segmentPath(allocator, data_dir, seg.id);
+            defer allocator.free(path);
+
+            const verify_result = verifyOneSegment(io, path);
+            if (verify_result) |_| {
+                kept.appendAssumeCapacity(seg);
+                continue;
+            } else |err| {
+                switch (policy) {
+                    .fail_closed => return err,
+                    .salvage => {
+                        // Drop the bad segment but keep going. We
+                        // do NOT touch the on-disk manifest here —
+                        // the next legitimate save() will rewrite it.
+                        continue;
+                    },
+                }
+            }
+        }
+
+        // Replace the in-memory segment list with the verified subset.
+        // Only matters in salvage mode (in fail_closed we would have
+        // returned above); harmless otherwise (kept == segments).
+        if (policy == .salvage and kept.items.len != man.segments.items.len) {
+            man.segments.deinit(allocator);
+            man.segments = .empty;
+            try man.segments.appendSlice(allocator, kept.items);
+        }
+    }
+
+    /// Verify a single segment file. Returns
+    /// `error.SegmentFileMissing` if the file does not exist,
+    /// `error.SegmentCorrupted` if the magic bytes are wrong or the
+    /// file is too short to even hold one block header.
+    fn verifyOneSegment(io: std.Io, path: []const u8) !void {
+        const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
+            return switch (err) {
+                error.FileNotFound => error.SegmentFileMissing,
+                else => err,
+            };
+        };
+        defer file.close(io);
+
+        const file_len = try file.length(io);
+        if (file_len < segment.SEGMENT_MAGIC.len + segment.BlockHeader.encoded_size) {
+            return error.SegmentCorrupted;
+        }
+
+        var magic_buf: [segment.SEGMENT_MAGIC.len]u8 = undefined;
+        const read_len = try file.readPositionalAll(io, &magic_buf, 0);
+        if (read_len != segment.SEGMENT_MAGIC.len) return error.SegmentCorrupted;
+        if (!std.mem.eql(u8, &magic_buf, &segment.SEGMENT_MAGIC)) {
+            return error.SegmentCorrupted;
+        }
     }
 
     /// Reject `data_dir` values that are empty or contain a `..`
