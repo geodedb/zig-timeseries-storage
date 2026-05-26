@@ -25,8 +25,29 @@ pub const ReplayFailure = struct {
     kind: ReplayFailureKind,
 };
 
-/// Manages WAL record persistence by delegating append-only storage to the
-/// external wal library (gitlab.com/devnw/zig/wal).
+/// Manages WAL record persistence by delegating append-only storage to
+/// the external wal library (gitlab.com/devnw/zig/wal).
+///
+/// ## Durability semantics
+///
+/// The underlying `wal_lib.WriteAheadLog` is opened with `manual_sync =
+/// true`, so `appendRecord` does NOT issue an fsync — it just writes
+/// the serialised record into the WAL's page cache and returns the
+/// assigned LSN. Durability requires a separate, explicit `sync()`
+/// call (delegated to `wal_lib.WriteAheadLog.sync`, which issues the
+/// fsync against the underlying file).
+///
+/// This is intentional: the engine batches multiple `appendRecord`
+/// calls and issues a single `sync()` at commit time (during `flush()`
+/// and `Engine.sync()`), amortising the fsync cost across many
+/// appends. Callers who want every record durable on disk before
+/// `appendRecord` returns must invoke `sync()` immediately after.
+///
+/// On `appendRecord` the manager allocates a serialised buffer either
+/// on the stack (records ≤ 16 KiB) or on the heap, computes the
+/// CRC32C checksum, hands the slice to the WAL library, and returns
+/// the LSN the WAL assigned. The LSN is monotonically increasing
+/// across all appends.
 pub const WalManager = struct {
     allocator: Allocator,
     inner: wal_lib.WriteAheadLog,

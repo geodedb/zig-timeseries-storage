@@ -13,6 +13,22 @@ const BlockInfo = struct {
     block: segment.Block,
 };
 
+/// Merge engine for combining multiple segments into a single segment.
+///
+/// `compactSegments` takes a list of input segment paths and an output
+/// segment path. For each `SeriesId` present in any input segment, it
+/// decodes every overlapping block, merges the points in ascending
+/// `(ts, value)` order via `iterator.MergeIterator`, deduplicates
+/// same-timestamp entries (later iterator wins; see `MergeIterator`'s
+/// doc-comment for the precise tie-breaker), and writes the merged
+/// stream as a single block into the output segment.
+///
+/// The compactor does not delete the input segments — that is the
+/// engine's responsibility once the manifest has been updated to point
+/// at the new output segment. The compactor borrows the supplied
+/// thread pool for any future parallel-merge work; today the merge is
+/// single-threaded but the dependency is kept so callers do not have
+/// to plumb a new pool through later.
 pub const Compactor = struct {
     allocator: Allocator,
     pool: *thread_pool.ThreadPool,
@@ -96,8 +112,14 @@ pub const Compactor = struct {
             defer merged_points.deinit(self.allocator);
 
             while (merger.next()) |pt| {
-                // Deduplicate points with the same timestamp by taking the later one (which comes last if stable).
-                // Our simple MergeIterator might not be perfectly stable, but it guarantees sorted order.
+                // Deduplicate points with the same timestamp. The
+                // MergeIterator orders by ascending (ts, value), so for
+                // a tie on `ts` the **higher**-value entry arrives
+                // last. We overwrite the existing tail with each new
+                // arrival, which means the highest-value point wins on
+                // a per-timestamp dedup. This matches the documented
+                // contract of `iterator.MergeIterator` (see
+                // `MergeIterator.next` doc-comment in iterator.zig).
                 if (merged_points.items.len > 0 and merged_points.items[merged_points.items.len - 1].ts == pt.ts) {
                     merged_points.items[merged_points.items.len - 1] = pt; // overwrite
                 } else {

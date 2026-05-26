@@ -21,6 +21,30 @@ pub const SegmentMeta = struct {
     level: u8,
 };
 
+/// On-disk manifest tracking the engine's persistent state.
+///
+/// Stores the list of segments, the next segment id, the last WAL
+/// checkpoint LSN, and the engine's identity UUID. Persisted to two
+/// files under the data directory — `manifest.a` and `manifest.b` —
+/// in a "ping-pong" pattern: each `save()` increments `counter` and
+/// writes to whichever slot the new counter parity selects.
+///
+/// ## Atomicity
+///
+/// Every write goes through `<filename>.tmp` first, is fsync'd, then
+/// `rename(2)`-d into place. `rename(2)` is atomic on POSIX, so a
+/// crash mid-write either leaves the slot at its previous contents
+/// (rename never happened) or fully updated. Each file ends with a
+/// CRC32 (Castagnoli, ISCSI variant) over the preceding bytes; on
+/// load both slots are CRC-verified and the slot with the higher
+/// `counter` wins. If both slots fail to load (missing or corrupted)
+/// the engine starts from an empty manifest.
+///
+/// This dual-file ping-pong is intentional: a single-file atomic
+/// rename is enough for atomicity, but two slots additionally protect
+/// against the case where a fresh write is fsync'd and then the
+/// underlying media corrupts that block before the next save() — the
+/// older but still-valid slot remains usable.
 pub const Manifest = struct {
     format_version: u32 = MANIFEST_VERSION,
     ts_uuid: [16]u8 = [_]u8{0} ** 16,

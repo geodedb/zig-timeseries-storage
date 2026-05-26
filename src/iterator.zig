@@ -111,6 +111,38 @@ pub const SegmentIterator = struct {
     }
 };
 
+/// K-way merge over a set of `PointIterator`s.
+///
+/// ## Ordering contract
+///
+/// `next()` returns points in ascending `(ts, value)` order:
+///   1. lower `ts` first;
+///   2. on equal `ts`, lower `value` first;
+///   3. on equal `(ts, value)` (a full tie), the iterator that was
+///      added EARLIEST via `addIterator` wins. (This falls out of
+///      the linear `<` scan in `next` — see source — and is the
+///      behaviour `compaction.zig` relies on for dedup: the later
+///      arrivals overwrite, so the *last* equal-`ts` point in the
+///      stream wins per timestamp; with full `(ts, value)` ties no
+///      observable difference occurs.)
+///
+/// ## Arena ownership
+///
+/// `MergeIterator` does NOT own the underlying point data — it holds
+/// `PointIterator` interface values, which in turn borrow from the
+/// caller-supplied arena (typically created and passed in by
+/// `Engine.queryPoints`). When that arena is freed, the slices
+/// returned by `next()` become invalid.
+///
+/// Callers using the engine's `queryPoints` path MUST keep the arena
+/// alive for the entire query lifetime and MUST NOT call `deinit` on
+/// the returned `*MergeIterator` — freeing the arena reclaims the
+/// iterator itself together with all its child state.
+///
+/// Direct callers (e.g. tests, the compactor) that construct a
+/// `MergeIterator` with a regular allocator MUST call `deinit` to
+/// release the two internal ArrayLists. Either ownership model is
+/// supported; do not mix them.
 pub const MergeIterator = struct {
     allocator: Allocator,
     iters: std.ArrayListUnmanaged(PointIterator),

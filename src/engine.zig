@@ -40,6 +40,20 @@ pub const EngineConfig = struct {
 /// Backwards-compatible alias. New code should use `EngineConfig`.
 pub const Config = EngineConfig;
 
+/// LSM-style time-series storage engine.
+///
+/// Every mutation is appended to a CRC32C-protected write-ahead log and
+/// inserted into an in-memory memtable. When the memtable hits its point
+/// threshold it is rotated into a flushing slot and a background worker
+/// writes it to an immutable on-disk segment. A second background worker
+/// merges level-0 segments into larger level-1 segments to bound read
+/// amplification.
+///
+/// Threading model: `appendPoints`, `flush`, `queryPoints`, and `sync`
+/// are safe to call concurrently from multiple threads; they take the
+/// engine's internal lock. Background flush and compaction tasks run on
+/// the user-supplied `thread_pool.ThreadPool`. `deinit` must not be
+/// called concurrently with any other operation.
 pub const Engine = struct {
     lock: std.Io.RwLock = std.Io.RwLock.init,
     allocator: Allocator,
@@ -51,6 +65,26 @@ pub const Engine = struct {
     pool: *thread_pool.ThreadPool,
     compaction_running: bool = false,
 
+    /// Open (or create) an engine over `config.data_dir`.
+    ///
+    /// On open, the engine loads the manifest (if present), opens the
+    /// WAL, and replays any WAL records past the last manifest checkpoint
+    /// into the in-memory memtable. The supplied `pool` is borrowed for
+    /// the lifetime of the engine (background flush and compaction tasks
+    /// are submitted to it); the caller retains ownership and must
+    /// outlive the engine.
+    ///
+    /// Errors:
+    /// - `error.FileNotFound` if `config.data_dir` does not exist or, when
+    ///   `config.create_identity_if_missing == false`, when `ts.uuid` is
+    ///   missing.
+    /// - `error.InvalidMagic`/`error.ChecksumMismatch` on a corrupt manifest.
+    /// - `error.OutOfMemory` on allocator failure.
+    /// - Any I/O error from the underlying WAL or filesystem.
+    ///
+    /// Allocator lifetime: `allocator` must outlive the engine; it is
+    /// used both for engine-owned state (manifest, memtable) and for
+    /// transient buffers inside `appendPoints`.
     pub fn init(allocator: Allocator, config: EngineConfig, pool: *thread_pool.ThreadPool) !Engine {
         const man = try manifest.Manifest.init(allocator, config.data_dir);
 
@@ -102,6 +136,19 @@ pub const Engine = struct {
         };
     }
 
+    /// Tear down the engine and release its resources.
+    ///
+    /// Blocks until any in-flight background flush or compaction task
+    /// has finished, then closes the WAL, manifest, and memtable.
+    /// Callers must ensure no other engine methods are in flight on
+    /// other threads before invoking `deinit` (it is not safe to call
+    /// concurrently with `appendPoints`, `flush`, `queryPoints`, or
+    /// `sync`).
+    ///
+    /// Does not flush the active memtable to disk — that is the
+    /// caller's responsibility via `flush()` or `sync()`. Data only
+    /// present in the active memtable will be recovered from the WAL
+    /// on the next open.
     pub fn deinit(self: *Engine) void {
         const io = std.Io.Threaded.global_single_threaded.io();
 
@@ -122,6 +169,39 @@ pub const Engine = struct {
         if (self.flushing_mem) |*fm| fm.deinit();
     }
 
+    /// Append a batch of points to the given series.
+    ///
+    /// The batch is first persisted to the WAL (CRC32C-checksummed,
+    /// LSN-ordered) and then inserted into the in-memory memtable.
+    /// When the memtable's point count crosses `config.max_memtable_points`,
+    /// the engine rotates it into a flushing slot and submits a flush
+    /// job to the thread pool; this call returns as soon as the rotation
+    /// completes, without waiting for the segment to land on disk.
+    ///
+    /// Durability: data is durable on disk only after a successful call
+    /// to `sync()` (or after `flush()` returns, which also fsyncs the
+    /// new segment + manifest). A `try eng.appendPoints(...)` that
+    /// returns without error guarantees the WAL has accepted the record
+    /// in memory, **not** that it has been fsync'd; a crash before the
+    /// next `sync()` may lose recent appends (they will be replayed
+    /// from the WAL on the next open).
+    ///
+    /// Threading: callers may invoke this concurrently from multiple
+    /// threads; the engine serialises WAL appends and memtable inserts
+    /// under its internal lock. The call blocks while the engine waits
+    /// for an in-flight flush to release the flushing slot under back-
+    /// pressure (memtable already full and a flush is still in progress).
+    ///
+    /// Ownership: `points` is read-only; the engine copies the data
+    /// into the memtable. Caller retains ownership of the slice.
+    ///
+    /// Errors:
+    /// - `error.OutOfMemory` if the payload buffer or memtable cannot grow.
+    /// - WAL I/O errors (disk full, permissions, fsync failures) bubble
+    ///   up unchanged.
+    /// - Thread-pool submission failure on a memtable rotation aborts
+    ///   the rotation and returns the underlying error; the memtable
+    ///   state is consistent.
     pub fn appendPoints(self: *Engine, series_id: types.SeriesId, points: []const types.Point) !void {
         if (points.len == 0) return;
 
@@ -191,6 +271,22 @@ pub const Engine = struct {
         };
     }
 
+    /// Force any data in the active memtable to a new segment on disk,
+    /// then block until that segment is durable.
+    ///
+    /// If the active memtable is empty this is a no-op. Otherwise, the
+    /// memtable is rotated into the flushing slot, a flush job is
+    /// submitted, and the call blocks until `flushing_mem` is cleared
+    /// (segment header written, manifest updated, WAL truncated past
+    /// the checkpoint).
+    ///
+    /// Threading: safe to call concurrently with other engine methods,
+    /// but the engine serialises flushes one at a time — overlapping
+    /// `flush()` callers will queue up behind one another.
+    ///
+    /// Errors: thread-pool submission failure or any WAL/segment I/O
+    /// error bubbles up. On error the engine state is consistent and
+    /// the call may be retried.
     pub fn flush(self: *Engine) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
         self.lock.lockUncancelable(io);
@@ -415,6 +511,35 @@ pub const Engine = struct {
         }
     }
 
+    /// Query all points in the inclusive timestamp range
+    /// `[start_ts, end_ts]` for `series_id`, returning a `MergeIterator`
+    /// that streams the points in ascending `(ts, value)` order.
+    ///
+    /// The iterator merges three sources: the active memtable, the
+    /// flushing memtable (if any), and every overlapping on-disk
+    /// segment. Segment blocks are decoded on the fly via Gorilla.
+    ///
+    /// Allocator ownership: every allocation made for the returned
+    /// iterator (the iterator itself, its child `SliceIterator`s, and
+    /// the decoded `Point` slices that back them) is made on `arena`.
+    /// The caller MUST keep `arena` alive for the lifetime of the
+    /// iterator, and must NOT call `deinit` on the iterator — freeing
+    /// the arena reclaims everything in one shot. This is intentional:
+    /// it removes the need for per-iterator cleanup paths and lets
+    /// callers drive multiple queries off the same arena cheaply.
+    ///
+    /// Threading: takes the engine's shared lock for the duration of
+    /// the call (so concurrent appends are blocked while the query is
+    /// reading the manifest segment list). The returned iterator is
+    /// independent: once the call returns, segments may be compacted
+    /// out from underneath it (segment readers were opened during the
+    /// call and the decoded points have been copied into arena memory).
+    ///
+    /// Errors:
+    /// - `error.OutOfMemory` from the arena.
+    /// - Segment read errors are currently silently skipped for the
+    ///   affected segment (per-segment best-effort) — this is tracked
+    ///   under Q-REL-003 and will be tightened in a follow-up.
     pub fn queryPoints(self: *Engine, arena: Allocator, series_id: types.SeriesId, start_ts: i64, end_ts: i64) !*iterator.MergeIterator {
         const io = std.Io.Threaded.global_single_threaded.io();
 
@@ -491,6 +616,19 @@ pub const Engine = struct {
         return merge_it;
     }
 
+    /// Force the WAL and manifest to durable storage (fsync the WAL,
+    /// re-write the manifest to its current dual-file slot).
+    ///
+    /// This does NOT flush the active memtable to a segment — use
+    /// `flush()` for that. `sync()` provides a "make currently
+    /// accepted appends durable" guarantee without paying the cost of
+    /// closing the active memtable.
+    ///
+    /// Threading: takes the engine's exclusive lock; concurrent
+    /// `appendPoints` calls will block briefly while `sync()` is in
+    /// flight. Safe to call from any thread.
+    ///
+    /// Errors: WAL fsync or manifest write errors bubble up unchanged.
     pub fn sync(self: *Engine) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
         self.lock.lockUncancelable(io);

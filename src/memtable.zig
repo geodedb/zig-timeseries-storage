@@ -5,6 +5,21 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 
+/// In-memory write buffer for points awaiting a segment flush.
+///
+/// Holds an `AutoHashMap<SeriesId, ArrayList<Point>>` keyed by series.
+/// `insert` appends new points and re-sorts the affected series when
+/// the incoming batch is not in non-decreasing `(ts, value)` order;
+/// when a batch is already sorted and lands after the existing tail
+/// (the steady-state ingest path), the append is O(n) with no sort.
+///
+/// `point_count` tracks the total live points across all series and
+/// is consulted by `shouldFlush()` against `max_points` to decide
+/// when the engine should rotate the memtable. The memtable does not
+/// itself trigger a flush — the engine owns that policy decision.
+///
+/// Threading: not internally synchronised. The engine serialises all
+/// access via its own lock.
 pub const Memtable = struct {
     allocator: Allocator,
     series: std.AutoHashMap(types.SeriesId, std.ArrayListUnmanaged(types.Point)),

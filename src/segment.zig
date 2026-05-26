@@ -75,7 +75,23 @@ pub const BlockHeader = struct {
     }
 };
 
-/// Writer for immutable segment files.
+/// Streaming writer for immutable segment files.
+///
+/// A segment file begins with the 8-byte `SEGMENT_MAGIC` followed by
+/// one or more `(BlockHeader, Gorilla-compressed payload)` pairs. The
+/// writer is append-only: `writeBlock` Gorilla-encodes the supplied
+/// points, computes block-level statistics (min/max ts and value,
+/// count, sum, first/last value), writes the header, then writes the
+/// compressed payload. Headers are fixed-size (88 bytes), making
+/// random-access scans of just the headers cheap for query planning.
+///
+/// File permissions are owner-read/write only (0o600). The caller is
+/// responsible for choosing the path; see `segmentPath` for the
+/// canonical `<data_dir>/<id>.tsseg` form.
+///
+/// `deinit` closes the file but does NOT fsync; durability is the
+/// engine's responsibility (it issues the fsync as part of the
+/// manifest commit when the segment is added to the manifest).
 pub const SegmentWriter = struct {
     file: std.Io.File,
     io_ctx: std.Io,
@@ -129,7 +145,17 @@ pub const SegmentWriter = struct {
     }
 };
 
-/// Reader for immutable segment files.
+/// Random-access reader for immutable segment files.
+///
+/// Validates the 8-byte magic on open and tracks the file size so the
+/// block iterator can detect EOF without an extra `stat`. Reads are
+/// positional (no internal seek state) so multiple `BlockIterator`s
+/// can share a single `SegmentReader` if desired.
+///
+/// Lifetime: `deinit` closes the file. The caller must not use any
+/// `Block` returned from a previous iteration after calling `deinit`
+/// (the `Block` retains a `*SegmentReader` pointer for late payload
+/// decoding).
 pub const SegmentReader = struct {
     file: std.Io.File,
     io_ctx: std.Io,
