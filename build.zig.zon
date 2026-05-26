@@ -1,0 +1,22 @@
+.{
+    .name = .timeseries_storage,
+    .version = "0.1.0",
+    .fingerprint = 0x2bf0366724c10ce7,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "Makefile",
+        ".gitlab-ci.yml",
+        "src",
+        "tests",
+        "examples",
+        "benchmarks",
+        "docs",
+        "scripts",
+        "LICENSE",
+        "NOTICE",
+        "README.md",
+    },
+}

@@ -1,0 +1,5 @@
+# Per-project toolchain pin for mise (https://mise.jdx.dev/).
+# Keeps `zig`, the pre-commit hooks, and the CI components on the same
+# version this project was developed against.
+[tools]
+zig = "0.16.0"
