@@ -514,14 +514,48 @@ pub const Engine = struct {
     fn flushWorker(ctx: *anyopaque, _: *thread_pool.TaskContext) void {
         var self: *Engine = @ptrCast(@alignCast(ctx));
         self.flushInternal() catch |err| {
-            std.debug.print("Background flush failed: {any}\n", .{err});
             const io = std.Io.Threaded.global_single_threaded.io();
             self.mu.lockUncancelable(io);
             if (self.flushing_mem) |*fm| fm.deinit();
             self.flushing_mem = null;
+            self.recordBackgroundErrorLocked(.flush, err);
             self.done_cv.broadcast(io);
             self.mu.unlock(io);
         };
+    }
+
+    /// Store `err` as the engine's most recent background-worker
+    /// failure and dispatch it to `error_callback` (if configured).
+    /// Caller MUST hold `self.mu`. The callback runs under the lock
+    /// — callers MUST NOT re-enter the engine from the callback.
+    fn recordBackgroundErrorLocked(self: *Engine, phase: BgPhase, err: anyerror) void {
+        self.last_background_error = err;
+        if (self.config.error_callback) |cb| {
+            // The callback ctx may legitimately be null when the
+            // caller has no per-instance state to thread through;
+            // use a stable non-null sentinel so the callback's
+            // `*anyopaque` parameter is well-defined either way.
+            const ctx_ptr = self.config.error_callback_ctx orelse @as(*anyopaque, @ptrCast(self));
+            cb(ctx_ptr, phase, err);
+        }
+    }
+
+    /// Drain and return the most recent background-worker error
+    /// recorded by a flush or compaction worker (or null if none).
+    ///
+    /// Reading clears the slot, so two successive calls to
+    /// `lastBackgroundError` cannot return the same error — operators
+    /// who want a persistent audit trail must wire `error_callback`.
+    ///
+    /// Threading: takes the engine's lock; safe to call concurrently
+    /// with other engine methods.
+    pub fn lastBackgroundError(self: *Engine) ?anyerror {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        const err = self.last_background_error;
+        self.last_background_error = null;
+        return err;
     }
 
     /// Force any data in the active memtable to a new segment on disk,
@@ -635,14 +669,11 @@ pub const Engine = struct {
         self.triggerCompaction() catch |err| {
             // A failed compaction trigger is not fatal — the flush
             // itself already succeeded and persisted a new segment.
-            // Surface the failure so it shows up in logs and on stderr
-            // instead of being silently dropped (the previous
-            // `catch {}` could mask real bugs in the manifest walk or
-            // pool submission).
-            std.debug.print(
-                "engine: triggerCompaction after flush failed: {s}\n",
-                .{@errorName(err)},
-            );
+            // Record under the lock so callers can drain it via
+            // `lastBackgroundError`.
+            self.mu.lockUncancelable(io);
+            self.recordBackgroundErrorLocked(.compaction, err);
+            self.mu.unlock(io);
         };
     }
 
@@ -672,11 +703,12 @@ pub const Engine = struct {
 
     fn compactionWorker(ctx: *anyopaque, _: *thread_pool.TaskContext) void {
         var self: *Engine = @ptrCast(@alignCast(ctx));
-        self.compactL0() catch |err| {
-            std.debug.print("Background compaction failed: {any}\n", .{err});
-        };
+        const result = self.compactL0();
         const io = std.Io.Threaded.global_single_threaded.io();
         self.mu.lockUncancelable(io);
+        if (result) |_| {} else |err| {
+            self.recordBackgroundErrorLocked(.compaction, err);
+        }
         self.compaction_running = false;
         self.done_cv.broadcast(io);
         self.mu.unlock(io);
@@ -760,16 +792,17 @@ pub const Engine = struct {
         }
 
         for (paths.items, l0_segs.items) |p, seg| {
+            _ = seg;
             std.Io.Dir.cwd().deleteFile(io, p) catch |err| {
                 // The new compacted segment is already durable and
                 // referenced by the manifest; the old L0 segment file
-                // is now an orphan on disk. Log so operators can find
-                // and reclaim the leak instead of silently dropping it
-                // on the floor.
-                std.debug.print(
-                    "engine: orphan segment {d} ({s}) deletion failed: {s}\n",
-                    .{ seg.id, p, @errorName(err) },
-                );
+                // is now an orphan on disk. Surface the failure so
+                // operators can find and reclaim the leak via
+                // `lastBackgroundError` / `error_callback` instead of
+                // silently dropping it on the floor.
+                self.mu.lockUncancelable(io);
+                self.recordBackgroundErrorLocked(.compaction, err);
+                self.mu.unlock(io);
             };
         }
     }
@@ -977,4 +1010,87 @@ test "Engine: validateDataDir rejects empty and traversal" {
     try std.testing.expectError(error.PathTraversal, Engine.validateDataDir("foo/../bar"));
     try Engine.validateDataDir("/tmp/safe");
     try Engine.validateDataDir("relative/safe");
+}
+
+test "Engine: lastBackgroundError is null on clean operation and drains" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 100,
+    }, &pool);
+    defer engine.deinit();
+
+    // Clean engine: nothing in the slot.
+    try std.testing.expect(engine.lastBackgroundError() == null);
+
+    // Synthesise a worker error to prove the slot/callback wiring
+    // works end-to-end without depending on filesystem races.
+    {
+        engine.mu.lockUncancelable(io);
+        engine.recordBackgroundErrorLocked(.flush, error.TestInjected);
+        engine.mu.unlock(io);
+    }
+    const err = engine.lastBackgroundError();
+    try std.testing.expect(err != null);
+    try std.testing.expect(err.? == error.TestInjected);
+
+    // Slot must be drained after a read.
+    try std.testing.expect(engine.lastBackgroundError() == null);
+}
+
+test "Engine: error_callback fires when a background error is recorded" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    const Trace = struct {
+        var count: usize = 0;
+        var last_phase: BgPhase = undefined;
+        var last_err: anyerror = undefined;
+
+        fn cb(_: *anyopaque, phase: BgPhase, err: anyerror) void {
+            count += 1;
+            last_phase = phase;
+            last_err = err;
+        }
+
+        fn reset() void {
+            count = 0;
+        }
+    };
+    Trace.reset();
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 100,
+        .error_callback = Trace.cb,
+    }, &pool);
+    defer engine.deinit();
+
+    {
+        engine.mu.lockUncancelable(io);
+        engine.recordBackgroundErrorLocked(.compaction, error.TestInjected);
+        engine.mu.unlock(io);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), Trace.count);
+    try std.testing.expectEqual(BgPhase.compaction, Trace.last_phase);
+    try std.testing.expect(Trace.last_err == error.TestInjected);
 }
