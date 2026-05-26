@@ -10,6 +10,12 @@ const owner_only_file_mode = 0o600;
 
 pub const SEGMENT_MAGIC: [8]u8 = .{ 'T', 'S', 'S', 'E', 'G', '0', '0', '1' };
 
+/// Build the on-disk path for a segment file, e.g. `<data_dir>/<id>.tsseg`.
+/// Caller owns the returned slice and must free it with `allocator.free`.
+pub fn segmentPath(allocator: Allocator, data_dir: []const u8, id: u64) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{d}.tsseg", .{ data_dir, id });
+}
+
 /// Header for a single block in a segment file.
 pub const BlockHeader = struct {
     series_id: types.SeriesId,

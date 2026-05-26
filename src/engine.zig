@@ -13,6 +13,12 @@ const compaction = @import("compaction.zig");
 const thread_pool = @import("thread_pool");
 const wal_record = @import("wal_record.zig");
 
+/// Number of level-0 segments that triggers a compaction job.
+/// Chosen to match the level-0 fan-in used by typical LSM designs;
+/// keeps the read amplification on L0 bounded while still amortizing
+/// compaction work over enough memtable flushes to matter.
+const kL0CompactionThreshold: usize = 4;
+
 pub const Config = struct {
     data_dir: []const u8,
     max_memtable_points: usize = 100_000,
@@ -50,7 +56,7 @@ pub const Engine = struct {
             if (rec.record_type == .append_points) {
                 if (rec.payload.len < 16 or (rec.payload.len - 16) % 16 != 0) continue;
 
-                const series_id = std.mem.littleToNative(u128, std.mem.bytesToValue(u128, rec.payload[0..16]));
+                const series_id = std.mem.readInt(u128, rec.payload[0..16], .little);
                 const num_points = (rec.payload.len - 16) / 16;
                 var points = try allocator.alloc(types.Point, num_points);
                 defer allocator.free(points);
@@ -58,8 +64,8 @@ pub const Engine = struct {
                 var pos: usize = 16;
                 for (0..num_points) |i| {
                     points[i] = .{
-                        .ts = std.mem.littleToNative(i64, std.mem.bytesToValue(i64, rec.payload[pos..][0..8])),
-                        .value = std.mem.littleToNative(i64, std.mem.bytesToValue(i64, rec.payload[pos + 8 ..][0..8])),
+                        .ts = std.mem.readInt(i64, rec.payload[pos..][0..8], .little),
+                        .value = std.mem.readInt(i64, rec.payload[pos + 8 ..][0..8], .little),
                     };
                     pos += 16;
                 }
@@ -105,12 +111,12 @@ pub const Engine = struct {
         const payload = try self.allocator.alloc(u8, payload_size);
         defer self.allocator.free(payload);
 
-        @memcpy(payload[0..16], &std.mem.toBytes(std.mem.nativeToLittle(u128, series_id)));
+        std.mem.writeInt(u128, payload[0..16], series_id, .little);
         var pos: usize = 16;
         for (points) |pt| {
-            @memcpy(payload[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(i64, pt.ts)));
+            std.mem.writeInt(i64, payload[pos..][0..8], pt.ts, .little);
             pos += 8;
-            @memcpy(payload[pos..][0..8], &std.mem.toBytes(std.mem.nativeToLittle(i64, pt.value)));
+            std.mem.writeInt(i64, payload[pos..][0..8], pt.value, .little);
             pos += 8;
         }
 
@@ -220,7 +226,7 @@ pub const Engine = struct {
         const seg_id = self.man.getNextSegmentId();
         self.lock.unlock(io);
 
-        const seg_name = try std.fmt.allocPrint(self.allocator, "{s}/{d}.tsseg", .{ self.config.data_dir, seg_id });
+        const seg_name = try segment.segmentPath(self.allocator, self.config.data_dir, seg_id);
         defer self.allocator.free(seg_name);
 
         var writer = try segment.SegmentWriter.init(self.allocator, seg_name);
@@ -262,7 +268,7 @@ pub const Engine = struct {
         }
         self.lock.unlockShared(io);
 
-        if (l0_count >= 4) {
+        if (l0_count >= kL0CompactionThreshold) {
             self.lock.lockUncancelable(io);
             defer self.lock.unlock(io);
             if (!self.compaction_running) {
@@ -301,7 +307,7 @@ pub const Engine = struct {
                     try l0_segs.append(self.allocator, seg);
                 }
             }
-            if (l0_segs.items.len < 4) {
+            if (l0_segs.items.len < kL0CompactionThreshold) {
                 return;
             }
             new_seg_id = self.man.getNextSegmentId();
@@ -317,13 +323,13 @@ pub const Engine = struct {
         var max_ts: i64 = std.math.minInt(i64);
 
         for (l0_segs.items) |seg| {
-            const p = try std.fmt.allocPrint(self.allocator, "{s}/{d}.tsseg", .{ self.config.data_dir, seg.id });
+            const p = try segment.segmentPath(self.allocator, self.config.data_dir, seg.id);
             try paths.append(self.allocator, p);
             if (seg.min_ts < min_ts) min_ts = seg.min_ts;
             if (seg.max_ts > max_ts) max_ts = seg.max_ts;
         }
 
-        const out_path = try std.fmt.allocPrint(self.allocator, "{s}/{d}.tsseg", .{ self.config.data_dir, new_seg_id });
+        const out_path = try segment.segmentPath(self.allocator, self.config.data_dir, new_seg_id);
         defer self.allocator.free(out_path);
 
         var compactor = compaction.Compactor.init(self.allocator, self.pool);
@@ -407,7 +413,7 @@ pub const Engine = struct {
         for (self.man.segments.items) |seg| {
             if (seg.min_ts > end_ts or seg.max_ts < start_ts) continue;
 
-            const p = try std.fmt.allocPrint(self.allocator, "{s}/{d}.tsseg", .{ self.config.data_dir, seg.id });
+            const p = try segment.segmentPath(self.allocator, self.config.data_dir, seg.id);
             defer self.allocator.free(p);
 
             var seg_reader = segment.SegmentReader.init(self.allocator, p) catch continue;
