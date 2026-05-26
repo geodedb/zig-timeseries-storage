@@ -19,15 +19,31 @@ const wal_record = @import("wal_record.zig");
 /// compaction work over enough memtable flushes to matter.
 const kL0CompactionThreshold: usize = 4;
 
-pub const Config = struct {
+/// Canonical engine configuration. The only configuration surface a
+/// caller needs to construct an `Engine`. Replaces both the template
+/// `root.Config` (removed in Phase B-1) and the unused `types.StoreConfig`.
+pub const EngineConfig = struct {
+    /// Filesystem directory where the manifest, WAL, and segment files
+    /// live. Must exist before `Engine.init`; the engine does not create
+    /// it for you (the CLI / example wrappers do).
     data_dir: []const u8,
+    /// Soft limit on the number of points held in the active memtable
+    /// before a background flush is triggered. Higher values amortize
+    /// flush cost but increase peak memory and replay time after a crash.
     max_memtable_points: usize = 100_000,
+    /// When true, the WAL identity file (`ts.uuid`) is created on first
+    /// open. When false, opening a fresh `data_dir` without an existing
+    /// identity returns `error.FileNotFound`.
+    create_identity_if_missing: bool = true,
 };
+
+/// Backwards-compatible alias. New code should use `EngineConfig`.
+pub const Config = EngineConfig;
 
 pub const Engine = struct {
     lock: std.Io.RwLock = std.Io.RwLock.init,
     allocator: Allocator,
-    config: Config,
+    config: EngineConfig,
     wal: wal_manager.WalManager,
     man: manifest.Manifest,
     active_mem: memtable.Memtable,
@@ -35,12 +51,14 @@ pub const Engine = struct {
     pool: *thread_pool.ThreadPool,
     compaction_running: bool = false,
 
-    pub fn init(allocator: Allocator, config: Config, pool: *thread_pool.ThreadPool) !Engine {
+    pub fn init(allocator: Allocator, config: EngineConfig, pool: *thread_pool.ThreadPool) !Engine {
         const man = try manifest.Manifest.init(allocator, config.data_dir);
 
         const io = std.Io.Threaded.global_single_threaded.io();
         const wal_dir = try std.Io.Dir.cwd().openDir(io, config.data_dir, .{});
-        var wal = try wal_manager.WalManager.init(allocator, wal_dir, man.ts_uuid, man.last_checkpoint_lsn, .{});
+        var wal = try wal_manager.WalManager.init(allocator, wal_dir, man.ts_uuid, man.last_checkpoint_lsn, .{
+            .create_identity_if_missing = config.create_identity_if_missing,
+        });
 
         var mem = memtable.Memtable.init(allocator, config.max_memtable_points);
 

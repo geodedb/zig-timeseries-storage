@@ -22,15 +22,3 @@ pub const Point = struct {
 
 /// Unique identifier for a time-series.
 pub const SeriesId = u128;
-
-/// Configuration for the time-series store.
-pub const StoreConfig = struct {
-    /// Directory where timeseries files are stored.
-    data_dir: []const u8,
-
-    /// Target chunk size for L0 flushes.
-    max_points_per_block: usize = 4096,
-
-    /// True to skip creating identity file if missing.
-    create_identity_if_missing: bool = true,
-};

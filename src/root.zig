@@ -45,8 +45,10 @@ pub const engine = @import("engine.zig");
 
 /// Top-level engine type. Construct with `Engine.init(allocator, config, &pool)`.
 pub const Engine = engine.Engine;
-/// Engine configuration. See `engine.Config` for field documentation.
-pub const Config = engine.Config;
+/// Canonical engine configuration. See `engine.EngineConfig` for fields.
+pub const EngineConfig = engine.EngineConfig;
+/// Backwards-compatible alias for `EngineConfig`. New code should use `EngineConfig`.
+pub const Config = engine.EngineConfig;
 
 // ============================================================================
 // Unit Tests
