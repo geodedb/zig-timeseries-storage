@@ -10,6 +10,28 @@ const owner_only_file_mode = 0o600;
 pub const MANIFEST_MAGIC: [8]u8 = .{ 'T', 'S', 'M', 'N', 'F', 'S', '0', '1' };
 pub const MANIFEST_VERSION: u32 = 1;
 
+/// Errors specific to the on-disk manifest. As with `SegmentError`,
+/// functions may ALSO bubble up allocator and file-system errors
+/// (`OutOfMemory`, `FileNotFound`, etc.); those stay on the inferred
+/// error set.
+pub const ManifestError = error{
+    /// Header magic mismatch.
+    InvalidMagic,
+    /// CRC32C over the body did not match the stored CRC.
+    ChecksumMismatch,
+    /// File shorter than a serialised manifest header.
+    FileTooSmall,
+    /// Read returned fewer bytes than requested.
+    UnexpectedEndOfFile,
+    /// File or segment-count claim exceeded a defensive cap. See
+    /// `limits.MAX_MANIFEST_SIZE` / `MAX_SEGMENTS_PER_MANIFEST`.
+    ManifestTooLarge,
+    /// Generic catch-all for malformed payload bytes.
+    InvalidData,
+    /// No on-disk manifest slot loaded cleanly.
+    NoManifest,
+};
+
 /// Size of the serialized manifest in bytes:
 /// magic(8) + fields + CRC32(4)
 const FIELD_SIZE: usize = 4 + 16 + 8 + 8 + 8 + 8 + 8; // = 60

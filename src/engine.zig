@@ -20,6 +20,28 @@ const wal_record = @import("wal_record.zig");
 /// compaction work over enough memtable flushes to matter.
 const kL0CompactionThreshold: usize = 4;
 
+/// Engine-level error set, unioning the named sets from each module
+/// the engine builds on plus a handful of engine-only conditions.
+///
+/// In practice most engine APIs still return inferred error sets
+/// (`!T`) because they also produce allocator and file-system
+/// errors whose union would balloon the surface. This set is the
+/// canonical place for callers who want to discriminate
+/// timeseries-storage failures from generic IO.
+pub const EngineError = wal_manager.WalError || segment.SegmentError || manifest.ManifestError || error{
+    /// `EngineConfig.data_dir` was empty.
+    InvalidDataDir,
+    /// `EngineConfig.data_dir` contained a `..` component.
+    PathTraversal,
+    /// `appendPoints` was called with more than `limits.MAX_APPEND_BATCH_POINTS`.
+    BatchTooLarge,
+    /// A segment file referenced by the manifest is missing on disk.
+    SegmentFileMissing,
+    /// A segment file is present but does not start with `SEGMENT_MAGIC`
+    /// or is otherwise too short to be valid.
+    SegmentCorrupted,
+};
+
 /// WAL recovery policy.
 ///
 /// - `fail_closed` (default): any deserialisation failure or CRC32C

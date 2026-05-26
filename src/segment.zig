@@ -11,6 +11,27 @@ const owner_only_file_mode = 0o600;
 
 pub const SEGMENT_MAGIC: [8]u8 = .{ 'T', 'S', 'S', 'E', 'G', '0', '0', '1' };
 
+/// Errors specific to segment file integrity. Functions that touch
+/// the segment files may ALSO return allocator or file-system errors
+/// (`error.OutOfMemory`, `error.FileNotFound`, etc.); those keep an
+/// inferred error set rather than being named here because the
+/// resulting union would be unwieldy and would not add discrimination
+/// value over the standard library types.
+pub const SegmentError = error{
+    /// File is shorter than the magic header.
+    InvalidFile,
+    /// First 8 bytes of the segment do not match `SEGMENT_MAGIC`.
+    InvalidMagic,
+    /// `Block.decodePoints` rejected `data_len` for exceeding
+    /// `limits.MAX_BLOCK_DATA_LEN`.
+    BlockTooLarge,
+    /// `GorillaEncoder.encodePoint` refused to grow the bitset past
+    /// `limits.MAX_POINTS_PER_BLOCK_ABSOLUTE`.
+    BlockPointLimitExceeded,
+    /// Read returned fewer bytes than requested.
+    UnexpectedEOF,
+};
+
 /// Build the on-disk path for a segment file, e.g. `<data_dir>/<id>.tsseg`.
 /// Caller owns the returned slice and must free it with `allocator.free`.
 pub fn segmentPath(allocator: Allocator, data_dir: []const u8, id: u64) ![]u8 {

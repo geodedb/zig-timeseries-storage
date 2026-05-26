@@ -8,6 +8,25 @@ const wal_record = @import("wal_record.zig");
 const WalRecord = wal_record.WalRecord;
 const TS_IDENTITY_FILE = "ts.uuid";
 
+/// Errors specific to WAL recovery and integrity checks. Module
+/// functions that can ALSO fail with allocator or file-system errors
+/// keep an inferred error set (`!T`) so they pick up the underlying
+/// errors automatically. This set is used for tests and for callers
+/// that need to discriminate WAL-specific failures from generic IO.
+pub const WalError = error{
+    /// `WalRecord.deserialize` could not parse a record (length
+    /// mismatch, invalid enum tag, etc.).
+    InvalidFormat,
+    /// CRC32C mismatch between stored and computed inner checksums
+    /// during strict recovery.
+    ChecksumMismatch,
+    /// The WAL identity file (`ts.uuid`) on disk does not match the
+    /// engine's expected UUID.
+    UuidMismatch,
+    /// A record's payload length exceeded `MAX_WAL_PAYLOAD`.
+    WalRecordTooLarge,
+};
+
 /// Configuration for the WAL manager.
 pub const WalConfig = struct {
     encryption_key: ?[32]u8 = null,

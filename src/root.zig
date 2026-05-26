@@ -52,9 +52,46 @@ pub const EngineConfig = engine.EngineConfig;
 pub const Config = engine.EngineConfig;
 
 // ============================================================================
+// Re-exports — named error sets. Most engine APIs still return inferred
+// error sets (`!T`) since their union with allocator/filesystem errors
+// is broad; these named sets are exposed for callers and tests that
+// want to discriminate timeseries-storage failures from generic IO.
+// ============================================================================
+
+pub const WalError = wal_manager.WalError;
+pub const SegmentError = segment.SegmentError;
+pub const ManifestError = manifest.ManifestError;
+pub const EngineError = engine.EngineError;
+
+// ============================================================================
 // Unit Tests
 // ============================================================================
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "root: named error sets are reachable and well-formed" {
+    // Spot-check the exposed named error sets so a future rename of
+    // a tag inside a sub-module breaks at the boundary instead of
+    // silently dropping a public API surface.
+    const we: WalError = error.InvalidFormat;
+    try std.testing.expect(we == error.InvalidFormat);
+
+    const se: SegmentError = error.InvalidMagic;
+    try std.testing.expect(se == error.InvalidMagic);
+
+    const me: ManifestError = error.ChecksumMismatch;
+    try std.testing.expect(me == error.ChecksumMismatch);
+
+    const ee: EngineError = error.SegmentFileMissing;
+    try std.testing.expect(ee == error.SegmentFileMissing);
+
+    // The unioned EngineError must include every constituent set.
+    const inherited_wal: EngineError = error.UuidMismatch;
+    try std.testing.expect(inherited_wal == error.UuidMismatch);
+    const inherited_seg: EngineError = error.BlockTooLarge;
+    try std.testing.expect(inherited_seg == error.BlockTooLarge);
+    const inherited_man: EngineError = error.ManifestTooLarge;
+    try std.testing.expect(inherited_man == error.ManifestTooLarge);
 }
