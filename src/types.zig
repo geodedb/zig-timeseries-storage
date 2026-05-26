@@ -5,14 +5,19 @@ const std = @import("std");
 
 /// Time-series data point.
 pub const Point = struct {
-    ts: i64, // Unix timestamp in milliseconds
-    value: i64,
-};
-
-/// Floating-point time-series point for advanced analytics.
-pub const PointF64 = struct {
+    /// Caller-chosen monotonic timestamp. The engine treats this as an
+    /// opaque `i64` and does not enforce a unit: it never reads a wall
+    /// clock, never converts to or from time zones, and never assumes
+    /// any particular epoch. The on-disk spec (`docs/ts-storage-spec.md`)
+    /// describes this field in milliseconds since the Unix epoch as a
+    /// convention for interop, but any monotonically non-decreasing
+    /// `i64` chosen by the caller is accepted (e.g. nanoseconds,
+    /// microseconds, logical counters). Mixing units within the same
+    /// series will silently break range queries, segment min/max
+    /// statistics, and Gorilla delta-of-delta compression — callers are
+    /// responsible for picking one unit per series and sticking to it.
     ts: i64,
-    value: f64,
+    value: i64,
 };
 
 /// Unique identifier for a time-series.
