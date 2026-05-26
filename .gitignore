@@ -57,8 +57,11 @@ benchmarks/results/.tmp/
 benchmarks/results/latest.json
 benchmarks/results/scale-latest.json
 
-# Local toolchains
+# Local toolchains and dep-cache scratch
 zig-*/
+# Root-level scratch experiments (production code lives under src/)
+/list_thread.zig
+/scratch_*.zig
 
 # Secrets and credentials
 .env*
