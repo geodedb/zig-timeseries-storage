@@ -217,9 +217,30 @@ pub const Engine = struct {
     pub fn appendPoints(self: *Engine, series_id: types.SeriesId, points: []const types.Point) !void {
         if (points.len == 0) return;
 
-        const payload_size = 16 + (points.len * 16);
-        const payload = try self.allocator.alloc(u8, payload_size);
+        const payload = try encodeAppendPointsPayload(self.allocator, series_id, points);
         defer self.allocator.free(payload);
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+
+        _ = try self.appendToWalLocked(payload);
+        try self.active_mem.insert(series_id, points);
+        try self.maybeTriggerFlushLocked(io);
+    }
+
+    /// Serialise `(series_id, points)` into the WAL record payload
+    /// format expected by `wal_record.WalRecord`. Layout is
+    /// `series_id (u128 LE) || (i64 ts, i64 value)*`. Caller owns the
+    /// returned buffer.
+    fn encodeAppendPointsPayload(
+        allocator: Allocator,
+        series_id: types.SeriesId,
+        points: []const types.Point,
+    ) ![]u8 {
+        const payload_size = 16 + (points.len * 16);
+        const payload = try allocator.alloc(u8, payload_size);
+        errdefer allocator.free(payload);
 
         std.mem.writeInt(u128, payload[0..16], series_id, .little);
         var pos: usize = 16;
@@ -229,48 +250,44 @@ pub const Engine = struct {
             std.mem.writeInt(i64, payload[pos..][0..8], pt.value, .little);
             pos += 8;
         }
+        return payload;
+    }
 
+    /// Append an already-encoded payload to the WAL and return the
+    /// assigned LSN. Must be called with `self.mu` held — the WAL
+    /// library is not internally synchronised.
+    fn appendToWalLocked(self: *Engine, payload: []const u8) !u64 {
         var rec = wal_record.WalRecord{
             .lsn = 0,
             .record_type = .append_points,
             .payload = payload,
             .checksum = 0,
         };
+        // The returned LSN isn't surfaced through appendPoints today,
+        // but is captured here so a future "wait until durable" API
+        // can return it without reshaping the call site. See
+        // manifest.last_checkpoint_lsn for the related watermark.
+        return try self.wal.appendRecord(&rec);
+    }
 
-        const io = std.Io.Threaded.global_single_threaded.io();
-        self.mu.lockUncancelable(io);
-        defer self.mu.unlock(io);
-
-        // Capture the assigned LSN. We do not surface it from
-        // appendPoints today, but having it bound to a named local
-        // (rather than discarded with `_ = try ...`) makes it
-        // trivially available for the in-memory watermark / future
-        // ack-on-commit work referenced by manifest.last_checkpoint_lsn.
-        // TODO: thread `lsn` into a per-call ack / return value when
-        // the public API grows a "wait until durable" surface.
-        const lsn = try self.wal.appendRecord(&rec);
-        _ = lsn;
-
-        // Write to Memtable
-        try self.active_mem.insert(series_id, points);
-
-        // Back-pressure: if a flush is in flight AND we've already
-        // tripped the next-flush threshold, park on the cv until the
-        // worker clears `flushing_mem`. Burning CPU here used to
-        // contend with the worker doing the actual flush.
+    /// If the active memtable has tripped its flush threshold,
+    /// rotate it into the flushing slot and submit a flush worker.
+    /// Honours back-pressure: parks on `done_cv` when a previous
+    /// flush is still in flight. Must be called with `self.mu` held.
+    fn maybeTriggerFlushLocked(self: *Engine, io: std.Io) !void {
         while (self.active_mem.shouldFlush() and self.flushing_mem != null) {
             self.done_cv.waitUncancelable(io, &self.mu);
         }
+        if (!self.active_mem.shouldFlush()) return;
 
-        if (self.active_mem.shouldFlush()) {
-            self.flushing_mem = self.active_mem;
-            self.active_mem = memtable.Memtable.init(self.allocator, self.config.max_memtable_points);
-            _ = self.pool.submit(flushWorker, self, .{}) catch |err| {
-                self.flushing_mem.?.deinit();
-                self.flushing_mem = null;
-                return err;
-            };
-        }
+        self.flushing_mem = self.active_mem;
+        self.active_mem = memtable.Memtable.init(self.allocator, self.config.max_memtable_points);
+        _ = self.pool.submit(flushWorker, self, .{}) catch |err| {
+            self.flushing_mem.?.deinit();
+            self.flushing_mem = null;
+            self.done_cv.broadcast(io);
+            return err;
+        };
     }
 
     fn flushWorker(ctx: *anyopaque, _: *thread_pool.TaskContext) void {
@@ -488,17 +505,22 @@ pub const Engine = struct {
         var compactor = compaction.Compactor.init(self.allocator, self.pool);
         try compactor.compactSegments(paths.items, out_path);
 
+        // Build an O(1)-lookup hash set of the IDs we just compacted so
+        // the "kept segments" filter below is O(n) over the manifest,
+        // not O(n × k) where k is the number of L0 segments folded into
+        // the new L1. Closes P-ALGO-004 / Q-CPLX-002.
+        var compacted_ids = std.AutoHashMap(u64, void).init(self.allocator);
+        defer compacted_ids.deinit();
+        try compacted_ids.ensureTotalCapacity(@intCast(l0_segs.items.len));
+        for (l0_segs.items) |seg| compacted_ids.putAssumeCapacity(seg.id, {});
+
         {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
 
             var new_segments = std.ArrayListUnmanaged(manifest.SegmentMeta).empty;
             for (self.man.segments.items) |seg| {
-                var is_compacted = false;
-                for (l0_segs.items) |c_seg| {
-                    if (c_seg.id == seg.id) is_compacted = true;
-                }
-                if (!is_compacted) {
+                if (!compacted_ids.contains(seg.id)) {
                     try new_segments.append(self.allocator, seg);
                 }
             }
@@ -563,77 +585,87 @@ pub const Engine = struct {
     pub fn queryPoints(self: *Engine, arena: Allocator, series_id: types.SeriesId, start_ts: i64, end_ts: i64) !*iterator.MergeIterator {
         const io = std.Io.Threaded.global_single_threaded.io();
 
-        var merge_it = try arena.create(iterator.MergeIterator);
+        const merge_it = try arena.create(iterator.MergeIterator);
         merge_it.* = iterator.MergeIterator.init(arena);
 
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
 
-        // 1. Query Active Memtable
-        if (self.active_mem.series.get(series_id)) |pts| {
-            var filtered_pts = std.ArrayListUnmanaged(types.Point).empty;
-            for (pts.items) |pt| {
-                if (pt.ts >= start_ts and pt.ts <= end_ts) {
-                    try filtered_pts.append(arena, pt);
-                }
-            }
-            if (filtered_pts.items.len > 0) {
-                var slice_it = try arena.create(iterator.SliceIterator);
-                slice_it.* = .{ .slice = try filtered_pts.toOwnedSlice(arena) };
-                try merge_it.addIterator(slice_it.iterator());
-            }
+        try queryMemtable(arena, &self.active_mem, series_id, start_ts, end_ts, merge_it);
+        if (self.flushing_mem) |*mem| {
+            try queryMemtable(arena, mem, series_id, start_ts, end_ts, merge_it);
         }
-
-        // 2. Query Flushing Memtable
-        if (self.flushing_mem) |mem| {
-            if (mem.series.get(series_id)) |pts| {
-                var filtered_pts = std.ArrayListUnmanaged(types.Point).empty;
-                for (pts.items) |pt| {
-                    if (pt.ts >= start_ts and pt.ts <= end_ts) {
-                        try filtered_pts.append(arena, pt);
-                    }
-                }
-                if (filtered_pts.items.len > 0) {
-                    var slice_it = try arena.create(iterator.SliceIterator);
-                    slice_it.* = .{ .slice = try filtered_pts.toOwnedSlice(arena) };
-                    try merge_it.addIterator(slice_it.iterator());
-                }
-            }
-        }
-
-        // 3. Query Segments
         for (self.man.segments.items) |seg| {
             if (seg.min_ts > end_ts or seg.max_ts < start_ts) continue;
-
-            const p = try segment.segmentPath(self.allocator, self.config.data_dir, seg.id);
-            defer self.allocator.free(p);
-
-            var seg_reader = segment.SegmentReader.init(self.allocator, p) catch continue;
-            defer seg_reader.deinit();
-
-            var block_it = seg_reader.iterator();
-            while (block_it.next() catch null) |block| {
-                if (block.header.series_id != series_id) continue;
-                if (block.header.stats.max_ts < start_ts) continue;
-                if (block.header.stats.min_ts > end_ts) continue;
-
-                if (block.decodePoints(arena) catch null) |pts| {
-                    var filtered_pts = std.ArrayListUnmanaged(types.Point).empty;
-                    for (pts) |pt| {
-                        if (pt.ts >= start_ts and pt.ts <= end_ts) {
-                            filtered_pts.append(arena, pt) catch continue;
-                        }
-                    }
-                    if (filtered_pts.items.len > 0) {
-                        var slice_it = try arena.create(iterator.SliceIterator);
-                        slice_it.* = .{ .slice = try filtered_pts.toOwnedSlice(arena) };
-                        try merge_it.addIterator(slice_it.iterator());
-                    }
-                }
-            }
+            try self.querySegment(arena, seg, series_id, start_ts, end_ts, merge_it);
         }
 
         return merge_it;
+    }
+
+    /// Drain points for `series_id` in `[start_ts, end_ts]` from a
+    /// memtable into `merge_it`. Allocates the filtered slice on the
+    /// supplied arena.
+    fn queryMemtable(
+        arena: Allocator,
+        mem: *const memtable.Memtable,
+        series_id: types.SeriesId,
+        start_ts: i64,
+        end_ts: i64,
+        merge_it: *iterator.MergeIterator,
+    ) !void {
+        const pts = mem.series.get(series_id) orelse return;
+        var filtered_pts = std.ArrayListUnmanaged(types.Point).empty;
+        for (pts.items) |pt| {
+            if (pt.ts >= start_ts and pt.ts <= end_ts) {
+                try filtered_pts.append(arena, pt);
+            }
+        }
+        if (filtered_pts.items.len == 0) return;
+
+        var slice_it = try arena.create(iterator.SliceIterator);
+        slice_it.* = .{ .slice = try filtered_pts.toOwnedSlice(arena) };
+        try merge_it.addIterator(slice_it.iterator());
+    }
+
+    /// Open `seg` from disk and append any overlapping blocks for
+    /// `series_id` to `merge_it`. Segment-level open/iterate errors
+    /// are best-effort skipped (per-segment), matching the pre-refactor
+    /// behaviour; this is tracked under Q-REL-003.
+    fn querySegment(
+        self: *Engine,
+        arena: Allocator,
+        seg: manifest.SegmentMeta,
+        series_id: types.SeriesId,
+        start_ts: i64,
+        end_ts: i64,
+        merge_it: *iterator.MergeIterator,
+    ) !void {
+        const p = try segment.segmentPath(self.allocator, self.config.data_dir, seg.id);
+        defer self.allocator.free(p);
+
+        var seg_reader = segment.SegmentReader.init(self.allocator, p) catch return;
+        defer seg_reader.deinit();
+
+        var block_it = seg_reader.iterator();
+        while (block_it.next() catch null) |block| {
+            if (block.header.series_id != series_id) continue;
+            if (block.header.stats.max_ts < start_ts) continue;
+            if (block.header.stats.min_ts > end_ts) continue;
+
+            const pts = block.decodePoints(arena) catch continue;
+            var filtered_pts = std.ArrayListUnmanaged(types.Point).empty;
+            for (pts) |pt| {
+                if (pt.ts >= start_ts and pt.ts <= end_ts) {
+                    filtered_pts.append(arena, pt) catch continue;
+                }
+            }
+            if (filtered_pts.items.len == 0) continue;
+
+            var slice_it = try arena.create(iterator.SliceIterator);
+            slice_it.* = .{ .slice = try filtered_pts.toOwnedSlice(arena) };
+            try merge_it.addIterator(slice_it.iterator());
+        }
     }
 
     /// Force the WAL and manifest to durable storage (fsync the WAL,
