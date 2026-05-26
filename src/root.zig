@@ -29,6 +29,7 @@ const std = @import("std");
 pub const version: []const u8 = "0.1.0";
 
 pub const types = @import("types.zig");
+pub const limits = @import("limits.zig");
 pub const gorilla = @import("encoding/gorilla.zig");
 pub const segment = @import("segment.zig");
 pub const wal_record = @import("wal_record.zig");

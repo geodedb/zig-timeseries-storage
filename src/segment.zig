@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const limits = @import("limits.zig");
 const gorilla = @import("encoding/gorilla.zig");
 
 const Allocator = std.mem.Allocator;
@@ -228,6 +229,12 @@ pub const Block = struct {
 
     /// Decodes the points in this block.
     pub fn decodePoints(self: Block, allocator: Allocator) ![]types.Point {
+        // CWE-770: refuse to allocate for absurd `data_len` values
+        // before they reach the allocator. The header is an
+        // attacker-influenced field (CRC covers only the data, not
+        // the header), so this is a defence-in-depth bound.
+        if (self.header.data_len > limits.MAX_BLOCK_DATA_LEN) return error.BlockTooLarge;
+
         const data = try allocator.alloc(u8, self.header.data_len);
         defer allocator.free(data);
 
@@ -281,4 +288,54 @@ test "Segment roundtrip" {
 
         try std.testing.expect((try it.next()) == null);
     }
+}
+
+test "Segment: decodePoints refuses oversized data_len" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path);
+    const seg_path = try std.fmt.allocPrint(allocator, "{s}/bad.tsseg", .{path});
+    defer allocator.free(seg_path);
+
+    // Hand-craft a segment file: magic + a single header with a
+    // data_len that exceeds MAX_BLOCK_DATA_LEN. We never write the
+    // payload — the decode-time check fires first.
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, seg_path, .{
+            .read = false,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        });
+        defer f.close(io);
+        try f.writeStreamingAll(io, &SEGMENT_MAGIC);
+
+        var hdr_buf: [BlockHeader.encoded_size]u8 = undefined;
+        const h = BlockHeader{
+            .series_id = 1,
+            .stats = .{
+                .min_ts = 0,
+                .max_ts = 1,
+                .count = 1,
+                .min_value = 0,
+                .max_value = 1,
+                .sum = 0,
+                .first_value = 0,
+                .last_value = 0,
+            },
+            .data_len = limits.MAX_BLOCK_DATA_LEN + 1,
+        };
+        h.serialize(&hdr_buf);
+        try f.writeStreamingAll(io, &hdr_buf);
+        try f.sync(io);
+    }
+
+    var reader = try SegmentReader.init(allocator, seg_path);
+    defer reader.deinit();
+    var it = reader.iterator();
+    const blk = (try it.next()).?;
+
+    try std.testing.expectError(error.BlockTooLarge, blk.decodePoints(allocator));
 }

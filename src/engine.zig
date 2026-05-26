@@ -4,6 +4,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
+const limits = @import("limits.zig");
 const wal_manager = @import("wal_manager.zig");
 const manifest = @import("manifest.zig");
 const memtable = @import("memtable.zig");
@@ -191,7 +192,9 @@ pub const Engine = struct {
     /// pre-resolved path. Absolute paths are preferred but not
     /// required (test helpers like `std.testing.tmpDir` produce
     /// relative paths under the cwd).
-    fn validateDataDir(data_dir: []const u8) !void {
+    ///
+    /// Exposed for unit tests; production code reaches it via `init`.
+    pub fn validateDataDir(data_dir: []const u8) !void {
         if (data_dir.len == 0) return error.InvalidDataDir;
         if (std.mem.indexOf(u8, data_dir, "..") != null) return error.PathTraversal;
     }
@@ -342,6 +345,11 @@ pub const Engine = struct {
     ///   state is consistent.
     pub fn appendPoints(self: *Engine, series_id: types.SeriesId, points: []const types.Point) !void {
         if (points.len == 0) return;
+        // CWE-770: cap attacker-influenced batch size before any
+        // allocation. The transient payload buffer below is 16 bytes
+        // per point; bounding the batch bounds the worst-case
+        // allocation an external caller can force.
+        if (points.len > limits.MAX_APPEND_BATCH_POINTS) return error.BatchTooLarge;
 
         const payload = try encodeAppendPointsPayload(self.allocator, series_id, points);
         defer self.allocator.free(payload);
@@ -845,4 +853,41 @@ test "Engine basic operations" {
     try engine.flush();
 
     try std.testing.expectEqual(@as(usize, 1), engine.man.segments.items.len);
+}
+
+test "Engine: appendPoints rejects oversized batch" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 1_000_000,
+    }, &pool);
+    defer engine.deinit();
+
+    // Constructing an actual MAX_APPEND_BATCH_POINTS+1 slice would
+    // be wasteful; we synthesise a fake-length slice via a
+    // zero-stride pointer trick that the type system accepts but
+    // we never read from (the size check rejects before any deref).
+    const fake_len = limits.MAX_APPEND_BATCH_POINTS + 1;
+    const stub_pt: types.Point = .{ .ts = 0, .value = 0 };
+    const oversize: []const types.Point = @as([*]const types.Point, @ptrCast(&stub_pt))[0..fake_len];
+
+    try std.testing.expectError(error.BatchTooLarge, engine.appendPoints(1, oversize));
+}
+
+test "Engine: validateDataDir rejects empty and traversal" {
+    try std.testing.expectError(error.InvalidDataDir, Engine.validateDataDir(""));
+    try std.testing.expectError(error.PathTraversal, Engine.validateDataDir("../etc"));
+    try std.testing.expectError(error.PathTraversal, Engine.validateDataDir("foo/../bar"));
+    try Engine.validateDataDir("/tmp/safe");
+    try Engine.validateDataDir("relative/safe");
 }

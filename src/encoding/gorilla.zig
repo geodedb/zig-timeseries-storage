@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("../types.zig");
+const limits = @import("../limits.zig");
 
 pub const BlockStats = struct {
     min_ts: i64,
@@ -53,6 +54,15 @@ pub const GorillaEncoder = struct {
 
     /// Encode a time-series point using Gorilla compression.
     pub fn encodePoint(self: *GorillaEncoder, point: types.Point) !void {
+        // CWE-770: hard cap on points per block. Without this the
+        // internal `DynamicBitSet` would double its capacity every
+        // time `writeBits` runs out of room; an adversarial caller
+        // could OOM the process by encoding indefinitely. The cap
+        // is checked on `count` *before* the increment so the limit
+        // is inclusive.
+        if (self.stats.count >= limits.MAX_POINTS_PER_BLOCK_ABSOLUTE) {
+            return error.BlockPointLimitExceeded;
+        }
         self.stats.count += 1;
         self.stats.sum += @as(i128, point.value);
         if (point.ts < self.stats.min_ts) self.stats.min_ts = point.ts;
@@ -390,3 +400,20 @@ pub const GorillaDecoder = struct {
         return try points.toOwnedSlice(allocator);
     }
 };
+
+test "GorillaEncoder: refuses to grow past the absolute point cap" {
+    const allocator = std.testing.allocator;
+    var enc = try GorillaEncoder.init(allocator);
+    defer enc.deinit();
+
+    // Drive the encoder up to the cap without doing the full
+    // limits.MAX_POINTS_PER_BLOCK_ABSOLUTE iterations (too slow for
+    // a unit test). Spoof the internal count instead — the cap
+    // check is purely on `self.stats.count`, so this proves the
+    // gate fires correctly without burning seconds in the loop.
+    enc.stats.count = limits.MAX_POINTS_PER_BLOCK_ABSOLUTE;
+    try std.testing.expectError(
+        error.BlockPointLimitExceeded,
+        enc.encodePoint(.{ .ts = 1, .value = 1 }),
+    );
+}

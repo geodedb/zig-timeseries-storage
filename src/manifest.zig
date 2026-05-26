@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const limits = @import("limits.zig");
 const Crc32 = std.hash.crc.Crc32Iscsi;
 const owner_only_file_mode = 0o600;
 
@@ -155,6 +156,10 @@ pub const Manifest = struct {
         pos += 8;
         const num_segments = readU32(data, pos);
         pos += 4;
+        // CWE-770: defend against a manifest whose declared
+        // `num_segments` field is wildly inflated. We still allocate
+        // O(n) below; bounding `n` bounds the worst case.
+        if (num_segments > limits.MAX_SEGMENTS_PER_MANIFEST) return error.ManifestTooLarge;
 
         m.segments = std.ArrayListUnmanaged(SegmentMeta).empty;
         for (0..num_segments) |_| {
@@ -199,6 +204,11 @@ pub const Manifest = struct {
 
         const file_len = try file.length(io);
         if (file_len < SERIALIZED_SIZE + 4) return error.FileTooSmall;
+        // CWE-770: cap the on-disk manifest size before `@intCast` to
+        // usize and before allocating a buffer for it. Without this
+        // gate a hostile file claiming many GiB would attempt an
+        // immediate large allocation.
+        if (file_len > limits.MAX_MANIFEST_SIZE) return error.ManifestTooLarge;
         const data = try allocator.alloc(u8, @intCast(file_len));
         defer allocator.free(data);
         const bytes_read = try file.readPositionalAll(io, data, 0);
@@ -258,4 +268,63 @@ test "Manifest serialize/deserialize round-trip" {
     try std.testing.expectEqual(m.series_count, m2.series_count);
     try std.testing.expectEqual(m.point_count, m2.point_count);
     m2.deinit();
+}
+
+test "Manifest: deserialize rejects inflated num_segments" {
+    const allocator = std.testing.allocator;
+
+    // Build a minimum-sized manifest with a num_segments value just
+    // above MAX_SEGMENTS_PER_MANIFEST. We are NOT writing that many
+    // segment entries — the field is consulted before the loop, so
+    // the cap check fires first.
+    const data = try allocator.alloc(u8, SERIALIZED_SIZE + 4);
+    defer allocator.free(data);
+    @memset(data, 0);
+    @memcpy(data[0..8], &MANIFEST_MAGIC);
+    var pos: usize = 8;
+    writeU32(data, &pos, MANIFEST_VERSION);
+    pos += 16; // ts_uuid (zero-filled)
+    writeU64(data, &pos, 1); // counter
+    writeU64(data, &pos, 0); // last_checkpoint_lsn
+    writeU64(data, &pos, 1); // next_segment_id
+    writeU64(data, &pos, 0); // series_count
+    writeU64(data, &pos, 0); // point_count
+    writeU32(data, &pos, limits.MAX_SEGMENTS_PER_MANIFEST + 1);
+
+    const crc = Crc32.hash(data[0..pos]);
+    writeU32(data, &pos, crc);
+
+    try std.testing.expectError(error.ManifestTooLarge, Manifest.deserialize(allocator, data));
+}
+
+test "Manifest: readFromFile rejects oversized file" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path);
+    const mf_path = try std.fmt.allocPrint(allocator, "{s}/oversized", .{path});
+    defer allocator.free(mf_path);
+
+    // Write a header followed by a hole punched to the cap+1 byte so
+    // the sparse file's `length()` exceeds the limit. We use a
+    // single positional write at the high offset to avoid actually
+    // materialising the entire file.
+    const f = try std.Io.Dir.cwd().createFile(io, mf_path, .{
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    });
+    defer f.close(io);
+
+    var hdr: [SERIALIZED_SIZE + 4]u8 = undefined;
+    @memset(&hdr, 0);
+    @memcpy(hdr[0..8], &MANIFEST_MAGIC);
+    try f.writeStreamingAll(io, &hdr);
+
+    var sentinel: [1]u8 = .{0xAA};
+    try f.writePositionalAll(io, &sentinel, limits.MAX_MANIFEST_SIZE + 1);
+    try f.sync(io);
+
+    try std.testing.expectError(error.ManifestTooLarge, Manifest.readFromFile(allocator, mf_path));
 }
