@@ -38,56 +38,19 @@ pub const memtable = @import("memtable.zig");
 pub const iterator = @import("iterator.zig");
 pub const compaction = @import("compaction.zig");
 pub const engine = @import("engine.zig");
-pub const integration = @import("integration.zig");
 
 // ============================================================================
-// Public Types
+// Re-exports — primary public API.
 // ============================================================================
 
-/// Example configuration structure.
-pub const Config = struct {
-    /// Enable debug output.
-    debug: bool = false,
-    /// Maximum retry attempts.
-    max_retries: u32 = 3,
-    /// Timeout in milliseconds.
-    timeout_ms: u64 = 30_000,
-};
-
-// ============================================================================
-// Public Functions
-// ============================================================================
-
-/// Initialize the library with the given configuration.
-///
-/// Returns an error if the configuration is invalid.
-pub fn init(config: Config) !void {
-    if (config.max_retries == 0) return error.InvalidConfig;
-    if (config.timeout_ms == 0) return error.InvalidConfig;
-}
+/// Top-level engine type. Construct with `Engine.init(allocator, config, &pool)`.
+pub const Engine = engine.Engine;
+/// Engine configuration. See `engine.Config` for field documentation.
+pub const Config = engine.Config;
 
 // ============================================================================
 // Unit Tests
 // ============================================================================
-
-test "Config default values" {
-    const config = Config{};
-    try std.testing.expectEqual(false, config.debug);
-    try std.testing.expectEqual(@as(u32, 3), config.max_retries);
-    try std.testing.expectEqual(@as(u64, 30_000), config.timeout_ms);
-}
-
-test "init with default config" {
-    try init(.{});
-}
-
-test "init rejects zero max_retries" {
-    try std.testing.expectError(error.InvalidConfig, init(.{ .max_retries = 0 }));
-}
-
-test "init rejects zero timeout" {
-    try std.testing.expectError(error.InvalidConfig, init(.{ .timeout_ms = 0 }));
-}
 
 test {
     std.testing.refAllDecls(@This());

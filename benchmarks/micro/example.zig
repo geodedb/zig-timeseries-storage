@@ -7,6 +7,11 @@
 //! corner of the library don't get hidden inside a broader workload.
 //! Wired via `zig build bench-micro-example` (see build.zig). Copy
 //! this file as a starting point for additional micro-benchmarks.
+//!
+//! TODO(GAP-0011): wire real benchmark bodies — the current scenario
+//! exercises only Memtable.insert with a single batch per iteration.
+//! Phase D will land richer per-function micros (Gorilla encode/decode,
+//! manifest write/read, etc.).
 
 const std = @import("std");
 const Io = std.Io;
@@ -24,8 +29,8 @@ pub fn main(init: std.process.Init) !void {
 
     const scenarios = [_]framework.Scenario{
         .{
-            .name = "init_default_x100k",
-            .ops_per_iteration = 100_000,
+            .name = "memtable_insert_one_point",
+            .ops_per_iteration = 1,
             .warmup_iterations = 2,
             .sample_iterations = 6,
             .run = run,
@@ -40,8 +45,10 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn run(ctx: *framework.Context) anyerror!void {
-    var i: u64 = 0;
-    while (i < ctx.scenario.ops_per_iteration) : (i += 1) {
-        try lib.init(.{});
-    }
+    var mt = lib.memtable.Memtable.init(ctx.allocator, 1024);
+    defer mt.deinit();
+
+    const pts = [_]lib.types.Point{.{ .ts = 1000, .value = 42 }};
+    try mt.insert(7, &pts);
+    std.mem.doNotOptimizeAway(mt.point_count);
 }

@@ -1,9 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2024-2026 CodePros
+
+//! End-to-end Engine tests for timeseries-storage.
+//!
+//! These tests run via `zig build test-engine-e2e` and exercise the
+//! Engine through its full ingestion + flush + query path with
+//! large input volumes. Use this file for high-fan-in scenarios that
+//! would dominate the runtime of the default unit-test suite.
+
 const std = @import("std");
-const engine = @import("engine.zig");
-const types = @import("types.zig");
+const lib = @import("timeseries_storage");
 const thread_pool = @import("thread_pool");
 
-test "End-to-End Stress Test: Insert 100k points across multiple series" {
+test "End-to-End: Insert 100k points across multiple series" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -15,7 +24,7 @@ test "End-to-End Stress Test: Insert 100k points across multiple series" {
     var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 2 });
     defer pool.deinit();
 
-    var eng = try engine.Engine.init(allocator, .{
+    var eng = try lib.Engine.init(allocator, .{
         .data_dir = data_dir,
         .max_memtable_points = 10000,
     }, &pool);
@@ -24,7 +33,7 @@ test "End-to-End Stress Test: Insert 100k points across multiple series" {
     const num_series = 10;
     const points_per_series = 10000;
 
-    var pts = try allocator.alloc(types.Point, 1000);
+    var pts = try allocator.alloc(lib.types.Point, 1000);
     defer allocator.free(pts);
 
     for (0..num_series) |s_id| {
@@ -42,9 +51,6 @@ test "End-to-End Stress Test: Insert 100k points across multiple series" {
     }
 
     try eng.flush(); // Flush remaining
-
-    const total_points = num_series * points_per_series;
-    _ = total_points;
 
     try std.testing.expect(eng.man.segments.items.len <= 10);
 

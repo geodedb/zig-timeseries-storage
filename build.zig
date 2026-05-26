@@ -9,6 +9,7 @@ fn importedModule(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     module: *std.Build.Module,
+    thread_pool_module: *std.Build.Module,
 ) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = b.path(path),
@@ -16,6 +17,7 @@ fn importedModule(
         .optimize = optimize,
         .imports = &.{
             .{ .name = "timeseries_storage", .module = module },
+            .{ .name = "thread_pool", .module = thread_pool_module },
         },
     });
 }
@@ -76,6 +78,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "timeseries_storage", .module = module },
+                .{ .name = "thread_pool", .module = thread_pool },
             },
         });
         const cli_exe = b.addExecutable(.{
@@ -115,7 +118,7 @@ pub fn build(b: *std.Build) void {
 
     const integration_step = b.step("test-integration", "Run integration tests");
     const integration_tests = b.addTest(.{
-        .root_module = importedModule(b, "tests/integration.zig", target, optimize, module),
+        .root_module = importedModule(b, "tests/integration.zig", target, optimize, module, thread_pool),
     });
     integration_tests.root_module.link_libc = true;
     if (tsan) integration_tests.root_module.sanitize_thread = true;
@@ -125,16 +128,27 @@ pub fn build(b: *std.Build) void {
     const stress_optimize: std.builtin.OptimizeMode = if (tsan) .Debug else .ReleaseFast;
     const stress_step = b.step("test-stress", "Run stress and load tests");
     const stress_tests = b.addTest(.{
-        .root_module = importedModule(b, "tests/stress.zig", target, stress_optimize, module),
+        .root_module = importedModule(b, "tests/stress.zig", target, stress_optimize, module, thread_pool),
     });
     stress_tests.root_module.link_libc = true;
     if (tsan) stress_tests.root_module.sanitize_thread = true;
     stress_step.dependOn(&b.addRunArtifact(stress_tests).step);
 
-    const all_tests_step = b.step("test-all", "Run unit, integration, and stress suites");
+    // Engine end-to-end tests (large input volumes; lifted out of the
+    // default unit suite so `zig build test` stays fast).
+    const e2e_step = b.step("test-engine-e2e", "Run engine end-to-end tests");
+    const e2e_tests = b.addTest(.{
+        .root_module = importedModule(b, "tests/engine_e2e.zig", target, optimize, module, thread_pool),
+    });
+    e2e_tests.root_module.link_libc = true;
+    if (tsan) e2e_tests.root_module.sanitize_thread = true;
+    e2e_step.dependOn(&b.addRunArtifact(e2e_tests).step);
+
+    const all_tests_step = b.step("test-all", "Run unit, integration, stress, and e2e suites");
     all_tests_step.dependOn(&b.addRunArtifact(unit_tests).step);
     all_tests_step.dependOn(&b.addRunArtifact(integration_tests).step);
     all_tests_step.dependOn(&b.addRunArtifact(stress_tests).step);
+    all_tests_step.dependOn(&b.addRunArtifact(e2e_tests).step);
 
     // ------------------------------------------------------------------
     // Example — demonstrates library usage end-to-end.
@@ -142,7 +156,7 @@ pub fn build(b: *std.Build) void {
     const example_step = b.step("example", "Build and run the basic example");
     const example_exe = b.addExecutable(.{
         .name = "timeseries-storage-basic",
-        .root_module = importedModule(b, "examples/basic.zig", target, optimize, module),
+        .root_module = importedModule(b, "examples/basic.zig", target, optimize, module, thread_pool),
     });
     example_step.dependOn(&b.addRunArtifact(example_exe).step);
 
@@ -168,7 +182,7 @@ pub fn build(b: *std.Build) void {
 
     const bench_exe = b.addExecutable(.{
         .name = "timeseries-storage-bench",
-        .root_module = benchModule(b, "benchmarks/bench.zig", target, module, framework_module),
+        .root_module = benchModule(b, "benchmarks/bench.zig", target, module, framework_module, thread_pool),
     });
     b.installArtifact(bench_exe);
     const run_bench = b.addRunArtifact(bench_exe);
@@ -178,7 +192,7 @@ pub fn build(b: *std.Build) void {
 
     const scale_bench_exe = b.addExecutable(.{
         .name = "timeseries-storage-scale-bench",
-        .root_module = benchModule(b, "benchmarks/scale.zig", target, module, framework_module),
+        .root_module = benchModule(b, "benchmarks/scale.zig", target, module, framework_module, thread_pool),
     });
     b.installArtifact(scale_bench_exe);
     const run_scale_bench = b.addRunArtifact(scale_bench_exe);
@@ -205,7 +219,7 @@ pub fn build(b: *std.Build) void {
 
     const micro_example_exe = b.addExecutable(.{
         .name = "timeseries-storage-micro-example",
-        .root_module = benchModule(b, "benchmarks/micro/example.zig", target, module, framework_module),
+        .root_module = benchModule(b, "benchmarks/micro/example.zig", target, module, framework_module, thread_pool),
     });
     const run_micro_example = b.addRunArtifact(micro_example_exe);
     if (b.args) |args| run_micro_example.addArgs(args);
@@ -228,6 +242,7 @@ fn benchModule(
     target: std.Build.ResolvedTarget,
     lib_module: *std.Build.Module,
     framework_module: *std.Build.Module,
+    thread_pool_module: *std.Build.Module,
 ) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = b.path(path),
@@ -236,6 +251,7 @@ fn benchModule(
         .imports = &.{
             .{ .name = "timeseries_storage", .module = lib_module },
             .{ .name = "framework", .module = framework_module },
+            .{ .name = "thread_pool", .module = thread_pool_module },
         },
     });
 }

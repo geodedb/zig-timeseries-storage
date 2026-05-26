@@ -7,10 +7,17 @@
 //! useful for ad-hoc grid sweeps or scheduled CI runs. Wired via
 //! `zig build scale-bench` and gated to schedule/manual in the default
 //! `.gitlab-ci.yml`.
+//!
+//! TODO(GAP-0011): wire real benchmark bodies — the current scenarios
+//! exercise the public Engine surface but only with a single trivial
+//! point per iteration. Phase D will land comprehensive bench bodies
+//! (multi-batch ingest, segment-spanning queries, compaction-induced
+//! flushes) so the measurements actually reflect production workloads.
 
 const std = @import("std");
 const Io = std.Io;
 const lib = @import("timeseries_storage");
+const thread_pool = @import("thread_pool");
 const framework = @import("framework");
 
 pub fn main(init: std.process.Init) !void {
@@ -24,18 +31,18 @@ pub fn main(init: std.process.Init) !void {
 
     const scenarios = [_]framework.Scenario{
         .{
-            .name = "init_default_x1m",
-            .ops_per_iteration = 1_000_000,
+            .name = "engine_append_default",
+            .ops_per_iteration = 1,
             .warmup_iterations = 1,
             .sample_iterations = 5,
-            .run = runDefault,
+            .run = runAppendDefault,
         },
         .{
-            .name = "init_custom_x1m",
-            .ops_per_iteration = 1_000_000,
+            .name = "engine_query_default",
+            .ops_per_iteration = 1,
             .warmup_iterations = 1,
             .sample_iterations = 5,
-            .run = runCustom,
+            .run = runQueryDefault,
         },
     };
 
@@ -46,20 +53,54 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn runDefault(ctx: *framework.Context) anyerror!void {
-    var i: u64 = 0;
-    while (i < ctx.scenario.ops_per_iteration) : (i += 1) {
-        try lib.init(.{});
-    }
+fn scaleTmpDir(allocator: std.mem.Allocator, ctx: *framework.Context) ![]u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = try std.fmt.allocPrint(allocator, "/tmp/ts-scale-{s}-{d}", .{
+        ctx.scenario.name,
+        ctx.iteration_index,
+    });
+    std.Io.Dir.cwd().deleteTree(io, path) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, path);
+    return path;
 }
 
-fn runCustom(ctx: *framework.Context) anyerror!void {
-    var i: u64 = 0;
-    while (i < ctx.scenario.ops_per_iteration) : (i += 1) {
-        try lib.init(.{
-            .debug = (i & 1) == 0,
-            .max_retries = @intCast(1 + (i % 16)),
-            .timeout_ms = 1 + (i % 1024),
-        });
-    }
+fn runAppendDefault(ctx: *framework.Context) anyerror!void {
+    const data_dir = try scaleTmpDir(ctx.allocator, ctx);
+    defer std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), data_dir) catch {};
+
+    var pool = try thread_pool.ThreadPool.init(ctx.allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var eng = try lib.Engine.init(ctx.allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 1024,
+    }, &pool);
+    defer eng.deinit();
+
+    const pts = [_]lib.types.Point{.{ .ts = 1000, .value = 1 }};
+    try eng.appendPoints(1, &pts);
+}
+
+fn runQueryDefault(ctx: *framework.Context) anyerror!void {
+    const data_dir = try scaleTmpDir(ctx.allocator, ctx);
+    defer std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), data_dir) catch {};
+
+    var pool = try thread_pool.ThreadPool.init(ctx.allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var eng = try lib.Engine.init(ctx.allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 1024,
+    }, &pool);
+    defer eng.deinit();
+
+    const pts = [_]lib.types.Point{.{ .ts = 1000, .value = 1 }};
+    try eng.appendPoints(1, &pts);
+
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    var it = try eng.queryPoints(arena.allocator(), 1, 0, 2000);
+    var count: usize = 0;
+    while (it.next()) |_| count += 1;
+    std.mem.doNotOptimizeAway(count);
 }
