@@ -574,6 +574,23 @@ pub const EngineConfig = struct {
     /// See `PermissiveAccessController` and `DenyAllAccessController`
     /// for reference implementations.
     access_controller: ?AccessController = null,
+
+    /// Optional caller-supplied IO context. When `null` (default),
+    /// `Engine.init` constructs a `std.Io.Threaded` with default
+    /// options (async_limit = cpu_count - 1, concurrent_limit =
+    /// unlimited) and OWNS it — the context is torn down by
+    /// `Engine.deinit`. When non-null, the engine BORROWS this
+    /// handle; the caller retains ownership and the underlying
+    /// context must outlive the engine.
+    ///
+    /// Replaces the previous `std.Io.Threaded.global_single_threaded`
+    /// usage. The global is a process-wide singleton with
+    /// `async_limit = .nothing` and `concurrent_limit = .nothing`,
+    /// which serialises every storage I/O call onto one async slot.
+    /// Routing engine I/O through a per-engine multi-threaded
+    /// context lets reads and writes overlap on a real thread pool,
+    /// which is what P-IO-004 calls for. Closes P-IO-004.
+    io: ?std.Io = null,
 };
 
 /// Backwards-compatible alias. New code should use `EngineConfig`.
@@ -762,6 +779,25 @@ pub const Engine = struct {
     /// segment commits and clears this slot to `null`.
     flushing_mem: ?*memtable.Memtable = null,
     pool: *thread_pool.ThreadPool,
+    /// Heap-allocated multi-threaded IO context owned by this engine
+    /// when the caller did NOT supply one in `EngineConfig.io`. Heap-
+    /// allocated (rather than inline) so the `Io` handle below carries
+    /// a stable `userdata` pointer that does not move when the Engine
+    /// value is returned from `init` and copied into the caller's slot.
+    /// Constructed with default options (async_limit = cpu_count - 1,
+    /// concurrent_limit = unlimited); torn down by `deinit` AFTER the
+    /// background workers (syncer + flushers + compactors waited on
+    /// `done_cv`) have drained. Null when the caller supplied a
+    /// borrowed `Io` via the config — in that mode the caller owns
+    /// the underlying `Threaded`. Closes P-IO-004.
+    threaded: ?*std.Io.Threaded = null,
+    /// Active IO handle used by every engine method on the storage
+    /// hot paths (append, query, flush, compaction, sync). Points
+    /// into `self.threaded` when the engine owns the context, or
+    /// into the caller-supplied context when borrowed. Replaces the
+    /// previous per-call `std.Io.Threaded.global_single_threaded.io()`
+    /// fetches across this file. Closes P-IO-004.
+    io: std.Io,
     compaction_running: bool = false,
     /// Most recent error observed by a background flush or compaction
     /// worker. Cleared by `lastBackgroundError`. Workers set this under
@@ -852,6 +888,31 @@ pub const Engine = struct {
     pub fn init(allocator: Allocator, config: EngineConfig, pool: *thread_pool.ThreadPool) !Engine {
         try validateDataDir(config.data_dir);
 
+        // P-IO-004: construct (or borrow) the engine's IO context
+        // BEFORE any I/O happens. The default path heap-allocates a
+        // `std.Io.Threaded` with stdlib defaults
+        // (async_limit = cpu_count - 1, concurrent_limit = unlimited),
+        // which lets reads, fsyncs, and compactions overlap on a real
+        // thread pool. The previous behaviour fetched
+        // `global_single_threaded.io()` per call — a singleton with
+        // both limits set to `.nothing`, serialising every storage
+        // I/O onto one async slot. Heap allocation (rather than an
+        // inline field) keeps the `Io.userdata` pointer stable across
+        // the value-return from `init` into the caller's slot.
+        var owned_threaded: ?*std.Io.Threaded = null;
+        const io: std.Io = blk: {
+            if (config.io) |caller_io| break :blk caller_io;
+            const t = try allocator.create(std.Io.Threaded);
+            errdefer allocator.destroy(t);
+            t.* = std.Io.Threaded.init(allocator, .{});
+            owned_threaded = t;
+            break :blk t.io();
+        };
+        errdefer if (owned_threaded) |t| {
+            t.deinit();
+            allocator.destroy(t);
+        };
+
         // GAP-0001 (manifest TDE): thread the operator-supplied key
         // into the manifest so on-disk slots are wrapped with the
         // TSMNF002 envelope. Plaintext mode (key == null) is
@@ -873,9 +934,8 @@ pub const Engine = struct {
         // corrupt segment aborts the open; in `salvage` mode the
         // segment is silently dropped from the in-memory manifest so
         // the engine can come up. Closes GAP-0006.
-        try verifySegments(allocator, &man, config.data_dir, config.wal_recovery, &integrity_failures);
+        try verifySegments(allocator, io, &man, config.data_dir, config.wal_recovery, &integrity_failures);
 
-        const io = std.Io.Threaded.global_single_threaded.io();
         const wal_dir = try std.Io.Dir.cwd().openDir(io, config.data_dir, .{});
         var wal = try wal_manager.WalManager.init(allocator, wal_dir, man.ts_uuid, man.last_checkpoint_lsn, .{
             .create_identity_if_missing = config.create_identity_if_missing,
@@ -928,6 +988,8 @@ pub const Engine = struct {
             .man = man,
             .active_mem = std.atomic.Value(*memtable.Memtable).init(mem),
             .pool = pool,
+            .threaded = owned_threaded,
+            .io = io,
             .reader_cache = SegmentReaderCache.init(allocator, DEFAULT_SEGMENT_READER_CACHE_CAPACITY),
             .counters = .{
                 .wal_records_dropped = .init(wal_drops),
@@ -960,7 +1022,7 @@ pub const Engine = struct {
     /// `config.wal_sync_interval_ms`, syncs the WAL, repeats until
     /// `syncer_shutdown_event` is set by `deinit`.
     fn syncerLoop(self: *Engine) void {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = self.io;
         const interval_ns: u64 = @as(u64, self.config.wal_sync_interval_ms) * std.time.ns_per_ms;
         while (true) {
             // Wait up to interval_ns for the shutdown event. On
@@ -1005,13 +1067,12 @@ pub const Engine = struct {
     /// up; this is documented as a recovery escape hatch.
     fn verifySegments(
         allocator: Allocator,
+        io: std.Io,
         man: *manifest.Manifest,
         data_dir: []const u8,
         policy: WalRecoveryPolicy,
         integrity_counter: ?*u64,
     ) !void {
-        const io = std.Io.Threaded.global_single_threaded.io();
-
         var kept = std.ArrayListUnmanaged(manifest.SegmentMeta).empty;
         defer kept.deinit(allocator);
         try kept.ensureTotalCapacity(allocator, man.segments.items.len);
@@ -1196,7 +1257,12 @@ pub const Engine = struct {
     /// present in the active memtable will be recovered from the WAL
     /// on the next open.
     pub fn deinit(self: *Engine) void {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        // P-IO-004: use the engine-owned (or caller-borrowed) IO
+        // handle for every internal mutex / condition variable touch
+        // in this function. `self.io` is valid until the explicit
+        // `Threaded.deinit` call below — after that we MUST NOT
+        // dispatch any more I/O against it.
+        const io = self.io;
 
         // Stop the background WAL syncer FIRST so it cannot try to
         // touch the WAL after we tear it down. The syncer takes
@@ -1209,7 +1275,6 @@ pub const Engine = struct {
         }
 
         self.mu.lockUncancelable(io);
-        defer self.mu.unlock(io);
 
         // Wait for all background tasks to finish. Park on the condition
         // variable so we burn no CPU; workers broadcast it as they
@@ -1237,6 +1302,28 @@ pub const Engine = struct {
         self.append_payload_buf.deinit(self.allocator);
         self.series_watermarks.deinit(self.allocator);
         self.reader_cache.deinit();
+
+        // Release the engine lock BEFORE tearing down the threaded
+        // IO context. `Threaded.deinit` joins its worker pool; we
+        // must not hold a mutex across that join (defensive: no
+        // engine-owned worker takes `engine.mu` today, but a future
+        // hook that does would deadlock otherwise). The unlock uses
+        // the same `io` we locked with — both reference the still-
+        // live Threaded instance.
+        self.mu.unlock(io);
+
+        // P-IO-004: tear down the engine-owned threaded IO context
+        // last. By this point the syncer thread has been joined
+        // above, the condition-variable loop drained any in-flight
+        // flush / compaction worker, and `self.io` will not be used
+        // again by this function. Borrowed contexts (caller-supplied
+        // via `EngineConfig.io`) are left untouched — the caller
+        // owns their lifetime.
+        if (self.threaded) |t| {
+            t.deinit();
+            self.allocator.destroy(t);
+            self.threaded = null;
+        }
     }
 
     /// Append a batch of points to the given series.
@@ -1294,7 +1381,7 @@ pub const Engine = struct {
         // is ~30 ns on commodity hardware — negligible next to the
         // WAL fsync this call ultimately amortises into.
         const t_start = nowMonotonicNs();
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = self.io;
 
         // P-LOCK-005: take `engine.mu` ONLY for the strict-OoO check
         // (which touches the per-series watermark map). The default
@@ -1524,7 +1611,7 @@ pub const Engine = struct {
         var self = safety.castCtx(Engine, ctx);
         const t_start = nowMonotonicNs();
         self.flushInternal() catch |err| {
-            const io = std.Io.Threaded.global_single_threaded.io();
+            const io = self.io;
             self.mu.lockUncancelable(io);
             if (self.flushing_mem) |fm| {
                 fm.deinit();
@@ -1634,7 +1721,7 @@ pub const Engine = struct {
     /// Threading: takes the engine's lock; safe to call concurrently
     /// with other engine methods.
     pub fn lastBackgroundError(self: *Engine) ?anyerror {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = self.io;
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
         const err = self.last_background_error;
@@ -1659,7 +1746,7 @@ pub const Engine = struct {
     /// error bubbles up. On error the engine state is consistent and
     /// the call may be retried.
     pub fn flush(self: *Engine) !void {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = self.io;
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
 
@@ -1726,7 +1813,7 @@ pub const Engine = struct {
     }
 
     fn flushInternal(self: *Engine) !void {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = self.io;
         var min_ts: i64 = std.math.maxInt(i64);
         var max_ts: i64 = std.math.minInt(i64);
 
@@ -1852,7 +1939,7 @@ pub const Engine = struct {
     }
 
     fn triggerCompaction(self: *Engine) !void {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = self.io;
         self.mu.lockUncancelable(io);
         var l0_count: usize = 0;
         for (self.man.segments.items) |seg| {
@@ -1894,7 +1981,7 @@ pub const Engine = struct {
     /// Concurrent `appendPoints` calls will block briefly while the
     /// final swap commits, but otherwise proceed normally.
     pub fn compactAll(self: *Engine) !void {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = self.io;
 
         // Wait for any in-flight background compaction to drain. We do
         // not want two compactions racing over the same L0 segments.
@@ -1932,7 +2019,7 @@ pub const Engine = struct {
     /// containing an OoO point would produce an overlapping segment
     /// that compaction silently leaves on disk forever.
     fn compactL0Forced(self: *Engine) !void {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = self.io;
 
         var input_segs = std.ArrayList(manifest.SegmentMeta).empty;
         defer input_segs.deinit(self.allocator);
@@ -1954,7 +2041,7 @@ pub const Engine = struct {
         var self = safety.castCtx(Engine, ctx);
         const t_start = nowMonotonicNs();
         const result = self.compactL0();
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = self.io;
         self.mu.lockUncancelable(io);
         if (result) |_| {} else |err| {
             self.recordBackgroundErrorLocked(.compaction, err);
@@ -1977,7 +2064,7 @@ pub const Engine = struct {
     /// overlapping segment that the engine would never reconcile,
     /// breaking the query-ordering contract.
     fn compactL0(self: *Engine) !void {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = self.io;
 
         var input_segs = std.ArrayList(manifest.SegmentMeta).empty;
         defer input_segs.deinit(self.allocator);
@@ -2193,7 +2280,7 @@ pub const Engine = struct {
     /// without the lock to avoid stalling other ops on slow disks.
     pub fn pruneExpired(self: *Engine) !u32 {
         const max_age = self.config.retention_max_age_ms orelse return 0;
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = self.io;
 
         const now = self.config.retention_now_override orelse blk: {
             const ts_ns = std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds;
@@ -2286,7 +2373,7 @@ pub const Engine = struct {
     ///   affected segment (per-segment best-effort) — this is tracked
     ///   under Q-REL-003 and will be tightened in a follow-up.
     pub fn queryPoints(self: *Engine, arena: Allocator, series_id: types.SeriesId, start_ts: i64, end_ts: i64) !*iterator.MergeIterator {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = self.io;
 
         // GAP-0002 / SEC-007: route through the pluggable authoriser
         // BEFORE any segment reader is acquired or memtable scanned.
@@ -2471,7 +2558,7 @@ pub const Engine = struct {
     ///
     /// Errors: WAL fsync or manifest write errors bubble up unchanged.
     pub fn sync(self: *Engine) !void {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = self.io;
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
         try self.wal.sync();

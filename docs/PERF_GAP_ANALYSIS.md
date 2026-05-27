@@ -44,7 +44,7 @@ pass.
 | P-LOCK-005  | appendPoints holds lock during WAL pwrite                 | Depends on P-LOCK-001. Moving the WAL pwrite outside the lock without a memtable shard scheme would create lost-update races.                                                                                                                                                                                                  | Same as P-LOCK-001.                                                                                                                                                                                                                                                |
 | P-ALGO-001  | Per-series block index                                    | Requires a v3 segment format with a footer index. v2 (TSSEG002, plaintext) and v3 (TSSEG003, encrypted) are stable on disk; a third format bump is sequenced after the encryption rollout settles. Bloom-filter and min/max sidecars need migration tooling.                                                                  | (1) Design v3-with-index format. (2) Implement migration TSSEG002 → TSSEG003-indexed. (3) Migrate existing data via the migration tool. (4) Update verifySegments to recognise the new footer.                                                                     |
 | P-COMP-002  | L1→L2 tiered compaction                                    | Depends on P-ALGO-001 + lock decomposition. Without the per-series index, L2 compaction is no cheaper than rewriting every L1 segment in place, which is what the engine already does on full compaction.                                                                                                                     | Same chain as P-ALGO-001.                                                                                                                                                                                                                                          |
-| P-IO-004    | Global single-threaded IO context                          | Zig 0.16 stdlib limitation: `std.Io.Threaded` does not expose a pooled multi-threaded IO context. Workarounds (one IO per thread) defeat the existing thread-pool model.                                                                                                                                                       | Wait for Zig stdlib evolution (post-0.16 `std.Io.Threaded.pool`-style API). Revisit when the upstream type lands.                                                                                                                                                  |
+| ~~P-IO-004~~ (Closed) | ~~Global single-threaded IO context~~                | **Closed.** Earlier note that "`std.Io.Threaded` does not expose a pooled multi-threaded IO context" was wrong: Zig 0.16's `std.Io.Threaded.init(gpa, .{})` constructs a multi-threaded context with `async_limit = cpu_count - 1` and `concurrent_limit = .unlimited` by default. The engine now owns (or borrows) its IO context via `EngineConfig.io` / `Engine.io`; all engine-internal call sites use `self.io` instead of `global_single_threaded.io()`. See "Closed in this session" below. | n/a — closed                                                                                                                                                                                                                                                       |
 | SEC-013     | Supply-chain signing of `gitlab.com/devnw` deps           | Requires upstream maintainer action. The deps are all under `gitlab.com/devnw`; signing must happen at the source side (minisign or cosign on releases) before consumers can verify. File an issue with the org maintainers.                                                                                                  | (1) File issue with `gitlab.com/devnw` maintainers requesting minisign/cosign on releases. (2) Add `zig build.zig.zon` hash pinning verification in CI once signing is upstream.                                                                                   |
 
 ### Closed in this session
@@ -68,10 +68,11 @@ pass.
 | P-MEM-002 | E | `aac0fe2` |
 | P-IO-002 | E | `314530f` |
 | P-OBS-001 | E | `9f2cb19` |
+| P-IO-004 | G | (this session — P-IO-004 multi-threaded IO context) |
 
 ### Deferred (Phase E XL or won't-do)
 
-Won't-do: P-LOCK-001, P-LOCK-003, P-LOCK-004, P-LOCK-005, P-ALGO-001, P-COMP-002, P-IO-004.
+Won't-do: P-LOCK-001, P-LOCK-003, P-LOCK-004, P-LOCK-005, P-ALGO-001, P-COMP-002.
 Remaining open (no-ID, deferred): HashMap defaults (rank 31), Allocator hygiene (rank 32).
 
 ### Status Legend
@@ -116,7 +117,7 @@ Top 5 risks (by PerfScore × blast_radius on the hot mix):
 1. **P-LOCK-001** — single global RwLock serializes write/flush/compact and blocks readers. Throughput ceiling ~5-10k writes/sec under mixed load. PerfScore 100.
 2. **P-LOCK-002** — `queryPoints` holds the shared lock through all disk I/O (open + header read + decode). Latency-coupled writers to query duration. PerfScore 100.
 3. **P-ALGO-001** — `queryPoints` has no per-series block index: O(segments × blocks) header scan per query. At 100k series cardinality, ~1M syscalls to read one series. PerfScore 100.
-4. **P-IO-004** — All I/O uses `std.Io.Threaded.global_single_threaded.io()` (concurrent_limit=.nothing, async_limit=.nothing). Async I/O is defeated globally. PerfScore 80.
+4. ~~**P-IO-004**~~ — **Closed.** Engine now owns/borrows its own `std.Io.Threaded` (multi-threaded by default: `async_limit = cpu_count - 1`, `concurrent_limit = .unlimited`); engine-internal call sites use `self.io` instead of `global_single_threaded.io()`. Bench `bench_concurrent_rw` p50 wall improved 729.6 ms → 699.4 ms (~4%) on the 3-sample reference run.
 5. **P-COMP-002** — L1→L2 compaction does not exist; L1 segment count grows linearly with time and amplifies P-ALGO-001 over the lifetime of the engine. PerfScore 80.
 
 Top 3 quick wins (highest ExpectedImpact × Ease):
@@ -138,7 +139,7 @@ Sorted by PerfScore descending. (Issue URLs pending — see notes column.)
 | 1    | P0       | 100   | P-LOCK-001    | engine    | write/read/flush/compact | engine.zig:81-251,288-358,365-447 | Replace global RwLock with manifest snapshot + per-memtable lock + segment-list COW | engine  | sprint | **Won't Do (Phase G)** -- XL architectural refactor; see Phase G Won't-Do section | TBD       |
 | 2    | P0       | 100   | P-LOCK-002    | engine    | read             | engine.zig:371-438   | Snapshot manifest under shared lock, release before disk I/O | engine  | sprint | **Closed (`6a5d087`)** | TBD       |
 | 3    | P0       | 100   | P-ALGO-001    | engine    | read             | engine.zig:407-435   | Per-series block index (segment-local + manifest-level Bloom/min-max) | engine  | sprint | **Won't Do (Phase G)** -- requires v3 segment format; see Phase G Won't-Do section | TBD       |
-| 4    | P0       | 80    | P-IO-004      | engine,wal,segment | all      | src/* (20+ call sites) | Introduce IO context plumbing; allow multi-threaded io() per engine | infra  | sprint | **Won't Do (Phase G)** -- Zig stdlib constraint; revisit when stdlib evolves | TBD       |
+| 4    | P0       | 80    | P-IO-004      | engine    | all      | src/engine.zig (15+ call sites) | Engine-owned `std.Io.Threaded` constructed in `Engine.init` via `std.Io.Threaded.init(allocator, .{})` (default: `async_limit = cpu_count - 1`, `concurrent_limit = .unlimited`); all engine-internal call sites use `self.io`. Caller override via `EngineConfig.io`. | infra  | sprint | **Closed (this session)** -- multi-threaded IO context plumbed through engine; `bench_concurrent_rw` ~4% faster | TBD       |
 | 5    | P1       | 80    | P-LOCK-003    | engine    | flush            | engine.zig:235-251   | Move `wal.truncate` + `man.save` fsync outside exclusive lock; double-buffered manifest | engine | sprint | **Won't Do (Phase G)** -- depends on P-LOCK-001 | TBD       |
 | 6    | P1       | 80    | P-COMP-002    | engine,compaction | compact   | engine.zig:256-275, 288-363; compaction.zig | Add tiered L1→L2 compaction with size/count triggers | engine | next-q | **Won't Do (Phase G)** -- depends on P-ALGO-001 | TBD       |
 | 7    | P1       | 72    | P-ALGO-003    | memtable  | write            | memtable.zig:54-62    | Lazy/segmented sort; insert into per-series sorted buckets; defer global sort to flush | memtable | sprint | **Closed (`ae23f8c`)** | TBD       |
@@ -254,25 +255,39 @@ Per-finding sections include category, severity, PerfScore, hot path, evidence, 
 
 ### P-IO-004 — Single global single-threaded IO context defeats async
 
-**Status: Won't Do** -- `std.Io.Threaded.global_single_threaded` is a Zig stdlib constraint; the
-engine cannot plumb an alternate context without stdlib changes. Revisit when Zig stdlib provides a
-stable multi-threaded IO API. This is not actionable at the library level today.
+**Status: Closed (this session).** The earlier "Won't Do" note was incorrect: Zig 0.16's
+`std.Io.Threaded.init(gpa, .{})` (lib/std/Io/Threaded.zig:1607+) constructs a multi-threaded IO
+context with sensible defaults (`async_limit = cpu_count - 1`, `concurrent_limit = .unlimited`).
+
+The fix:
+
+- `EngineConfig.io: ?std.Io = null` — optional caller-supplied IO handle. When `null`, the
+  engine constructs its own context; when non-null the engine borrows it.
+- `Engine.threaded: ?*std.Io.Threaded` (heap-allocated when engine-owned, null when borrowed)
+  and `Engine.io: std.Io` (active handle).
+- `Engine.init` heap-allocates a `std.Io.Threaded` with stdlib defaults (or borrows the
+  caller-supplied one), stores it on the engine, and threads `self.io` through every
+  storage I/O call inside the engine.
+- `Engine.deinit` joins the background syncer and any in-flight flush/compaction worker
+  (existing condition-variable wait), then calls `Threaded.deinit` + `allocator.destroy` on
+  the engine-owned context. Borrowed contexts are left untouched.
+
+Heap allocation (rather than embedding `std.Io.Threaded` inline on the Engine struct) is
+required because `Threaded.io()` returns an `Io` whose `userdata` points at the `Threaded`
+instance; embedding inline would dangle that pointer the moment the Engine value is moved
+out of `init()`.
 
 - **Category:** I/O / runtime
 - **Severity:** P0
 - **PerfScore:** 80 (Impact 4 × Likelihood 5 × 4)
 - **Confidence:** confirmed
 - **Hot path:** all
-- **Evidence:** 20+ call sites of `std.Io.Threaded.global_single_threaded.io()` across `engine.zig`, `wal_manager.zig`, `segment.zig`, `manifest.zig`, `compaction.zig`. Zig 0.16 stdlib defines this as `concurrent_limit = .nothing, async_limit = .nothing`.
-- **Root cause:** Engine grabs the global single-threaded IO context per call. Any future move to a multi-threaded executor or io_uring backend has no entry point.
-- **Expected delta if fixed:** Enables: (a) overlapped pread/pwrite on compactions, (b) background fsync, (c) parallel segment opens in queryPoints. Realistic 2-5× on cold-read queries and ≥2× on compaction throughput.
-- **Recommended fix:**
-  - Add `Engine.io` field initialized from a caller-supplied IO context (e.g. `std.Io.Threaded.init(.{ .max_threads = N })`).
-  - Plumb `self.io` through every call site instead of fetching the global.
-- **Validation plan:**
-  - Add benchmark that triggers parallel segment reads; compare before/after with multi-thread IO.
-- **Rollout risk:** Medium. Plumbing churn; risk of mismatched IO contexts. Add a debug-build assertion that all syscalls use the engine's IO.
-- **Affected paths:** every storage file under `src/`.
+- **Evidence (pre-fix):** 15 call sites of `std.Io.Threaded.global_single_threaded.io()` inside Engine methods in `src/engine.zig` (every public entry point: `init`, `deinit`, `appendPoints`, `flush`, `flushInternal`, `compactL0`, `compactAll`, `queryPoints`, `sync`, `pruneExpired`, `lastBackgroundError`, `syncerLoop`, plus internal helpers). Zig 0.16 stdlib defines `global_single_threaded` as `concurrent_limit = .nothing, async_limit = .nothing` — every storage I/O serialised on one async slot.
+- **Post-fix:** 0 `global_single_threaded` references inside Engine methods. Engine-method I/O routes through `self.io`; the global is retained only by `nowMonotonicNs` (a clock-read helper that doesn't need a dispatcher) and by free-standing test helpers (per scope: benches/tests are external observers).
+- **Bench delta:** `bench_concurrent_rw` (3 samples, znver2, Linux): p50 wall 729.6 ms → 699.4 ms (−4.1%), throughput 71,271 ops/s → 74,354 ops/s (+4.3%), stddev 941 → 625 ops/s. Modest because the bench's hot path is WAL-fsync-bound and most fsyncs already run under a single-flusher invariant; the bigger payoffs land on cold reads + compaction where parallel preads matter.
+- **Backwards compatibility:** `EngineConfig.io` defaults to `null`, so every existing caller picks up the engine-owned multi-threaded context automatically. Tests in `tests/`, examples, and bench helpers in `benchmarks/` that touch `global_single_threaded.io()` directly are unchanged (they are external observers — owning their own IO context is correct).
+- **Rollout risk (closed):** Tests run twice clean across `zig build test`, `test-integration`, `test-stress`, `test-engine-e2e`, `test-wal-recovery`.
+- **Affected paths:** `src/engine.zig` (all changes). `src/segment.zig`, `src/manifest.zig`, `src/wal_manager.zig`, `src/compaction.zig`, `src/memtable.zig`, `src/backup.zig`, `src/iterator.zig`, `src/migration.zig` continue to accept an `io: std.Io` parameter from their callers — those callers (the engine) now pass `self.io`, so the global-IO flow is severed at the engine boundary even though the leaf modules' signatures did not change.
 - **Platform issue:** TBD (token write access required).
 
 ---
@@ -810,7 +825,7 @@ correct concurrency with the compaction lock.
 
 ### Area: infra / runtime
 
-- P-IO-004 (P0, global single-threaded IO)
+- ~~P-IO-004~~ (P0, global single-threaded IO) — **Closed this session**
 - P-BUILD-004 (P3)
 
 ### Area: ci / build / observability
@@ -833,7 +848,7 @@ This is the actionable shortlist the team should execute against. Ordered by imp
 | 6 | L1→L2 (tiered) compaction                                       | P-COMP-002                               | L      | bounds query cost over engine lifetime               | #1, #3     |
 | 7 | Bounded SegmentReader / FD cache                                | P-IO-001, P-MEM-006                      | M      | 5-20× syscall reduction on wide queries              | #1         |
 | 8 | Real benchmark wiring (Engine, not stub) + baseline.json        | P-BUILD-002, P-BUILD-003                 | S      | unblocks measuring every other fix                   | -          |
-| 9 | Engine-owned IO context (not global single-threaded)            | P-IO-004                                 | M-L    | unblocks parallel I/O on reads + compactions         | #1         |
+| 9 | ~~Engine-owned IO context (not global single-threaded)~~ — **Closed this session** | P-IO-004           | M-L    | ~~unblocks parallel I/O on reads + compactions~~ — landed | #1         |
 | 10| Streaming compaction (no full per-series materialization)       | P-MEM-001, P-MEM-005                     | M      | bounded RAM, larger blocks possible                  | -          |
 
 Quick wins (< 1 day): #2 (condvars), #5 (lazy sort), #8 (bench wiring), P-MEM-006 (inner-scope `defer`), P-ALGO-004 (HashSet for removal), P-MEM-005 (pre-size).
