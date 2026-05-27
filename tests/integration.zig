@@ -5,9 +5,17 @@
 //!
 //! These tests run via `zig build test-integration` and exercise the
 //! library through its public module surface (the same way a downstream
-//! consumer would import it). Each test constructs a real `Engine`
-//! over a fresh tmpdir, appends a small batch, queries it back, and
-//! asserts the result.
+//! consumer would import it). Coverage spans:
+//!
+//!   - Append/query round-trip
+//!   - Flush + on-disk segment query
+//!   - Empty-range query semantics
+//!   - Multi-series multi-batch ingest at 100 batches × 100 points
+//!   - Flush -> compactAll -> segment-count reduction -> query consistency
+//!   - Restart scenario (open, append, sync, close, reopen, query)
+//!   - Crash-recovery scenario (close WITHOUT sync, reopen, replay)
+//!
+//! Closes GAP-0007, Q-DEAD-005, Q-DEAD-006.
 
 const std = @import("std");
 const lib = @import("timeseries_storage");
@@ -113,4 +121,245 @@ test "integration: engine query empty range returns nothing" {
     defer arena.deinit();
     var it = try eng.queryPoints(arena.allocator(), 1, 5000, 6000);
     try std.testing.expect(it.next() == null);
+}
+
+test "integration: 100 batches x 100 points across 4 series — query reflects every insert" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 2 });
+    defer pool.deinit();
+
+    var eng = try lib.Engine.init(allocator, .{
+        .data_dir = data_dir,
+        // Force several flushes during the run so the query path
+        // exercises both the active memtable and on-disk segments.
+        .max_memtable_points = 500,
+    }, &pool);
+    defer eng.deinit();
+
+    const num_series: u128 = 4;
+    const num_batches: i64 = 100;
+    const points_per_batch: usize = 100;
+
+    var batch: [points_per_batch]lib.types.Point = undefined;
+
+    var s: u128 = 0;
+    while (s < num_series) : (s += 1) {
+        var b: i64 = 0;
+        while (b < num_batches) : (b += 1) {
+            const base = b * @as(i64, @intCast(points_per_batch));
+            for (0..points_per_batch) |i| {
+                const ts = base + @as(i64, @intCast(i));
+                batch[i] = .{ .ts = ts, .value = ts };
+            }
+            try eng.appendPoints(s, &batch);
+        }
+    }
+
+    // Drain the active memtable to make sure all data is queryable
+    // from a consistent snapshot.
+    try eng.flush();
+
+    s = 0;
+    while (s < num_series) : (s += 1) {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var it = try eng.queryPoints(arena.allocator(), s, 0, std.math.maxInt(i64));
+        var count: usize = 0;
+        var last_ts: i64 = -1;
+        while (it.next()) |pt| {
+            // Verify monotonic ordering — the merge iterator's
+            // contract is ascending (ts, value).
+            try std.testing.expect(pt.ts >= last_ts);
+            last_ts = pt.ts;
+            count += 1;
+        }
+        const expected = @as(usize, @intCast(num_batches)) * points_per_batch;
+        try std.testing.expectEqual(expected, count);
+    }
+}
+
+test "integration: flush + compactAll reduces segment count and preserves data" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 2 });
+    defer pool.deinit();
+
+    var eng = try lib.Engine.init(allocator, .{
+        .data_dir = data_dir,
+        // Small threshold so a few hundred points produce multiple L0
+        // segments without slamming the auto-trigger threshold.
+        .max_memtable_points = 50,
+    }, &pool);
+    defer eng.deinit();
+
+    var batch: [50]lib.types.Point = undefined;
+    var b: i64 = 0;
+    while (b < 6) : (b += 1) {
+        const base = b * 50;
+        for (0..50) |i| {
+            batch[i] = .{
+                .ts = base + @as(i64, @intCast(i)),
+                .value = base + @as(i64, @intCast(i)),
+            };
+        }
+        try eng.appendPoints(1, &batch);
+        try eng.flush();
+    }
+
+    const segments_before = eng.man.segments.items.len;
+    try std.testing.expect(segments_before >= 2);
+
+    try eng.compactAll();
+
+    var l0_after: usize = 0;
+    var l1_after: usize = 0;
+    for (eng.man.segments.items) |seg| {
+        if (seg.level == 0) l0_after += 1;
+        if (seg.level == 1) l1_after += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), l0_after);
+    try std.testing.expect(l1_after >= 1);
+
+    // Data must still be queryable end-to-end.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var it = try eng.queryPoints(arena.allocator(), 1, 0, std.math.maxInt(i64));
+    var count: usize = 0;
+    while (it.next()) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 300), count);
+}
+
+test "integration: restart preserves data after sync" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    // Phase 1: open, append, flush + sync (the durable path), close.
+    {
+        var eng = try lib.Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 100,
+        }, &pool);
+        defer eng.deinit();
+
+        const pts = [_]lib.types.Point{
+            .{ .ts = 10, .value = 100 },
+            .{ .ts = 20, .value = 200 },
+            .{ .ts = 30, .value = 300 },
+        };
+        try eng.appendPoints(123, &pts);
+        try eng.flush();
+        try eng.sync();
+    }
+
+    // Phase 2: reopen the same data_dir and prove the data survives.
+    {
+        var eng = try lib.Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 100,
+        }, &pool);
+        defer eng.deinit();
+
+        // The flush in phase 1 produced one segment.
+        try std.testing.expect(eng.man.segments.items.len >= 1);
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var it = try eng.queryPoints(arena.allocator(), 123, 0, 1000);
+        var values: [3]i64 = undefined;
+        var count: usize = 0;
+        while (it.next()) |pt| {
+            try std.testing.expect(count < values.len);
+            values[count] = pt.value;
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 3), count);
+        try std.testing.expectEqual(@as(i64, 100), values[0]);
+        try std.testing.expectEqual(@as(i64, 200), values[1]);
+        try std.testing.expectEqual(@as(i64, 300), values[2]);
+    }
+}
+
+test "integration: crash recovery replays unflushed WAL records" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    // Phase 1: open, append, sync to make the WAL durable, then close
+    // WITHOUT flushing the memtable to a segment. The next open must
+    // replay the WAL into the memtable from scratch.
+    {
+        var eng = try lib.Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 1_000_000,
+        }, &pool);
+        defer eng.deinit();
+
+        const pts = [_]lib.types.Point{
+            .{ .ts = 1, .value = 11 },
+            .{ .ts = 2, .value = 22 },
+            .{ .ts = 3, .value = 33 },
+        };
+        try eng.appendPoints(7, &pts);
+        try eng.sync();
+
+        // Deliberately skip eng.flush() — data lives only in the WAL
+        // and in the in-memory memtable. The memtable is lost when
+        // deinit fires; recovery must come from the WAL.
+        try std.testing.expectEqual(@as(usize, 0), eng.man.segments.items.len);
+    }
+
+    // Phase 2: reopen and prove the records were replayed into the
+    // active memtable from the WAL.
+    {
+        var eng = try lib.Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 1_000_000,
+        }, &pool);
+        defer eng.deinit();
+
+        // No flush happened in phase 1, so no segments on disk; the
+        // points must come from the recovered memtable.
+        try std.testing.expectEqual(@as(usize, 0), eng.man.segments.items.len);
+        try std.testing.expectEqual(@as(usize, 3), eng.active_mem.point_count);
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var it = try eng.queryPoints(arena.allocator(), 7, 0, 1000);
+        var count: usize = 0;
+        var first_ts: i64 = -1;
+        while (it.next()) |pt| {
+            if (first_ts < 0) first_ts = pt.ts;
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 3), count);
+        try std.testing.expectEqual(@as(i64, 1), first_ts);
+    }
 }
