@@ -1,0 +1,26 @@
+{
+  "merge_iter_k4": {
+    "n": 10,
+    "p50_median_ns": 138929,
+    "p50_stddev_pct": 12.112103823775064,
+    "tput_stddev_pct": 12.154984637995245,
+    "alloc_count": 6,
+    "peak_live": 64336
+  },
+  "merge_iter_k16": {
+    "n": 10,
+    "p50_median_ns": 708008,
+    "p50_stddev_pct": 16.489422759665388,
+    "tput_stddev_pct": 14.087245804503079,
+    "alloc_count": 19,
+    "peak_live": 256992
+  },
+  "merge_iter_k64": {
+    "n": 10,
+    "p50_median_ns": 3590821,
+    "p50_stddev_pct": 9.769136094551392,
+    "tput_stddev_pct": 8.417170011779294,
+    "alloc_count": 71,
+    "peak_live": 1027464
+  }
+}

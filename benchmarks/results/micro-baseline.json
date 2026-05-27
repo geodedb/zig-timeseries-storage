@@ -1,0 +1,53 @@
+{
+  "generated_at_unix_s": 1779903071,
+  "rows": [
+    {
+      "git_sha": "2723d3be14330c37e09aa90c663d33a1cf92a1dc",
+      "run_timestamp_unix_s": 1779903071,
+      "zig_version": "0.16.0",
+      "os": "linux",
+      "arch": "x86_64",
+      "cpu": "znver2",
+      "scenario_name": "memtable_insert_sorted",
+      "ops_per_iteration": 256,
+      "sample_count": 10,
+      "wall_ns_min": 571,
+      "wall_ns_p50": 621,
+      "wall_ns_p95": 651,
+      "wall_ns_p99": 651,
+      "wall_ns_max": 652,
+      "wall_ns_stddev": 22.27554713132766,
+      "throughput_ops_per_sec": 412238325.28180355,
+      "throughput_stddev_ops_per_sec": 15238505.299413292,
+      "alloc_count": 2,
+      "alloc_bytes": 6688,
+      "peak_live_bytes": 6688,
+      "rss_current_bytes": 2273280,
+      "rss_peak_bytes": 2273280
+    },
+    {
+      "git_sha": "2723d3be14330c37e09aa90c663d33a1cf92a1dc",
+      "run_timestamp_unix_s": 1779903071,
+      "zig_version": "0.16.0",
+      "os": "linux",
+      "arch": "x86_64",
+      "cpu": "znver2",
+      "scenario_name": "memtable_insert_ooo",
+      "ops_per_iteration": 256,
+      "sample_count": 10,
+      "wall_ns_min": 601,
+      "wall_ns_p50": 701,
+      "wall_ns_p95": 742,
+      "wall_ns_p99": 742,
+      "wall_ns_max": 751,
+      "wall_ns_stddev": 48.70728898224577,
+      "throughput_ops_per_sec": 365192582.02567756,
+      "throughput_stddev_ops_per_sec": 27355811.253277477,
+      "alloc_count": 2,
+      "alloc_bytes": 6688,
+      "peak_live_bytes": 6688,
+      "rss_current_bytes": 2273280,
+      "rss_peak_bytes": 2273280
+    }
+  ]
+}

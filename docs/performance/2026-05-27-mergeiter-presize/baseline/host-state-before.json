@@ -1,0 +1,9 @@
+{
+  "uname": "Linux celebrimbor 6.17.0-29-generic #29~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Mon May 11 10:30:58 UTC 2 x86_64 x86_64 x86_64 GNU/Linux",
+  "zig_version": "0.16.0",
+  "git_sha": "2723d3be14330c37e09aa90c663d33a1cf92a1dc",
+  "date_utc": "2026-05-27T17:37:04+00:00",
+  "cpu_model": "AMD Ryzen Threadripper PRO 3955WX 16-Cores",
+  "cpu_governor": "performance",
+  "mem_total_kb": 263760896
+}

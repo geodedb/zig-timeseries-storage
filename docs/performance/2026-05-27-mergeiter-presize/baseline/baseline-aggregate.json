@@ -1,0 +1,38 @@
+{
+  "merge_iter_k4": {
+    "rounds": 10,
+    "wall_p50_median_ns": 135627,
+    "wall_p50_min_ns": 115519,
+    "wall_p50_max_ns": 149695,
+    "wall_p50_stddev_ns": 10457.72401890371,
+    "wall_p50_stddev_pct": 7.710622122286195,
+    "throughput_median_ops_per_sec": 29493652.47202602,
+    "throughput_stddev_pct": 8.292668948912201,
+    "alloc_count_median": 6,
+    "peak_live_median": 64336
+  },
+  "merge_iter_k16": {
+    "rounds": 10,
+    "wall_p50_median_ns": 712493,
+    "wall_p50_min_ns": 562920,
+    "wall_p50_max_ns": 841478,
+    "wall_p50_stddev_ns": 85040.88584707685,
+    "wall_p50_stddev_pct": 11.935680188728428,
+    "throughput_median_ops_per_sec": 22465457.39744594,
+    "throughput_stddev_pct": 13.06836818071041,
+    "alloc_count_median": 19,
+    "peak_live_median": 256992
+  },
+  "merge_iter_k64": {
+    "rounds": 10,
+    "wall_p50_median_ns": 3680536,
+    "wall_p50_min_ns": 3144452,
+    "wall_p50_max_ns": 3917030,
+    "wall_p50_stddev_ns": 320288.57072474505,
+    "wall_p50_stddev_pct": 8.702226271519828,
+    "throughput_median_ops_per_sec": 17390703.213080265,
+    "throughput_stddev_pct": 9.60843132876295,
+    "alloc_count_median": 71,
+    "peak_live_median": 1027464
+  }
+}

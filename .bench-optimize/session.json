@@ -1,0 +1,48 @@
+{
+  "date": "2026-05-27",
+  "slug": "mergeiter-presize",
+  "target_benchmarks": [
+    "merge_iter_k64",
+    "merge_iter_k16",
+    "merge_iter_k4"
+  ],
+  "goal_metrics": [],
+  "success_thresholds": {
+    "target_gain_pct": 5.0,
+    "max_regression_pct": -3.0
+  },
+  "allowed_paths": [
+    "src/iterator.zig",
+    "src/compaction.zig"
+  ],
+  "forbidden_paths": [
+    "tests/**",
+    "benchmarks/framework/**",
+    "build.zig.zon"
+  ],
+  "baseline": {
+    "git_sha": "2723d3be14330c37e09aa90c663d33a1cf92a1dc",
+    "evidence_dir": "docs/performance/2026-05-27-mergeiter-presize/baseline",
+    "evidence_dir_pinned": "docs/performance/2026-05-27-mergeiter-presize/baseline-pinned",
+    "command": "zig build bench-micro-merge",
+    "rounds": 10,
+    "warmups": 1,
+    "timestamp_utc": "2026-05-27T17:42:16.284935Z",
+    "variance": {
+      "merge_iter_k4_stddev_pct_unpinned": 7.71,
+      "merge_iter_k4_stddev_pct_pinned": 12.11,
+      "merge_iter_k16_stddev_pct_unpinned": 11.94,
+      "merge_iter_k16_stddev_pct_pinned": 16.49,
+      "merge_iter_k64_stddev_pct_unpinned": 8.7,
+      "merge_iter_k64_stddev_pct_pinned": 9.77
+    },
+    "verdict": "NOISY \u2014 STOP per variance policy (>5% compiled micro threshold; pinning did not help)",
+    "decision_doc": "docs/performance/2026-05-27-mergeiter-presize/baseline-decision.md"
+  },
+  "hypotheses": [],
+  "current_hypothesis_id": null,
+  "iteration_count": 0,
+  "max_hypotheses_per_session": 10,
+  "started_at": "2026-05-27T17:35:26Z",
+  "updated_at": "2026-05-27T17:42:16.284991Z"
+}

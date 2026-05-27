@@ -1,0 +1,29 @@
+{
+  "generated_at_unix_s": 1779903105,
+  "rows": [
+    {
+      "git_sha": "2723d3be14330c37e09aa90c663d33a1cf92a1dc",
+      "run_timestamp_unix_s": 1779903105,
+      "zig_version": "0.16.0",
+      "os": "linux",
+      "arch": "x86_64",
+      "cpu": "znver2",
+      "scenario_name": "manifest_write_read",
+      "ops_per_iteration": 2,
+      "sample_count": 10,
+      "wall_ns_min": 5205272,
+      "wall_ns_p50": 5325671,
+      "wall_ns_p95": 6116550,
+      "wall_ns_p99": 6116550,
+      "wall_ns_max": 8452787,
+      "wall_ns_stddev": 1025491.4208573371,
+      "throughput_ops_per_sec": 375.5395329527491,
+      "throughput_stddev_ops_per_sec": 47.1082110508497,
+      "alloc_count": 12,
+      "alloc_bytes": 4675,
+      "peak_live_bytes": 2206,
+      "rss_current_bytes": 2375680,
+      "rss_peak_bytes": 2375680
+    }
+  ]
+}
