@@ -314,20 +314,29 @@ pub const EngineConfig = struct {
     /// Opaque context handed to `error_callback`. Ignored when
     /// `error_callback` is null.
     error_callback_ctx: ?*anyopaque = null,
-    /// Optional WAL encryption key (AES-256-GCM, 32 bytes). When
-    /// set, every record appended to the WAL is encrypted in place
-    /// by the underlying `wal_lib.WriteAheadLog`. `null` (the default)
-    /// keeps the WAL plaintext.
+    /// Optional AES-256-GCM encryption key (32 bytes) used for
+    /// transparent data encryption (TDE) of every on-disk artefact:
+    /// WAL records, segment blocks (TSSEG003), and the manifest
+    /// (TSMNF002). When `null` (the default), every layer stays
+    /// plaintext.
     ///
-    /// Caveat (partial GAP-0001): segments and the manifest are
-    /// still written plaintext to disk. Full TDE coverage requires
-    /// AES-GCM framing on `SegmentWriter` and `Manifest.writeToFile`,
-    /// which is tracked under GAP-0001 as a follow-up.
+    /// Closes GAP-0001 / SEC-006 in full: the WAL, segment, and
+    /// manifest paths all derive their per-record nonces and AAD
+    /// domain-separation tags from this single operator-supplied key.
+    /// AAD design (segments: `"seg" || segment_id || block_index`,
+    /// manifest: `"mnf" || counter`) prevents cross-context
+    /// ciphertext reuse: a stolen segment block cannot be replayed as
+    /// a manifest block, and vice versa, even though they share the
+    /// same 32-byte master key.
     ///
     /// Security: callers MUST keep the key consistent across opens.
     /// Reopening the same `data_dir` with a different key (or no
-    /// key, when the WAL was written with one) causes the WAL
-    /// library to reject decryption and `Engine.init` to fail.
+    /// key, when the artefacts were written with one) fails closed:
+    /// WAL replay drops records, the manifest returns
+    /// `error.DecryptionFailed`, and segment reads return the same.
+    ///
+    /// Operators rotating keys must drive a full read-and-re-encrypt
+    /// migration (out of scope for the engine itself).
     encryption_key: ?[32]u8 = null,
     /// Age-based retention. When set, `Engine.pruneExpired` removes
     /// any whole segment whose `max_ts < (now - retention_max_age_ms)`.
@@ -563,7 +572,15 @@ pub const Engine = struct {
     pub fn init(allocator: Allocator, config: EngineConfig, pool: *thread_pool.ThreadPool) !Engine {
         try validateDataDir(config.data_dir);
 
-        var man = try manifest.Manifest.init(allocator, config.data_dir);
+        // GAP-0001 (manifest TDE): thread the operator-supplied key
+        // into the manifest so on-disk slots are wrapped with the
+        // TSMNF002 envelope. Plaintext mode (key == null) is
+        // unchanged.
+        var man = try manifest.Manifest.initWithEncryption(
+            allocator,
+            config.data_dir,
+            config.encryption_key,
+        );
         errdefer man.deinit();
 
         // P-OBS-001: track integrity failures encountered during
@@ -2264,18 +2281,18 @@ test "Engine: WAL encryption key round-trips append/recover/query" {
     }
 }
 
-test "Engine: reopening with a different key drops encrypted WAL records" {
-    // The underlying wal library swallows decryption failures and
-    // treats them as EOF (iterator.zig:122-130 — wrong key looks
-    // identical to "no more records" on the read path). That gives
-    // us two observable guarantees rather than one:
-    //
-    //   1. With the SAME key the records come back.
-    //   2. With a DIFFERENT key the records are silently dropped —
-    //      they are NOT decrypted as plaintext. So this test
-    //      simultaneously proves the WAL was encrypted (otherwise
-    //      the wrong-key replay would still return the points) and
-    //      that the engine does not crash or hand back garbage.
+test "Engine: reopening with a different key fails closed (GAP-0001)" {
+    // Post-GAP-0001 (manifest TDE), opening with the wrong key fails
+    // CLOSED at the manifest layer rather than silently degrading
+    // to "WAL records silently dropped". This is the correct
+    // security contract: an attacker who possesses the on-disk
+    // bytes without the key must not be able to bring the engine
+    // up at all, because doing so could:
+    //   * issue a new save() that clobbers the legitimate manifest,
+    //   * accept new appends that are unrelated to the existing
+    //     series namespace.
+    // The pre-Manifest-TDE behaviour (engine opens, memtable empty)
+    // is replaced by an explicit `error.DecryptionFailed`.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2290,8 +2307,8 @@ test "Engine: reopening with a different key drops encrypted WAL records" {
     var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
     defer pool.deinit();
 
-    // Phase 1: write under key_a, sync, close (no flush — data is
-    // WAL-only).
+    // Phase 1: write under key_a, sync (which writes the encrypted
+    // manifest), close.
     {
         var eng = try Engine.init(allocator, .{
             .data_dir = data_dir,
@@ -2303,33 +2320,22 @@ test "Engine: reopening with a different key drops encrypted WAL records" {
         try eng.sync();
     }
 
-    // Phase 2: reopen with key_b — engine opens fine but the
-    // memtable must be empty because every encrypted record failed
-    // its AES-GCM tag check.
-    {
-        var eng = try Engine.init(allocator, .{
-            .data_dir = data_dir,
-            .max_memtable_points = 1_000_000,
-            .encryption_key = key_b,
-        }, &pool);
-        defer eng.deinit();
-
-        try std.testing.expectEqual(@as(usize, 0), eng.active_mem.point_count);
-
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        var it = try eng.queryPoints(arena.allocator(), 1, 0, 100);
-        try std.testing.expect(it.next() == null);
-    }
+    // Phase 2: reopen with key_b — must fail closed.
+    try std.testing.expectError(error.DecryptionFailed, Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 1_000_000,
+        .encryption_key = key_b,
+    }, &pool));
 }
 
-test "Engine: reopening an encrypted WAL with no key drops records" {
-    // Same shape as the wrong-key case: when the WAL is encrypted
-    // and the engine is opened without a key, the iterator's
-    // encrypted-record path is disabled and the magic-byte check
-    // rejects the record (iterator.zig:145-149), again returning
-    // EOF rather than data. Proves an attacker who learns
-    // data_dir without the key cannot replay the WAL.
+test "Engine: reopening an encrypted manifest with no key fails closed (GAP-0001)" {
+    // Symmetric to the wrong-key case: opening an encrypted
+    // (TSMNF002) manifest with no key must also fail closed, NOT
+    // silently downgrade to "engine starts empty". This is the
+    // contract that protects against an attacker who learns the
+    // data_dir path but does not possess the key — they cannot
+    // bring the engine up and start fresh on top of the existing
+    // ciphertext slots.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2353,15 +2359,13 @@ test "Engine: reopening an encrypted WAL with no key drops records" {
         try eng.sync();
     }
 
-    // Reopen without a key.
-    var eng = try Engine.init(allocator, .{
+    // Reopen without a key: manifest decryption fails before any
+    // WAL is touched, so the call returns DecryptionFailed.
+    try std.testing.expectError(error.DecryptionFailed, Engine.init(allocator, .{
         .data_dir = data_dir,
         .max_memtable_points = 1_000_000,
         .encryption_key = null,
-    }, &pool);
-    defer eng.deinit();
-
-    try std.testing.expectEqual(@as(usize, 0), eng.active_mem.point_count);
+    }, &pool));
 }
 
 test "Engine: pruneExpired returns 0 when retention disabled" {
@@ -2528,6 +2532,54 @@ test "SegmentReaderCache: invalidate defers close for borrowed entries" {
     cache.release(io, 7);
 }
 
+test "Engine: TDE — manifest is encrypted (TSMNF002) when key is set (GAP-0001)" {
+    // Post-Phase-G the engine's manifest persistence is also under
+    // AES-256-GCM. We assert the on-disk magic to prove the
+    // encrypted wrapper actually wraps; if a regression flipped the
+    // path back to plaintext we would see the TSMNFS01 magic here
+    // and the test would fail before reaching the decrypt-roundtrip
+    // body.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    const key: [32]u8 = [_]u8{0x77} ** 32;
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    {
+        var eng = try Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 100,
+            .encryption_key = key,
+        }, &pool);
+        defer eng.deinit();
+        try eng.appendPoints(1, &.{.{ .ts = 1, .value = 1 }});
+        try eng.sync();
+    }
+
+    // Locate whichever slot file is on disk and inspect its magic.
+    // We try both .a and .b since the parity-driven save() picks one.
+    var found_v2_magic = false;
+    for ([_][]const u8{ "manifest.a", "manifest.b" }) |name| {
+        const mf_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ data_dir, name });
+        defer allocator.free(mf_path);
+        const f = std.Io.Dir.cwd().openFile(io, mf_path, .{}) catch continue;
+        defer f.close(io);
+        var magic_buf: [8]u8 = undefined;
+        const n = try f.readPositionalAll(io, &magic_buf, 0);
+        if (n == 8 and std.mem.eql(u8, &magic_buf, &manifest.MANIFEST_MAGIC_V2)) {
+            found_v2_magic = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_v2_magic);
+}
+
 test "Engine: TDE end-to-end — write encrypted, reopen with same key, query (GAP-0001)" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2604,20 +2656,16 @@ test "Engine: TDE — reopening encrypted segments with wrong key surfaces Decry
         try eng.flush();
     }
 
-    // Reopen with the wrong key. The segments are present so the
-    // verifySegments step succeeds (it only checks magic), but the
-    // query path surfaces DecryptionFailed when it tries to decode
-    // any block.
-    var eng = try Engine.init(allocator, .{
+    // Reopen with the wrong key. Post-Manifest-TDE this fails at
+    // open time (manifest decryption layer) rather than at query
+    // time (segment decryption layer). The earlier failure point
+    // is strictly safer — an attacker without the key cannot even
+    // bring the engine up to attempt a query.
+    try std.testing.expectError(error.DecryptionFailed, Engine.init(allocator, .{
         .data_dir = data_dir,
         .max_memtable_points = 100,
         .encryption_key = key_b,
-    }, &pool);
-    defer eng.deinit();
-
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    try std.testing.expectError(error.DecryptionFailed, eng.queryPoints(arena.allocator(), 1, 0, 1000));
+    }, &pool));
 }
 
 test "Engine: per_call durability mode survives crash without explicit sync (P-IO-002)" {
