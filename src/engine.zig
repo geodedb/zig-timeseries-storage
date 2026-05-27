@@ -21,6 +21,158 @@ const wal_record = @import("wal_record.zig");
 /// compaction work over enough memtable flushes to matter.
 const kL0CompactionThreshold: usize = 4;
 
+/// Default capacity of the per-engine SegmentReader LRU cache.
+/// Each cache slot holds an open file descriptor + a small bookkeeping
+/// struct (~48 bytes). 64 entries is a comfortable default — large
+/// enough to keep the hot working set warm across queries, small enough
+/// to stay well under default per-process FD limits even when several
+/// engines share a process. Closes the LRU dimension of P-MEM-006.
+pub const DEFAULT_SEGMENT_READER_CACHE_CAPACITY: usize = 64;
+
+/// Bounded LRU cache of open `SegmentReader` handles, indexed by
+/// segment id (P-IO-001 / P-MEM-006). Avoids reopening the same
+/// segment file across successive queries.
+///
+/// Concurrency: every public method takes the internal mutex. Entries
+/// carry a refcount; eviction only removes entries whose refcount is
+/// zero, so a reader is never closed out from under an in-flight
+/// query. The cache is invalidated on compaction (`invalidate(id)`).
+const SegmentReaderCache = struct {
+    const Entry = struct {
+        reader: segment.SegmentReader,
+        id: u64,
+        /// Number of outstanding `acquire` callers. Eviction is gated
+        /// on refcount == 0 — a reader currently being read by a query
+        /// cannot be evicted.
+        refcount: u32,
+        /// LRU position counter; higher = more recently used. Filled in
+        /// from `tick` on every acquire so eviction can pick the
+        /// numerically smallest one.
+        last_used: u64,
+    };
+
+    allocator: Allocator,
+    mu: std.Io.Mutex = std.Io.Mutex.init,
+    entries: std.AutoHashMapUnmanaged(u64, Entry) = .{},
+    capacity: usize,
+    tick: u64 = 0,
+
+    fn init(allocator: Allocator, capacity: usize) SegmentReaderCache {
+        return .{ .allocator = allocator, .capacity = capacity };
+    }
+
+    fn deinit(self: *SegmentReaderCache) void {
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            kv.value_ptr.reader.deinit();
+        }
+        self.entries.deinit(self.allocator);
+    }
+
+    /// Borrow a reader for segment `id`. If absent, opens the file at
+    /// `path` and inserts it; if full, evicts the LRU entry whose
+    /// refcount is zero. Returns a pointer to the borrowed reader.
+    /// Caller MUST balance with `release(id)` exactly once.
+    fn acquire(self: *SegmentReaderCache, io: std.Io, id: u64, path: []const u8) !*segment.SegmentReader {
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+
+        if (self.entries.getPtr(id)) |entry| {
+            self.tick += 1;
+            entry.last_used = self.tick;
+            entry.refcount += 1;
+            return &entry.reader;
+        }
+
+        // Miss: must open. Evict-then-insert order matters — we evict
+        // FIRST so the new entry has somewhere to live without growing
+        // the map past capacity. evictLruLocked is a no-op when the
+        // map is below capacity.
+        try self.evictLruLocked();
+
+        const reader = try segment.SegmentReader.init(self.allocator, path);
+        errdefer {
+            var r = reader;
+            r.deinit();
+        }
+
+        self.tick += 1;
+        try self.entries.put(self.allocator, id, .{
+            .reader = reader,
+            .id = id,
+            .refcount = 1,
+            .last_used = self.tick,
+        });
+        return &self.entries.getPtr(id).?.reader;
+    }
+
+    /// Release a previously-acquired reader. Decrements the entry's
+    /// refcount; the reader remains open in the cache for reuse.
+    fn release(self: *SegmentReaderCache, io: std.Io, id: u64) void {
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        if (self.entries.getPtr(id)) |entry| {
+            if (entry.refcount > 0) entry.refcount -= 1;
+        }
+    }
+
+    /// Remove the cached reader for `id` (if any) and close its file.
+    /// MUST only be called when no query is using the entry. Compaction
+    /// calls this AFTER the manifest has been updated to drop the old
+    /// segment — at that point any in-flight query that previously
+    /// snapshotted the old manifest may still be holding a refcount,
+    /// so we honour it by skipping the close (the reader stays live
+    /// until the last release; the slot is reclaimable thereafter via
+    /// the LRU path).
+    fn invalidate(self: *SegmentReaderCache, io: std.Io, id: u64) void {
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        if (self.entries.fetchRemove(id)) |kv| {
+            // If a query is still holding a borrow, we can't close
+            // the file safely — re-insert. The next eviction round
+            // will catch it once the refcount drops to zero.
+            if (kv.value.refcount > 0) {
+                self.entries.put(self.allocator, id, kv.value) catch {
+                    // OOM during reinsert: leak the reader rather than
+                    // close it underneath an in-flight query. This is
+                    // a one-FD leak in a pathological case.
+                };
+                return;
+            }
+            var r = kv.value.reader;
+            r.deinit();
+        }
+    }
+
+    /// Evict the LRU entry (smallest `last_used`) whose refcount is
+    /// zero, if the cache is at or above capacity. Holds the mutex.
+    /// No-op if no eviction is needed or no eligible entry exists.
+    fn evictLruLocked(self: *SegmentReaderCache) !void {
+        if (self.entries.count() < self.capacity) return;
+
+        var victim_id: ?u64 = null;
+        var victim_ts: u64 = std.math.maxInt(u64);
+        var it = self.entries.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.refcount != 0) continue;
+            if (kv.value_ptr.last_used < victim_ts) {
+                victim_ts = kv.value_ptr.last_used;
+                victim_id = kv.key_ptr.*;
+            }
+        }
+
+        if (victim_id) |id| {
+            if (self.entries.fetchRemove(id)) |kv| {
+                var r = kv.value.reader;
+                r.deinit();
+            }
+        }
+        // No-op if every entry is borrowed: we let the cache exceed
+        // its bound temporarily rather than block. The next query
+        // returning a borrow will allow eviction on the next miss.
+    }
+};
+
 /// Monotonic-clock nanoseconds helper used by the observability
 /// counters (P-OBS-001). Uses the `.awake` clock (Linux:
 /// `CLOCK_MONOTONIC`) so NTP slews and wall-clock adjustments do
@@ -345,6 +497,12 @@ pub const Engine = struct {
     /// stays set, which is exactly the shutdown semantic we want.
     syncer_shutdown_event: std.Io.Event = .unset,
 
+    /// Bounded LRU cache of open SegmentReader handles (P-IO-001 /
+    /// P-MEM-006). Initialised lazily in `queryPoints` so engines
+    /// that never query don't pay for an unused HashMap allocation.
+    /// Cleared on `deinit`; entries invalidated on compaction.
+    reader_cache: SegmentReaderCache,
+
     /// Engine-wide latency / throughput counters. Updated under
     /// `self.mu` by every hot path (append, query, flush, compaction).
     /// Read out via `stats()`. Closes P-OBS-001.
@@ -435,6 +593,7 @@ pub const Engine = struct {
             .man = man,
             .active_mem = mem,
             .pool = pool,
+            .reader_cache = SegmentReaderCache.init(allocator, DEFAULT_SEGMENT_READER_CACHE_CAPACITY),
             .counters = .{
                 .append_count = 0,
                 .append_points = 0,
@@ -736,6 +895,7 @@ pub const Engine = struct {
         self.active_mem.deinit();
         if (self.flushing_mem) |*fm| fm.deinit();
         self.append_payload_buf.deinit(self.allocator);
+        self.reader_cache.deinit();
     }
 
     /// Append a batch of points to the given series.
@@ -1281,6 +1441,17 @@ pub const Engine = struct {
             try self.man.save();
         }
 
+        // P-IO-001: invalidate the FD cache entries for the
+        // compacted-away segments BEFORE we unlink the files. The
+        // cache's refcount guard ensures any in-flight query still
+        // holding a borrow gets to finish — invalidate becomes a
+        // deferred close in that case (see `invalidate` doc).
+        for (l0_segs.items) |seg| self.reader_cache.invalidate(io, seg.id);
+
+        // P-IO-001: invalidate FD cache entries for the compacted
+        // segments before unlinking, same as compactL0.
+        for (l0_segs.items) |seg| self.reader_cache.invalidate(io, seg.id);
+
         for (paths.items) |p| {
             std.Io.Dir.cwd().deleteFile(io, p) catch |err| {
                 self.mu.lockUncancelable(io);
@@ -1469,6 +1640,12 @@ pub const Engine = struct {
             try self.man.save();
         }
 
+        // P-IO-001: invalidate FD cache entries for the pruned
+        // segments before unlinking. Cache invalidate is refcount-
+        // safe — in-flight queries finish on the live FD, then the
+        // cache slot is reclaimable on the next eviction round.
+        for (doomed_ids.items) |id| self.reader_cache.invalidate(io, id);
+
         // Best-effort unlink of the doomed files. A failure here
         // leaves an orphan on disk but the manifest is already
         // correct; surface the error via the background-error
@@ -1527,21 +1704,49 @@ pub const Engine = struct {
         const merge_it = try arena.create(iterator.MergeIterator);
         merge_it.* = iterator.MergeIterator.init(arena);
 
+        // P-LOCK-002: snapshot the manifest segment list under the
+        // engine lock, then RELEASE the lock before doing any disk
+        // I/O. Concurrent writers (appendPoints, flush, compaction)
+        // are blocked only for the snapshot copy, not for the entire
+        // query body.
+        var segments_snapshot = std.ArrayListUnmanaged(manifest.SegmentMeta).empty;
+        defer segments_snapshot.deinit(arena);
+
+        {
+            self.mu.lockUncancelable(io);
+            defer self.mu.unlock(io);
+
+            // Memtables are touched under the lock — they can mutate
+            // concurrently with appendPoints. The points are copied
+            // into arena-owned slices inside queryMemtable so they
+            // outlive the lock release.
+            try queryMemtable(arena, &self.active_mem, series_id, start_ts, end_ts, merge_it, &points_added);
+            if (self.flushing_mem) |*mem| {
+                try queryMemtable(arena, mem, series_id, start_ts, end_ts, merge_it, &points_added);
+            }
+
+            try segments_snapshot.ensureTotalCapacity(arena, self.man.segments.items.len);
+            for (self.man.segments.items) |seg| {
+                if (seg.min_ts > end_ts or seg.max_ts < start_ts) continue;
+                segments_snapshot.appendAssumeCapacity(seg);
+            }
+        }
+
+        // Iterate the snapshot WITHOUT the engine lock. Concurrent
+        // appends, flushes, and compactions are now free to run.
+        // Compaction's invalidate() / our cache's refcount guard
+        // ensure readers we are using cannot be closed under us.
+        for (segments_snapshot.items) |seg| {
+            try self.querySegment(arena, io, seg, series_id, start_ts, end_ts, merge_it, &points_added);
+        }
+
+        // Counters bump under the engine lock to stay consistent
+        // with the snapshot pattern used by stats().
         self.mu.lockUncancelable(io);
-        defer self.mu.unlock(io);
-
-        try queryMemtable(arena, &self.active_mem, series_id, start_ts, end_ts, merge_it, &points_added);
-        if (self.flushing_mem) |*mem| {
-            try queryMemtable(arena, mem, series_id, start_ts, end_ts, merge_it, &points_added);
-        }
-        for (self.man.segments.items) |seg| {
-            if (seg.min_ts > end_ts or seg.max_ts < start_ts) continue;
-            try self.querySegment(arena, seg, series_id, start_ts, end_ts, merge_it, &points_added);
-        }
-
         self.counters.query_count += 1;
         self.counters.query_points_returned += points_added;
         self.counters.query_total_ns += nowMonotonicNs() - t_start;
+        self.mu.unlock(io);
         return merge_it;
     }
 
@@ -1597,6 +1802,7 @@ pub const Engine = struct {
     fn querySegment(
         self: *Engine,
         arena: Allocator,
+        io: std.Io,
         seg: manifest.SegmentMeta,
         series_id: types.SeriesId,
         start_ts: i64,
@@ -1607,16 +1813,19 @@ pub const Engine = struct {
         const p = try segment.segmentPath(self.allocator, self.config.data_dir, seg.id);
         defer self.allocator.free(p);
 
-        var seg_reader = segment.SegmentReader.init(self.allocator, p) catch |err| switch (err) {
+        // P-IO-001 / P-MEM-006: borrow a cached reader instead of
+        // opening from scratch. Cache lookup is O(1) under its own
+        // mutex; the engine lock is NOT held here.
+        const reader_ptr = self.reader_cache.acquire(io, seg.id, p) catch |err| switch (err) {
             // Benign race with compaction: the segment was just
             // unlinked but the in-memory manifest snapshot we
             // captured still references it. Skip.
             error.FileNotFound => return,
             else => return err,
         };
-        defer seg_reader.deinit();
+        defer self.reader_cache.release(io, seg.id);
 
-        var block_it = seg_reader.iterator();
+        var block_it = reader_ptr.iterator();
         while (try block_it.next()) |block| {
             if (block.header.series_id != series_id) continue;
             if (block.header.stats.max_ts < start_ts) continue;
@@ -2164,6 +2373,93 @@ test "Engine: pruneExpired removes segments older than the cutoff" {
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "SegmentReaderCache: acquire returns the same reader on hit (P-IO-001)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(base);
+    const path = try std.fmt.allocPrint(allocator, "{s}/test.tsseg", .{base});
+    defer allocator.free(path);
+
+    {
+        var w = try segment.SegmentWriter.init(allocator, path);
+        defer w.deinit();
+        try w.writeBlock(1, &.{.{ .ts = 1, .value = 1 }});
+        try w.sync();
+    }
+
+    var cache = SegmentReaderCache.init(allocator, 8);
+    defer cache.deinit();
+
+    const a = try cache.acquire(io, 42, path);
+    const b = try cache.acquire(io, 42, path);
+    // Same pointer = same cached reader; no double-open.
+    try std.testing.expectEqual(@intFromPtr(a), @intFromPtr(b));
+    cache.release(io, 42);
+    cache.release(io, 42);
+}
+
+test "SegmentReaderCache: invalidate closes the entry" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(base);
+    const path = try std.fmt.allocPrint(allocator, "{s}/test.tsseg", .{base});
+    defer allocator.free(path);
+
+    {
+        var w = try segment.SegmentWriter.init(allocator, path);
+        defer w.deinit();
+        try w.writeBlock(1, &.{.{ .ts = 1, .value = 1 }});
+        try w.sync();
+    }
+
+    var cache = SegmentReaderCache.init(allocator, 8);
+    defer cache.deinit();
+
+    _ = try cache.acquire(io, 7, path);
+    cache.release(io, 7);
+    try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
+
+    cache.invalidate(io, 7);
+    try std.testing.expectEqual(@as(u32, 0), cache.entries.count());
+}
+
+test "SegmentReaderCache: invalidate defers close for borrowed entries" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(base);
+    const path = try std.fmt.allocPrint(allocator, "{s}/test.tsseg", .{base});
+    defer allocator.free(path);
+
+    {
+        var w = try segment.SegmentWriter.init(allocator, path);
+        defer w.deinit();
+        try w.writeBlock(1, &.{.{ .ts = 1, .value = 1 }});
+        try w.sync();
+    }
+
+    var cache = SegmentReaderCache.init(allocator, 8);
+    defer cache.deinit();
+
+    _ = try cache.acquire(io, 7, path);
+    // Don't release yet — borrowed.
+    cache.invalidate(io, 7);
+    // Entry must still be present (deferred close).
+    try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
+    cache.release(io, 7);
 }
 
 test "Engine: per_call durability mode survives crash without explicit sync (P-IO-002)" {
