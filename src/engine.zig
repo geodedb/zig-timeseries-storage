@@ -710,11 +710,19 @@ pub const Engine = struct {
             return;
         }
 
+        // Lazy-sort (P-ALGO-003): the memtable may contain per-series
+        // entries whose `sorted` flag was flipped to false by an
+        // out-of-order append. We sort once here, just before flush,
+        // rather than paying the cost on every OoO insert under the
+        // writer lock.
+        mem.ensureAllSorted();
+
         var it = mem.series.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.items.len > 0) {
-                const first_ts = entry.value_ptr.items[0].ts;
-                const last_ts = entry.value_ptr.items[entry.value_ptr.items.len - 1].ts;
+            const items = entry.value_ptr.points.items;
+            if (items.len > 0) {
+                const first_ts = items[0].ts;
+                const last_ts = items[items.len - 1].ts;
                 if (first_ts < min_ts) min_ts = first_ts;
                 if (last_ts > max_ts) max_ts = last_ts;
             }
@@ -732,7 +740,7 @@ pub const Engine = struct {
 
         it = mem.series.iterator();
         while (it.next()) |entry| {
-            try writer.writeBlock(entry.key_ptr.*, entry.value_ptr.items);
+            try writer.writeBlock(entry.key_ptr.*, entry.value_ptr.points.items);
         }
 
         // Durability ordering: fsync the segment file BEFORE adding
@@ -1162,17 +1170,23 @@ pub const Engine = struct {
     /// Drain points for `series_id` in `[start_ts, end_ts]` from a
     /// memtable into `merge_it`. Allocates the filtered slice on the
     /// supplied arena.
+    ///
+    /// Mutable receiver: `getSortedPoints` lazy-sorts the per-series
+    /// list on demand (see P-ALGO-003). The engine's writer lock is
+    /// held by `queryPoints` for the duration of this call, so the
+    /// mutation is race-free.
     fn queryMemtable(
         arena: Allocator,
-        mem: *const memtable.Memtable,
+        mem: *memtable.Memtable,
         series_id: types.SeriesId,
         start_ts: i64,
         end_ts: i64,
         merge_it: *iterator.MergeIterator,
     ) !void {
-        const pts = mem.series.get(series_id) orelse return;
+        const pts = mem.getSortedPoints(series_id);
+        if (pts.len == 0) return;
         var filtered_pts = std.ArrayListUnmanaged(types.Point).empty;
-        for (pts.items) |pt| {
+        for (pts) |pt| {
             if (pt.ts >= start_ts and pt.ts <= end_ts) {
                 try filtered_pts.append(arena, pt);
             }
