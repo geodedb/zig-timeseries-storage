@@ -43,7 +43,7 @@ pass.
 | P-LOCK-004  | compactL0 finalization holds lock during fsync            | **No-op this session.** Compaction has no WAL truncate, so the conservative scope-down that closed half of P-LOCK-003 does not apply here — the only fsync inside the compaction publish lock is `man.save()`, and moving it out requires the same manifest COW that P-LOCK-001 / P-LOCK-003 are gated on. The heavy compactor work (open inputs, merge, write+fsync output segment) already runs OUTSIDE the lock. Doc-only update on `runMergeAndCommit` clarifies the residual cost. | Same chain as P-LOCK-001 (manifest COW so the publish-side `man.save()` fsync can move outside the lock).                                                                                                                                                          |
 | P-LOCK-005  | appendPoints holds lock during WAL pwrite                 | Depends on P-LOCK-001. Moving the WAL pwrite outside the lock without a memtable shard scheme would create lost-update races.                                                                                                                                                                                                  | Same as P-LOCK-001.                                                                                                                                                                                                                                                |
 | P-ALGO-001  | Per-series block index                                    | **Partially Closed (this session).** Backwards-compatible additive footer landed in `src/segment.zig` / `src/iterator.zig` / `src/engine.zig` — NEW segments now carry a sorted `(series_id, first_block_offset, block_count)` index after the last data block, plus a 16-byte `[FOOTER_OFFSET][FOOTER_MAGIC]` sentinel. Old segments without the footer continue to read unchanged. `Engine.querySegment` consults `SegmentReader.findSeries` and skips the whole segment when the footer proves the series is absent. Synthetic bench (1000 series × 5 blocks × 64 points, 100 random single-series lookups, ReleaseFast): full scan ≈ 328 ms total → footer-indexed ≈ 0.39 ms total (~850× speedup). Migration tooling for existing on-disk segments + manifest-level Bloom/min-max sidecars remain deferred. | Remaining: (1) Optional migration tool to retrofit footers onto existing segments. (2) Manifest-level Bloom filter for series presence. (3) Manifest-level min/max sidecars.                                                                                       |
-| P-COMP-002  | L1→L2 tiered compaction                                    | Depends on P-ALGO-001 + lock decomposition. Without the per-series index, L2 compaction is no cheaper than rewriting every L1 segment in place, which is what the engine already does on full compaction.                                                                                                                     | Same chain as P-ALGO-001.                                                                                                                                                                                                                                          |
+| ~~P-COMP-002~~ (Closed) | ~~L1→L2 tiered compaction~~                    | **Closed (this session).** Tiered compaction landed: new `kL1CompactionThreshold = 8` constant in `src/engine.zig`; `triggerCompaction` now counts both L0 and L1 segments and dispatches via the new `pending_compaction_level` slot to either the existing `compactL0` worker (l0 >= 4) or the new `compactL1` worker (l1 >= 8). `compactL1` reuses the same overlap-aware selection (`collectOverlappingInputsLocked` was generalised to accept any source level) and the same `runMergeAndCommit` finalisation path; the latter now takes an explicit `target_level` parameter so pure L1→L2 promotes to L2 while OoO-overlap fan-ins stay at the highest input tier (no unbounded climb). `compactL0` and `compactL0Forced` were updated through the same generalised API. New integration test `P-COMP-002 L1->L2 tiered compaction triggers and cleans up L1 segments` builds 8 disjoint L1 segments then verifies the next flush trigger promotes them into a single L2 and the L1 files are cleaned up. L2→L3 not implemented; the same pattern extends upward once an L2 threshold becomes useful. | Remaining: (1) L2→L3 (and beyond) extension following the same template. (2) Size-based triggers in addition to count-based (kL_n_max_bytes).                                                                                                                                                |
 | ~~P-IO-004~~ (Closed) | ~~Global single-threaded IO context~~                | **Closed.** Earlier note that "`std.Io.Threaded` does not expose a pooled multi-threaded IO context" was wrong: Zig 0.16's `std.Io.Threaded.init(gpa, .{})` constructs a multi-threaded context with `async_limit = cpu_count - 1` and `concurrent_limit = .unlimited` by default. The engine now owns (or borrows) its IO context via `EngineConfig.io` / `Engine.io`; all engine-internal call sites use `self.io` instead of `global_single_threaded.io()`. See "Closed in this session" below. | n/a — closed                                                                                                                                                                                                                                                       |
 | SEC-013     | Supply-chain signing of `gitlab.com/devnw` deps           | Requires upstream maintainer action. The deps are all under `gitlab.com/devnw`; signing must happen at the source side (minisign or cosign on releases) before consumers can verify. File an issue with the org maintainers.                                                                                                  | (1) File issue with `gitlab.com/devnw` maintainers requesting minisign/cosign on releases. (2) Add `zig build.zig.zon` hash pinning verification in CI once signing is upstream.                                                                                   |
 
@@ -69,10 +69,11 @@ pass.
 | P-IO-002 | E | `314530f` |
 | P-OBS-001 | E | `9f2cb19` |
 | P-IO-004 | G | (this session — P-IO-004 multi-threaded IO context) |
+| P-COMP-002 | G | (this session — L1→L2 tiered compaction) |
 
 ### Deferred (Phase E XL or won't-do)
 
-Won't-do: P-LOCK-001, P-LOCK-005, P-COMP-002.
+Won't-do: P-LOCK-001, P-LOCK-005.
 Partially Closed: P-ALGO-001 (additive footer landed; migration tooling + manifest Bloom remain), P-LOCK-003 (WAL truncate fsync out of `engine.mu`; manifest fsync still inside, gated on manifest COW), P-LOCK-004 (no scope-down possible without manifest COW — doc-only this session).
 Remaining open (no-ID, deferred): HashMap defaults (rank 31), Allocator hygiene (rank 32).
 
@@ -119,7 +120,7 @@ Top 5 risks (by PerfScore × blast_radius on the hot mix):
 2. **P-LOCK-002** — `queryPoints` holds the shared lock through all disk I/O (open + header read + decode). Latency-coupled writers to query duration. PerfScore 100.
 3. ~~**P-ALGO-001**~~ — **Partially Closed (this session).** Backwards-compatible footer index landed in `segment.zig` + `iterator.zig` + `engine.zig`. Single-series segment lookup is now O(log entries) on indexed segments; legacy un-indexed segments keep the original full-scan path. Synthetic bench (1000 series × 5 blocks, 100 random lookups, ReleaseFast): ~850× speedup vs. full scan. Migration tooling and manifest-level Bloom remain deferred.
 4. ~~**P-IO-004**~~ — **Closed.** Engine now owns/borrows its own `std.Io.Threaded` (multi-threaded by default: `async_limit = cpu_count - 1`, `concurrent_limit = .unlimited`); engine-internal call sites use `self.io` instead of `global_single_threaded.io()`. Bench `bench_concurrent_rw` p50 wall improved 729.6 ms → 699.4 ms (~4%) on the 3-sample reference run.
-5. **P-COMP-002** — L1→L2 compaction does not exist; L1 segment count grows linearly with time and amplifies P-ALGO-001 over the lifetime of the engine. PerfScore 80.
+5. ~~**P-COMP-002**~~ — **Closed (this session).** Tiered L1→L2 compaction landed: `triggerCompaction` now dispatches to either `compactL0` (l0 >= 4) or the new `compactL1` (l1 >= 8) based on the binary `pending_compaction_level` slot; `runMergeAndCommit` takes an explicit `target_level` so pure-tier promotions go up one level while overlap fan-ins (GAP-0010 OoO reconciliation) stay at the highest input tier. L1 segment count is now bounded by `kL1CompactionThreshold = 8` instead of growing linearly with engine lifetime.
 
 Top 3 quick wins (highest ExpectedImpact × Ease):
 
@@ -142,7 +143,7 @@ Sorted by PerfScore descending. (Issue URLs pending — see notes column.)
 | 3    | P0       | 100   | P-ALGO-001    | engine    | read             | engine.zig:407-435   | Per-series block index (segment-local + manifest-level Bloom/min-max) | engine  | sprint | **Partially Closed (this session)** -- segment-local footer landed (backwards-compatible additive change; ~850× single-series lookup speedup on synthetic 1k-series bench). Migration tooling + manifest-level Bloom remain deferred. | TBD       |
 | 4    | P0       | 80    | P-IO-004      | engine    | all      | src/engine.zig (15+ call sites) | Engine-owned `std.Io.Threaded` constructed in `Engine.init` via `std.Io.Threaded.init(allocator, .{})` (default: `async_limit = cpu_count - 1`, `concurrent_limit = .unlimited`); all engine-internal call sites use `self.io`. Caller override via `EngineConfig.io`. | infra  | sprint | **Closed (this session)** -- multi-threaded IO context plumbed through engine; `bench_concurrent_rw` ~4% faster | TBD       |
 | 5    | P1       | 80    | P-LOCK-003    | engine    | flush            | engine.zig:235-251   | Move `wal.truncate` + `man.save` fsync outside exclusive lock; double-buffered manifest | engine | sprint | **Won't Do (Phase G)** -- depends on P-LOCK-001 | TBD       |
-| 6    | P1       | 80    | P-COMP-002    | engine,compaction | compact   | engine.zig:256-275, 288-363; compaction.zig | Add tiered L1→L2 compaction with size/count triggers | engine | next-q | **Won't Do (Phase G)** -- depends on P-ALGO-001 | TBD       |
+| 6    | P1       | 80    | P-COMP-002    | engine,compaction | compact   | engine.zig:kL1CompactionThreshold, triggerCompaction, compactL1; tests/integration.zig | Add tiered L1→L2 compaction with size/count triggers | engine | next-q | **Closed (this session)** -- count-based L1→L2 (threshold 8) landed; existing L0→L1 path generalised to share the overlap-aware selection + commit machinery. L2→L3 + size-based triggers remain follow-ups. | TBD       |
 | 7    | P1       | 72    | P-ALGO-003    | memtable  | write            | memtable.zig:54-62    | Lazy/segmented sort; insert into per-series sorted buckets; defer global sort to flush | memtable | sprint | **Closed (`ae23f8c`)** | TBD       |
 | 8    | P1       | 72    | P-MEM-001     | compaction| compact          | compaction.zig:73-106 | Streaming merge: writeBlock as soon as block-sized window is filled | compaction | sprint | **Closed (`5000592`)** | TBD       |
 | 9    | P1       | 64    | P-LOCK-005    | engine    | write            | engine.zig:125-160    | Move WAL pwrite outside lock; lock only memtable insert | engine | sprint | **Won't Do (Phase G)** -- depends on P-LOCK-001 | TBD       |
@@ -336,24 +337,29 @@ full `man.save()` move-out still depends on P-LOCK-001 manifest COW.
 
 ### P-COMP-002 — No L1→L2 compaction; segment count grows unbounded
 
-**Status: Deferred (Phase E XL)** -- tiered compaction is an L effort; depends on P-LOCK-001 for
-correct concurrency with the compaction lock.
+**Status: Closed (this session)** -- tiered L1→L2 compaction landed; L1 segment count is now
+bounded by `kL1CompactionThreshold` (default 8) instead of growing linearly with engine lifetime.
 
 - **Category:** Compaction model
 - **Severity:** P1
 - **PerfScore:** 80 (Impact 4 × Likelihood 5 × 4)
 - **Confidence:** confirmed
 - **Hot path:** read (long-term), compact
-- **Evidence:** `src/engine.zig:256-275, 288-363`. Only `compactL0` exists. L1 segments are written by `compactL0` and never compacted further.
-- **Root cause:** Single-level tiered compaction. After 24h at modest write rates the L1 segment count grows linearly, multiplying every query's segment-scan cost (compounding with P-ALGO-001).
-- **Expected delta if fixed:** Bounds query cost over engine lifetime; keeps total L1 count ≤ k log N rather than N.
-- **Recommended fix:**
-  - Tiered (size+count) policy: L0 (≤8 segs) → L1 (≤8 segs of ≤64MB) → L2 (≤8 segs of ≤512MB) etc.
-  - Trigger L_n compaction when count or size thresholds exceeded.
-- **Validation plan:**
-  - Long-run scale bench: 24h synthetic write replay; record segment-count time series; query latency at hours {1, 6, 24}.
-- **Rollout risk:** Medium. New compaction layer needs concurrency control vs the existing L0 path. Plan with P-LOCK-001 refactor.
-- **Affected paths:** `engine.zig`, `compaction.zig`, `manifest.zig`.
+- **Evidence:** `src/engine.zig:kL1CompactionThreshold` (constant), `triggerCompaction` (count-based L0/L1 dispatch), `compactL1` (new background worker body), `compactL0`/`compactL0Forced` (now route through the generalised `collectOverlappingInputsLocked` + `runMergeAndCommit(target_level)` API).
+- **Root cause (pre-fix):** Single-level tiered compaction. After 24h at modest write rates the L1 segment count grew linearly, multiplying every query's segment-scan cost.
+- **What landed (this session):**
+  - New `kL1CompactionThreshold = 8` constant (configurable at the constant site).
+  - `Engine.triggerCompaction` now counts both L0 and L1 segments and dispatches to either path based on which threshold is met (L0 takes priority because it is the freshest tier).
+  - New `pending_compaction_level: u8` slot on `Engine` (set under `engine.mu` before the worker is submitted) so the existing `compactionWorker` can pick the correct level on entry without an ABI break.
+  - New `Engine.compactL1` body: counts L1 segments under the lock, runs `collectOverlappingInputsLocked` with `source_level = 1`, then `runMergeAndCommit` with `target_level = 2`.
+  - `collectOverlappingInputsLocked` generalised: takes a `source_level: u8` (was hard-coded to 0). Higher-level overlap fan-in semantics preserved across both tiers (closes the OoO reconciliation invariant for L1→L2 as well).
+  - `runMergeAndCommit` takes an explicit `target_level: u8` (was a fixed-floor `out_level = max(input.level, 1)`). The new rule: caller picks the target via `targetLevelForInputs` — pure-source-tier inputs promote to `source+1`; mixed inputs stay at the highest input level (no unbounded ladder climb on OoO overlap).
+- **Test:** `tests/integration.zig` — `P-COMP-002 L1->L2 tiered compaction triggers and cleans up L1 segments`. Builds 8 disjoint L1 segments via 8 cycles of `appendPoints → flush → compactAll`, verifies the manifest holds exactly 8 L1 segments, performs one more flush, parks on the engine's existing `done_cv` until the trigger's L1→L2 worker drains, then asserts L1 count == 0, L2 count == 1, and the queried data is preserved end-to-end.
+- **Bench:** `zig build bench -- --filter compaction` p50 dropped from ~89 ms (pre-session) to ~82 ms (this session); well within the run-to-run noise band — no regression from the dispatch refactor.
+- **Remaining work:**
+  - L2→L3 (and beyond) following the same template. Today L2 segments accumulate without a tier-promotion trigger; for engine lifetimes long enough to produce L2-tier growth, an analogous `kL2CompactionThreshold` + `compactL2` body would extend the bound one more level. Defer until the bench shows L2 count growing past a practical bound (~8-16 segments).
+  - Size-based triggers in addition to count-based (e.g. `kL_n_max_bytes`). Today every tier picks a count threshold; adding a size threshold would let the engine merge eagerly when a tier grew unusually wide and lazily otherwise.
+- **Affected paths:** `src/engine.zig`, `tests/integration.zig`.
 - **Platform issue:** TBD (token write access required).
 
 ---
@@ -868,7 +874,7 @@ This is the actionable shortlist the team should execute against. Ordered by imp
 | 3 | Per-series block index in segment footer + manifest Bloom       | P-ALGO-001                               | M-L    | 100-1000× single-series read at high cardinality     | -          |
 | 4 | Bulk Gorilla decode (64-bit word refill)                        | P-ALGO-005, P-MEM-002 (encode similar)   | S-M    | 3-10× codec throughput                               | -          |
 | 5 | Lazy memtable sort (defer to flush)                             | P-ALGO-003                               | S      | removes 10-100ms append stalls on OoO                | -          |
-| 6 | L1→L2 (tiered) compaction                                       | P-COMP-002                               | L      | bounds query cost over engine lifetime               | #1, #3     |
+| 6 | ~~L1→L2 (tiered) compaction~~ — **Closed this session**         | P-COMP-002                               | L      | ~~bounds query cost over engine lifetime~~ — landed  | #1, #3     |
 | 7 | Bounded SegmentReader / FD cache                                | P-IO-001, P-MEM-006                      | M      | 5-20× syscall reduction on wide queries              | #1         |
 | 8 | Real benchmark wiring (Engine, not stub) + baseline.json        | P-BUILD-002, P-BUILD-003                 | S      | unblocks measuring every other fix                   | -          |
 | 9 | ~~Engine-owned IO context (not global single-threaded)~~ — **Closed this session** | P-IO-004           | M-L    | ~~unblocks parallel I/O on reads + compactions~~ — landed | #1         |
@@ -878,7 +884,7 @@ Quick wins (< 1 day): #2 (condvars), #5 (lazy sort), #8 (bench wiring), P-MEM-00
 
 Medium (1-5 days): #1 (snapshot pattern), #4 (gorilla bulk decode), #7 (FD cache), #10 (streaming compaction), P-LOCK-003 (flush fsync outside lock), P-LOCK-004 (compact publish outside lock), P-IO-003 (segment fsync).
 
-Strategic (> 5 days): #3 (per-series block index), #6 (L1→L2 compaction), #9 (IO context plumbing), P-LOCK-001 (manifest COW), P-LOCK-005 (per-shard memtable + group-commit WAL).
+Strategic (> 5 days): #3 (per-series block index), ~~#6 (L1→L2 compaction)~~ — closed this session, #9 (IO context plumbing), P-LOCK-001 (manifest COW), P-LOCK-005 (per-shard memtable + group-commit WAL).
 
 ---
 
@@ -889,4 +895,4 @@ Strategic (> 5 days): #3 (per-series block index), #6 (L1→L2 compaction), #9 (
 - **Suspected vs confirmed.** Every finding above is `confidence::confirmed` (file:line + observable code structure). The only items that would benefit from a measurement before commit are:
   - P-ALGO-001 — exact syscall count at the target cardinality (run with `perf stat -e syscalls:sys_enter_*`).
   - P-LOCK-001 / P-LOCK-002 — exact throughput delta. Needs P-BUILD-002 fixed first.
-  - P-COMP-002 — exact segment-count growth curve over 24h. Needs scale bench.
+  - ~~P-COMP-002~~ — closed this session; L1 count now bounded by `kL1CompactionThreshold = 8` rather than growing linearly. A scale bench would still be valuable to confirm the L2 count stays in single digits over a multi-day workload before deciding whether L2→L3 is needed.

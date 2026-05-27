@@ -363,3 +363,156 @@ test "integration: crash recovery replays unflushed WAL records" {
         try std.testing.expectEqual(@as(i64, 1), first_ts);
     }
 }
+
+/// Block until any in-flight background compaction has finished.
+/// Used by the L1->L2 test below so it can observe a quiescent
+/// manifest after each cycle. Parks on the engine's existing
+/// `done_cv` (broadcast by workers as they clear their in-flight
+/// flags), which is the same primitive `Engine.deinit` uses to
+/// drain background work — so we inherit its correctness rather
+/// than spin-polling on the side.
+fn waitForCompactionQuiescent(eng: *lib.Engine) void {
+    const io = eng.io;
+    eng.mu.lockUncancelable(io);
+    defer eng.mu.unlock(io);
+    while (eng.compaction_running or eng.flushing_mem != null or eng.flush_workers_active > 0) {
+        eng.done_cv.waitUncancelable(io, &eng.mu);
+    }
+}
+
+test "integration: P-COMP-002 L1->L2 tiered compaction triggers and cleans up L1 segments" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 2 });
+    defer pool.deinit();
+
+    var eng = try lib.Engine.init(allocator, .{
+        .data_dir = data_dir,
+        // Small threshold so each appended batch trips a flush.
+        .max_memtable_points = 50,
+    }, &pool);
+    defer eng.deinit();
+
+    // Build 8 L1 segments by running 8 disjoint "rounds". Each round:
+    //   1. Append a batch covering a fresh, non-overlapping ts window.
+    //   2. flush() to seal that batch into an L0 segment.
+    //   3. compactAll() to fold the new L0 into a fresh L1 segment.
+    //
+    // Using disjoint ts windows is the key invariant: it guarantees
+    // the round's compactAll does NOT fold in any pre-existing L1
+    // segment via the overlap-aware selection path. After 8 rounds
+    // the manifest holds exactly 8 L1 segments — enough to trip
+    // kL1CompactionThreshold on the next flush.
+    const points_per_round: usize = 50;
+    const num_rounds: usize = 8;
+    const series_id: lib.types.SeriesId = 7;
+
+    var round: usize = 0;
+    while (round < num_rounds) : (round += 1) {
+        var batch: [points_per_round]lib.types.Point = undefined;
+        const base: i64 = @intCast(round * 10_000);
+        for (0..points_per_round) |i| {
+            const ts: i64 = base + @as(i64, @intCast(i));
+            batch[i] = .{ .ts = ts, .value = ts };
+        }
+        try eng.appendPoints(series_id, &batch);
+        try eng.flush();
+        try eng.compactAll();
+        waitForCompactionQuiescent(&eng);
+    }
+
+    // Sanity: 8 L1 segments, 0 L0.
+    var l0_before: usize = 0;
+    var l1_before: usize = 0;
+    var l2_before: usize = 0;
+    for (eng.man.segments.items) |seg| {
+        if (seg.level == 0) l0_before += 1;
+        if (seg.level == 1) l1_before += 1;
+        if (seg.level == 2) l2_before += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), l0_before);
+    try std.testing.expectEqual(@as(usize, 8), l1_before);
+    try std.testing.expectEqual(@as(usize, 0), l2_before);
+
+    // Trigger one more flush. The flushed L0 segment count is 1 (well
+    // below kL0CompactionThreshold=4), but the L1 count of 8 meets
+    // kL1CompactionThreshold=8 — `triggerCompaction` should now
+    // dispatch an L1->L2 worker.
+    {
+        var batch: [points_per_round]lib.types.Point = undefined;
+        const base: i64 = @intCast(num_rounds * 10_000);
+        for (0..points_per_round) |i| {
+            const ts: i64 = base + @as(i64, @intCast(i));
+            batch[i] = .{ .ts = ts, .value = ts };
+        }
+        try eng.appendPoints(series_id, &batch);
+        try eng.flush();
+    }
+    waitForCompactionQuiescent(&eng);
+
+    // After the L1->L2 pass the manifest should contain:
+    //   * 0 L1 segments (all 8 folded into the new L2 — they were
+    //     disjoint by construction so no L2 pre-existed to also fold
+    //     in via overlap).
+    //   * Exactly 1 L2 segment.
+    //   * The post-flush L0 segment may have been picked up by the
+    //     compactor as well, but at minimum it is NOT >= the L0
+    //     threshold, so we assert "fewer than 4" rather than an exact
+    //     count.
+    var l0_after: usize = 0;
+    var l1_after: usize = 0;
+    var l2_after: usize = 0;
+    for (eng.man.segments.items) |seg| {
+        if (seg.level == 0) l0_after += 1;
+        if (seg.level == 1) l1_after += 1;
+        if (seg.level == 2) l2_after += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), l1_after);
+    try std.testing.expectEqual(@as(usize, 1), l2_after);
+    try std.testing.expect(l0_after < 4);
+
+    // The new L2 segment file must be on disk. Iterate the segments
+    // list to find the L2 entry and stat the file.
+    var l2_id: ?u64 = null;
+    for (eng.man.segments.items) |seg| {
+        if (seg.level == 2) {
+            l2_id = seg.id;
+            break;
+        }
+    }
+    try std.testing.expect(l2_id != null);
+    const l2_path = try lib.segment.segmentPath(allocator, data_dir, l2_id.?);
+    defer allocator.free(l2_path);
+    {
+        const f = try std.Io.Dir.cwd().openFile(io, l2_path, .{});
+        defer f.close(io);
+        const len = try f.length(io);
+        try std.testing.expect(len > 0);
+    }
+
+    // The old L1 segment files must have been deleted by the
+    // compactor's cleanup loop. We can't easily enumerate them
+    // (we no longer have their ids), but the manifest's L1 count
+    // dropped to 0 above, which is the source-of-truth check.
+
+    // Data must still be queryable end-to-end across all rounds —
+    // the compaction is supposed to be invisible to readers.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var it = try eng.queryPoints(arena.allocator(), series_id, 0, std.math.maxInt(i64));
+    var count: usize = 0;
+    var last_ts: i64 = -1;
+    while (it.next()) |pt| {
+        try std.testing.expect(pt.ts >= last_ts);
+        last_ts = pt.ts;
+        count += 1;
+    }
+    const expected: usize = (num_rounds + 1) * points_per_round;
+    try std.testing.expectEqual(expected, count);
+}

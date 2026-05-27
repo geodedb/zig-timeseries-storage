@@ -21,6 +21,15 @@ const wal_record = @import("wal_record.zig");
 /// compaction work over enough memtable flushes to matter.
 const kL0CompactionThreshold: usize = 4;
 
+/// Number of level-1 segments that triggers an L1->L2 compaction job
+/// (P-COMP-002). Picked larger than `kL0CompactionThreshold` so the
+/// (more expensive) L1 merge runs less often than the L0 merge but
+/// still bounds the L1 segment count to a constant — without this
+/// trigger, L1 segments accumulate linearly with engine lifetime and
+/// every query pays a linearly-growing segment-scan cost (compounds
+/// with the per-series-index gap closed by P-ALGO-001).
+const kL1CompactionThreshold: usize = 8;
+
 /// Compute the per-series ArrayList capacity hint for a fresh
 /// memtable, given the engine's `max_memtable_points` budget and the
 /// expected number of distinct series. The hint floors at 64 so
@@ -648,8 +657,11 @@ pub const StatsSnapshot = struct {
     /// per-flush worker body — encode, write, fsync, manifest commit).
     flush_total_ns: u64,
 
-    /// Number of L0 -> L1 compaction passes that completed (success
-    /// OR failure). Increments inside `compactL0` / `compactL0Forced`.
+    /// Number of compaction passes that completed (success OR
+    /// failure), across every tier. Increments inside the background
+    /// `compactionWorker` (which dispatches to either `compactL0` or
+    /// `compactL1` per P-COMP-002) and inside `compactL0Forced` (the
+    /// synchronous `compactAll` path).
     compaction_count: u64,
     /// Cumulative wall time spent inside compaction worker bodies.
     compaction_total_ns: u64,
@@ -799,6 +811,14 @@ pub const Engine = struct {
     /// fetches across this file. Closes P-IO-004.
     io: std.Io,
     compaction_running: bool = false,
+    /// Source level the in-flight background compaction worker should
+    /// compact (P-COMP-002). Set under `engine.mu` by
+    /// `triggerCompaction` BEFORE submitting the worker; read by the
+    /// worker on entry. Valid values are 0 (L0->L1) and 1 (L1->L2).
+    /// The single-binary `compaction_running` flag still gates the
+    /// worker submission so only one compaction runs at a time across
+    /// any tier.
+    pending_compaction_level: u8 = 0,
     /// Number of flush worker invocations that have entered
     /// `flushWorker` and not yet returned. Distinct from
     /// `flushing_mem` — that slot is cleared inside the lock as
@@ -2029,20 +2049,45 @@ pub const Engine = struct {
         };
     }
 
+    /// Decide whether a background compaction is warranted and, if so,
+    /// dispatch one. Implements the tiered policy that closes
+    /// P-COMP-002:
+    ///
+    ///   * `l0_count >= kL0CompactionThreshold` -> submit L0->L1.
+    ///   * Else if `l1_count >= kL1CompactionThreshold` -> submit L1->L2.
+    ///   * Else no-op.
+    ///
+    /// L0 takes priority because it is the freshest tier and growing
+    /// L0 directly inflates write amplification on the next compaction
+    /// fan-in. We only consider L1 when L0 is already below its
+    /// trigger — the binary `compaction_running` gate ensures only one
+    /// pass runs at a time across any tier.
     fn triggerCompaction(self: *Engine) !void {
         const io = self.io;
         self.mu.lockUncancelable(io);
         var l0_count: usize = 0;
+        var l1_count: usize = 0;
         for (self.man.segments.items) |seg| {
-            if (seg.level == 0) l0_count += 1;
+            if (seg.level == 0) l0_count += 1 else if (seg.level == 1) l1_count += 1;
         }
         self.mu.unlock(io);
 
+        var target_level: u8 = 0;
+        var should_submit = false;
         if (l0_count >= kL0CompactionThreshold) {
+            target_level = 0;
+            should_submit = true;
+        } else if (l1_count >= kL1CompactionThreshold) {
+            target_level = 1;
+            should_submit = true;
+        }
+
+        if (should_submit) {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
             if (!self.compaction_running) {
                 self.compaction_running = true;
+                self.pending_compaction_level = target_level;
                 _ = self.pool.submit(compactionWorker, self, .{}) catch {
                     self.compaction_running = false;
                     // No worker actually ran, so wake anyone parked
@@ -2120,19 +2165,39 @@ pub const Engine = struct {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
 
-            try self.collectOverlappingInputsLocked(.{ .require_l0 = false }, &input_segs);
+            try self.collectOverlappingInputsLocked(.{ .source_level = 0, .require_source = false }, &input_segs);
             if (input_segs.items.len == 0) return;
             new_seg_id = self.man.getNextSegmentId();
         }
 
-        try self.runMergeAndCommit(io, input_segs.items, new_seg_id);
+        // Forced L0 path: target the next tier above the highest input
+        // level seen (matches the pure-fan-in semantic). If any L1+
+        // segment got folded in via overlap, the output stays at that
+        // tier (see `targetLevelForInputs`).
+        const target_level = targetLevelForInputs(input_segs.items, 0);
+        try self.runMergeAndCommit(io, input_segs.items, new_seg_id, target_level);
     }
 
     fn compactionWorker(ctx: *anyopaque, _: *thread_pool.TaskContext) void {
         var self = safety.castCtx(Engine, ctx);
         const t_start = nowMonotonicNs();
-        const result = self.compactL0();
         const io = self.io;
+
+        // Snapshot the dispatch level under the lock so a racing
+        // `triggerCompaction` cannot clobber it mid-run. The trigger
+        // path gates on `compaction_running` so the only legitimate
+        // writer of `pending_compaction_level` at this point is the
+        // one that just submitted us.
+        self.mu.lockUncancelable(io);
+        const level = self.pending_compaction_level;
+        self.mu.unlock(io);
+
+        const result = switch (level) {
+            0 => self.compactL0(),
+            1 => self.compactL1(),
+            else => self.compactL0(), // defensive fall-through to L0
+        };
+
         self.mu.lockUncancelable(io);
         if (result) |_| {} else |err| {
             self.recordBackgroundErrorLocked(.compaction, err);
@@ -2171,31 +2236,108 @@ pub const Engine = struct {
             }
             if (l0_count < kL0CompactionThreshold) return;
 
-            try self.collectOverlappingInputsLocked(.{ .require_l0 = true }, &input_segs);
+            try self.collectOverlappingInputsLocked(.{ .source_level = 0, .require_source = true }, &input_segs);
             if (input_segs.items.len == 0) return;
             new_seg_id = self.man.getNextSegmentId();
         }
 
-        try self.runMergeAndCommit(io, input_segs.items, new_seg_id);
+        // Background L0 path: same target-level rule as the forced
+        // path — climb to L1 by default, but stay at the highest input
+        // level when an OoO overlap folded an L1+ segment in.
+        const target_level = targetLevelForInputs(input_segs.items, 0);
+        try self.runMergeAndCommit(io, input_segs.items, new_seg_id, target_level);
+    }
+
+    /// Background L1->L2 compaction worker body (P-COMP-002).
+    ///
+    /// Folds every L1 segment into a single L2 segment when the L1
+    /// count crosses `kL1CompactionThreshold`. Without this trigger,
+    /// L1 segments accumulate one-per-L0-fan-in and every query pays
+    /// a linearly-growing segment-scan cost over the engine lifetime.
+    ///
+    /// L2->L3+ is not yet implemented; the same pattern can extend
+    /// upward once an L2 trigger threshold becomes useful.
+    ///
+    /// Overlap-awareness: like L0->L1, we fold in any higher-level
+    /// (L2+) segment whose timestamp range intersects the chosen L1
+    /// set. Today no L2+ segments exist outside this path so the
+    /// overlap fold is a no-op on the first pass; on subsequent
+    /// passes it keeps the OoO reconciliation invariant intact.
+    fn compactL1(self: *Engine) !void {
+        const io = self.io;
+
+        var input_segs = std.ArrayList(manifest.SegmentMeta).empty;
+        defer input_segs.deinit(self.allocator);
+        var new_seg_id: u64 = 0;
+        var l1_count: usize = 0;
+
+        {
+            self.mu.lockUncancelable(io);
+            defer self.mu.unlock(io);
+
+            for (self.man.segments.items) |seg| {
+                if (seg.level == 1) l1_count += 1;
+            }
+            if (l1_count < kL1CompactionThreshold) return;
+
+            try self.collectOverlappingInputsLocked(.{ .source_level = 1, .require_source = true }, &input_segs);
+            if (input_segs.items.len == 0) return;
+            new_seg_id = self.man.getNextSegmentId();
+        }
+
+        const target_level = targetLevelForInputs(input_segs.items, 1);
+        try self.runMergeAndCommit(io, input_segs.items, new_seg_id, target_level);
+    }
+
+    /// Pure helper that computes the canonical output level for a
+    /// completed compaction pass given the input segment set and the
+    /// nominal "source" level the pass started from.
+    ///
+    /// Rules:
+    ///   * Pure-source merge -> source+1 (standard tier promotion).
+    ///   * Any input above source (folded in via the OoO overlap
+    ///     scan) -> stay at the HIGHEST input level so the reconciled
+    ///     segment replaces the older sibling at the same tier
+    ///     rather than climbing the level ladder unboundedly with
+    ///     every OoO arrival.
+    fn targetLevelForInputs(inputs: []const manifest.SegmentMeta, source_level: u8) u8 {
+        var max_level: u8 = source_level;
+        for (inputs) |seg| {
+            if (seg.level > max_level) max_level = seg.level;
+        }
+        // Pure-source: promote one tier. Mixed: stay at the highest
+        // observed level (no unbounded climb on OoO overlap).
+        return if (max_level == source_level) source_level + 1 else max_level;
     }
 
     /// Selection policy for `collectOverlappingInputsLocked`.
+    ///
+    /// `source_level` is the tier whose segments are unconditionally
+    /// pulled in as the primary inputs (L0 for the original
+    /// background path; L1 for the P-COMP-002 path). Any segment at a
+    /// HIGHER level whose `[min_ts, max_ts]` overlaps the source
+    /// range is folded into the merge too — this preserves the OoO
+    /// reconciliation invariant across tier boundaries.
+    ///
+    /// When `require_source` is true the selection aborts if no
+    /// source-level segment is present (background-worker policy:
+    /// the trigger gated on a non-zero count). When false, an empty
+    /// source set is acceptable (forced-compaction operator policy).
     const InputSelection = struct {
-        /// When true, abort the selection if no L0 segment is
-        /// present (background worker policy — L0 is the trigger).
-        /// When false, any non-empty segment list is allowed
-        /// (forced-compaction policy — operator drove the call).
-        require_l0: bool,
+        source_level: u8,
+        require_source: bool,
     };
 
     /// Collect the input segment set for a compaction pass
-    /// (GAP-0010). Selects every L0 segment, then expands the set
-    /// with any higher-level segment that overlaps the L0 range.
-    /// The result is sorted by segment id ASCENDING (oldest first)
-    /// so the downstream `MergeIterator`'s same-(ts, value) tie
-    /// semantics put the newer LSN's point last, which the
-    /// compactor's per-ts dedup loop then overwrites with — net
-    /// behaviour: last-write-wins under cross-segment OoO writes.
+    /// (GAP-0010, generalised in P-COMP-002 to non-zero source
+    /// levels). Selects every segment at `policy.source_level`, then
+    /// expands the set with any HIGHER-level segment that overlaps
+    /// the chosen range. The result is sorted by segment id
+    /// ASCENDING (oldest first) so the downstream `MergeIterator`'s
+    /// same-(ts, value) tie semantics put the newer LSN's point
+    /// last, which the compactor's per-ts dedup loop then overwrites
+    /// with — net behaviour: last-write-wins under cross-segment
+    /// OoO writes, regardless of which tiers are being merged.
     ///
     /// Caller MUST hold `self.mu`.
     fn collectOverlappingInputsLocked(
@@ -2203,31 +2345,33 @@ pub const Engine = struct {
         policy: InputSelection,
         out: *std.ArrayList(manifest.SegmentMeta),
     ) !void {
-        // First pass: collect L0 and bracket the timestamp range.
-        var l0_min: i64 = std.math.maxInt(i64);
-        var l0_max: i64 = std.math.minInt(i64);
-        var l0_count: usize = 0;
+        // First pass: collect source-level segments and bracket their
+        // timestamp range.
+        var src_min: i64 = std.math.maxInt(i64);
+        var src_max: i64 = std.math.minInt(i64);
+        var src_count: usize = 0;
         for (self.man.segments.items) |seg| {
-            if (seg.level == 0) {
+            if (seg.level == policy.source_level) {
                 try out.append(self.allocator, seg);
-                if (seg.min_ts < l0_min) l0_min = seg.min_ts;
-                if (seg.max_ts > l0_max) l0_max = seg.max_ts;
-                l0_count += 1;
+                if (seg.min_ts < src_min) src_min = seg.min_ts;
+                if (seg.max_ts > src_max) src_max = seg.max_ts;
+                src_count += 1;
             }
         }
 
-        if (policy.require_l0 and l0_count == 0) return;
+        if (policy.require_source and src_count == 0) return;
 
-        // Second pass: any higher-level segment overlapping the L0
-        // range gets folded in. The "overlap" test is the standard
-        // closed-interval intersection: NOT (other.max < l0_min
-        // OR other.min > l0_max). When there is no L0 (forced path
-        // on an L0-empty manifest), there's nothing to overlap with,
-        // so the higher-level pass is a no-op.
-        if (l0_count > 0) {
+        // Second pass: any HIGHER-level segment overlapping the
+        // source range gets folded in. The "overlap" test is the
+        // standard closed-interval intersection: NOT (other.max <
+        // src_min OR other.min > src_max). When there is no source
+        // segment (forced path on an empty source tier), there's
+        // nothing to overlap with, so the higher-level pass is a
+        // no-op.
+        if (src_count > 0) {
             for (self.man.segments.items) |seg| {
-                if (seg.level == 0) continue;
-                const overlaps = !(seg.max_ts < l0_min or seg.min_ts > l0_max);
+                if (seg.level <= policy.source_level) continue;
+                const overlaps = !(seg.max_ts < src_min or seg.min_ts > src_max);
                 if (overlaps) try out.append(self.allocator, seg);
             }
         }
@@ -2265,6 +2409,7 @@ pub const Engine = struct {
         io: std.Io,
         input_segs: []const manifest.SegmentMeta,
         new_seg_id: u64,
+        target_level: u8,
     ) !void {
         var paths = std.ArrayList([]const u8).empty;
         defer {
@@ -2301,14 +2446,19 @@ pub const Engine = struct {
         try compacted_ids.ensureTotalCapacity(@intCast(input_segs.len));
         for (input_segs) |seg| compacted_ids.putAssumeCapacity(seg.id, {});
 
-        // Output level rule:
-        //   * Pure-L0 merge → L1 (the historical fan-in behaviour).
-        //   * Any L1+ input folded in (cross-segment OoO path,
-        //     GAP-0010) → stay at the HIGHEST level seen so the
-        //     reconciled segment replaces the older sibling at the
-        //     same tier rather than climbing the level ladder
-        //     unboundedly with every OoO arrival.
-        var out_level: u8 = 1;
+        // Output level rule (P-COMP-002 generalisation):
+        //   * The caller supplies `target_level` based on which tier
+        //     it set out to compact (`targetLevelForInputs`). This is
+        //     `source+1` for a pure-source pass, or the highest input
+        //     level when an OoO overlap folded a higher-tier segment
+        //     in (so the reconciled segment replaces the older
+        //     sibling at the same tier rather than climbing the
+        //     ladder unboundedly).
+        //   * Defensive floor: never DEMOTE below the highest input
+        //     level. A future caller bug that under-counts the
+        //     target would otherwise create a stranded
+        //     lower-tier segment that compaction never picks up.
+        var out_level: u8 = target_level;
         for (input_segs) |seg| {
             if (seg.level > out_level) out_level = seg.level;
         }
