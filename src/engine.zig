@@ -238,6 +238,13 @@ pub const EngineError = wal_manager.WalError || segment.SegmentError || manifest
     /// `DenyAllAccessController` and by callers wiring a custom
     /// authoriser. Closes GAP-0002 / SEC-007.
     AccessDenied,
+    /// `appendPoints` received a point whose timestamp falls
+    /// before the engine's running per-series watermark while
+    /// `EngineConfig.allow_cross_segment_ooo == false`. Closes
+    /// GAP-0010. Permissive mode (the default) never returns this
+    /// error; OoO points land in the active memtable and are
+    /// reconciled at compaction time.
+    OutOfOrderTimestamp,
 };
 
 /// WAL durability mode (P-IO-002).
@@ -507,6 +514,29 @@ pub const EngineConfig = struct {
     /// typical workloads.
     wal_sync_interval_ms: u32 = 100,
 
+    /// Cross-segment out-of-order write policy (GAP-0010).
+    ///
+    /// When `true` (the default), `appendPoints` accepts a point
+    /// whose timestamp falls earlier than the `max_ts` of an
+    /// existing sealed segment for the same series. The new point
+    /// lands in the active memtable and, on the next flush, produces
+    /// an overlapping segment that compaction's overlap-aware merge
+    /// folds back into time order — same-timestamp collisions
+    /// resolve under last-write-wins (newer LSN wins).
+    ///
+    /// When `false`, `appendPoints` returns
+    /// `error.OutOfOrderTimestamp` if any input point's `ts` is
+    /// less than the engine's running per-series watermark. Use
+    /// this when the upstream system guarantees monotonic time and
+    /// any out-of-order arrival is a bug.
+    ///
+    /// Storage cost: in permissive mode, occasional OoO writes are
+    /// O(1) on the write path but trigger an extra merge during
+    /// the next compaction. In strict mode the engine never
+    /// produces overlapping segments and compaction stays a clean
+    /// L0->L1 fan-in. Closes GAP-0010.
+    allow_cross_segment_ooo: bool = true,
+
     /// Optional pluggable authorisation seam (GAP-0002 / SEC-007).
     /// When set, `Engine.appendPoints` and `Engine.queryPoints`
     /// route every call through `access_controller.check(...)`
@@ -694,6 +724,18 @@ pub const Engine = struct {
     /// that never query don't pay for an unused HashMap allocation.
     /// Cleared on `deinit`; entries invalidated on compaction.
     reader_cache: SegmentReaderCache,
+
+    /// Per-series highest timestamp ever observed by `appendPoints`
+    /// (GAP-0010 strict-mode tracker). Only populated when
+    /// `config.allow_cross_segment_ooo == false`; permissive mode
+    /// skips the hashmap entirely to avoid the per-call lookup cost.
+    /// Bounded by the number of distinct series the engine has
+    /// touched in the current process — same growth shape as the
+    /// memtable's series map.
+    ///
+    /// Concurrency: every read/write happens under `self.mu` from
+    /// `appendPoints`, so no additional synchronisation is needed.
+    series_watermarks: std.AutoHashMapUnmanaged(types.SeriesId, i64) = .{},
 
     /// Engine-wide latency / throughput counters. Updated under
     /// `self.mu` by every hot path (append, query, flush, compaction).
@@ -1098,6 +1140,7 @@ pub const Engine = struct {
         self.active_mem.deinit();
         if (self.flushing_mem) |*fm| fm.deinit();
         self.append_payload_buf.deinit(self.allocator);
+        self.series_watermarks.deinit(self.allocator);
         self.reader_cache.deinit();
     }
 
@@ -1161,6 +1204,15 @@ pub const Engine = struct {
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
 
+        // GAP-0010: strict-mode OoO check. Runs under the writer
+        // lock so the watermark map cannot race with another
+        // appendPoints. The check is BEFORE the WAL write and
+        // memtable insert — a rejected batch leaves no on-disk or
+        // in-memory side effect.
+        if (!self.config.allow_cross_segment_ooo) {
+            try self.checkOoOLocked(series_id, points);
+        }
+
         // P-MEM-003: reuse the engine-owned scratch buffer instead of
         // heap-allocating a fresh payload per call. The writer lock is
         // already held, so `append_payload_buf` has a single owner for
@@ -1179,12 +1231,79 @@ pub const Engine = struct {
         try self.active_mem.insert(series_id, points);
         try self.maybeTriggerFlushLocked(io);
 
+        // GAP-0010 strict-mode bookkeeping: bump the watermark
+        // AFTER the insert so a partial-failure rollback leaves
+        // the watermark untouched. No-op in permissive mode.
+        if (!self.config.allow_cross_segment_ooo) {
+            try self.bumpWatermarkLocked(series_id, points);
+        }
+
         // Counters are bumped only on a clean return; failed calls
         // do not pollute the latency average. We are still under the
         // engine lock here.
         self.counters.append_count += 1;
         self.counters.append_points += @intCast(points.len);
         self.counters.append_total_ns += nowMonotonicNs() - t_start;
+    }
+
+    /// Strict-mode OoO check (GAP-0010). Verifies every point's
+    /// timestamp is >= the running per-series watermark. Caller
+    /// MUST hold `self.mu`.
+    ///
+    /// The watermark is the max of:
+    ///   * the highest timestamp ever passed to `appendPoints` for
+    ///     this series in this process, and
+    ///   * the manifest's `max_ts` for the series across all sealed
+    ///     segments (loaded lazily on first reference).
+    ///
+    /// In strict mode the engine refuses to widen the OoO window —
+    /// every batch must be monotonically non-decreasing per series.
+    /// The check costs one HashMap lookup per call regardless of
+    /// `points.len`.
+    fn checkOoOLocked(
+        self: *Engine,
+        series_id: types.SeriesId,
+        points: []const types.Point,
+    ) !void {
+        // Lazily seed the watermark from the manifest. The manifest
+        // tracks per-segment min/max; we approximate the per-series
+        // watermark with the global max across all segments since
+        // per-series block-level metadata is not in the manifest
+        // (that is tracked under P-ALGO-001 as future work). This
+        // is correct but conservative — strict mode will reject
+        // points that are technically valid for a different series
+        // but predate a segment that does NOT contain this series.
+        // Callers that need finer-grained tracking must enable the
+        // permissive mode and rely on overlap-aware compaction.
+        if (!self.series_watermarks.contains(series_id)) {
+            var seeded: i64 = std.math.minInt(i64);
+            for (self.man.segments.items) |seg| {
+                if (seg.max_ts > seeded) seeded = seg.max_ts;
+            }
+            try self.series_watermarks.put(self.allocator, series_id, seeded);
+        }
+
+        const wm = self.series_watermarks.get(series_id).?;
+        for (points) |pt| {
+            if (pt.ts < wm) return error.OutOfOrderTimestamp;
+        }
+    }
+
+    /// Strict-mode watermark update (GAP-0010). Caller MUST hold
+    /// `self.mu`. No-op in permissive mode.
+    fn bumpWatermarkLocked(
+        self: *Engine,
+        series_id: types.SeriesId,
+        points: []const types.Point,
+    ) !void {
+        var local_max: i64 = std.math.minInt(i64);
+        for (points) |pt| {
+            if (pt.ts > local_max) local_max = pt.ts;
+        }
+        const current = self.series_watermarks.get(series_id) orelse std.math.minInt(i64);
+        if (local_max > current) {
+            try self.series_watermarks.put(self.allocator, series_id, local_max);
+        }
     }
 
     /// Serialise `(series_id, points)` into the engine-owned payload
@@ -1620,94 +1739,29 @@ pub const Engine = struct {
     /// Inner body of `compactAll`. Lifted from `compactL0` with the
     /// threshold gate removed so the synchronous path can fold even a
     /// single L0 segment into L1.
+    ///
+    /// GAP-0010: overlap-aware. After picking the L0 set, any
+    /// higher-level segment whose `[min_ts, max_ts]` intersects the
+    /// L0 range is folded into the merge too — otherwise a flush
+    /// containing an OoO point would produce an overlapping segment
+    /// that compaction silently leaves on disk forever.
     fn compactL0Forced(self: *Engine) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
 
-        var l0_segs = std.ArrayList(manifest.SegmentMeta).empty;
-        defer l0_segs.deinit(self.allocator);
+        var input_segs = std.ArrayList(manifest.SegmentMeta).empty;
+        defer input_segs.deinit(self.allocator);
         var new_seg_id: u64 = 0;
 
         {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
 
-            for (self.man.segments.items) |seg| {
-                if (seg.level == 0) {
-                    try l0_segs.append(self.allocator, seg);
-                }
-            }
-            if (l0_segs.items.len == 0) return;
+            try self.collectOverlappingInputsLocked(.{ .require_l0 = false }, &input_segs);
+            if (input_segs.items.len == 0) return;
             new_seg_id = self.man.getNextSegmentId();
         }
 
-        var paths = std.ArrayList([]const u8).empty;
-        defer {
-            for (paths.items) |p| self.allocator.free(p);
-            paths.deinit(self.allocator);
-        }
-
-        var min_ts: i64 = std.math.maxInt(i64);
-        var max_ts: i64 = std.math.minInt(i64);
-        for (l0_segs.items) |seg| {
-            const p = try segment.segmentPath(self.allocator, self.config.data_dir, seg.id);
-            try paths.append(self.allocator, p);
-            if (seg.min_ts < min_ts) min_ts = seg.min_ts;
-            if (seg.max_ts > max_ts) max_ts = seg.max_ts;
-        }
-
-        const out_path = try segment.segmentPath(self.allocator, self.config.data_dir, new_seg_id);
-        defer self.allocator.free(out_path);
-
-        // GAP-0001: encryption descriptor for the compactor (no-op
-        // when no key is configured).
-        const in_seg_ids_forced = try self.allocator.alloc(u64, l0_segs.items.len);
-        defer self.allocator.free(in_seg_ids_forced);
-        for (l0_segs.items, 0..) |seg, i| in_seg_ids_forced[i] = seg.id;
-        const enc_forced = try self.buildCompactionEncryption(in_seg_ids_forced, new_seg_id);
-        defer if (enc_forced) |e| self.allocator.free(e.inputs);
-
-        var compactor = compaction.Compactor.init(self.allocator, self.pool);
-        try compactor.compactSegmentsWithEncryption(paths.items, out_path, enc_forced);
-
-        var compacted_ids = std.AutoHashMap(u64, void).init(self.allocator);
-        defer compacted_ids.deinit();
-        try compacted_ids.ensureTotalCapacity(@intCast(l0_segs.items.len));
-        for (l0_segs.items) |seg| compacted_ids.putAssumeCapacity(seg.id, {});
-
-        {
-            self.mu.lockUncancelable(io);
-            defer self.mu.unlock(io);
-
-            var new_segments = std.ArrayListUnmanaged(manifest.SegmentMeta).empty;
-            for (self.man.segments.items) |seg| {
-                if (!compacted_ids.contains(seg.id)) {
-                    try new_segments.append(self.allocator, seg);
-                }
-            }
-            try new_segments.append(self.allocator, .{
-                .id = new_seg_id,
-                .min_ts = min_ts,
-                .max_ts = max_ts,
-                .level = 1,
-            });
-
-            self.man.segments.deinit(self.allocator);
-            self.man.segments = new_segments;
-            try self.man.save();
-        }
-
-        // P-IO-001: invalidate FD cache entries for the compacted
-        // segments before unlinking. Refcount-safe: deferred close
-        // for entries still borrowed by an in-flight query.
-        for (l0_segs.items) |seg| self.reader_cache.invalidate(io, seg.id);
-
-        for (paths.items) |p| {
-            std.Io.Dir.cwd().deleteFile(io, p) catch |err| {
-                self.mu.lockUncancelable(io);
-                self.recordBackgroundErrorLocked(.compaction, err);
-                self.mu.unlock(io);
-            };
-        }
+        try self.runMergeAndCommit(io, input_segs.items, new_seg_id);
     }
 
     fn compactionWorker(ctx: *anyopaque, _: *thread_pool.TaskContext) void {
@@ -1728,28 +1782,112 @@ pub const Engine = struct {
         self.mu.unlock(io);
     }
 
+    /// Background L0->L1 compaction worker body.
+    ///
+    /// GAP-0010: overlap-aware. After picking the L0 set, any
+    /// higher-level segment whose `[min_ts, max_ts]` intersects
+    /// the L0 range is folded into the merge too. Without this,
+    /// a flush containing an OoO point would produce an
+    /// overlapping segment that the engine would never reconcile,
+    /// breaking the query-ordering contract.
     fn compactL0(self: *Engine) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
 
-        var l0_segs = std.ArrayList(manifest.SegmentMeta).empty;
-        defer l0_segs.deinit(self.allocator);
-        var new_seg_id: usize = 0;
+        var input_segs = std.ArrayList(manifest.SegmentMeta).empty;
+        defer input_segs.deinit(self.allocator);
+        var new_seg_id: u64 = 0;
+        var l0_count: usize = 0;
 
         {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
 
             for (self.man.segments.items) |seg| {
-                if (seg.level == 0) {
-                    try l0_segs.append(self.allocator, seg);
-                }
+                if (seg.level == 0) l0_count += 1;
             }
-            if (l0_segs.items.len < kL0CompactionThreshold) {
-                return;
-            }
+            if (l0_count < kL0CompactionThreshold) return;
+
+            try self.collectOverlappingInputsLocked(.{ .require_l0 = true }, &input_segs);
+            if (input_segs.items.len == 0) return;
             new_seg_id = self.man.getNextSegmentId();
         }
 
+        try self.runMergeAndCommit(io, input_segs.items, new_seg_id);
+    }
+
+    /// Selection policy for `collectOverlappingInputsLocked`.
+    const InputSelection = struct {
+        /// When true, abort the selection if no L0 segment is
+        /// present (background worker policy — L0 is the trigger).
+        /// When false, any non-empty segment list is allowed
+        /// (forced-compaction policy — operator drove the call).
+        require_l0: bool,
+    };
+
+    /// Collect the input segment set for a compaction pass
+    /// (GAP-0010). Selects every L0 segment, then expands the set
+    /// with any higher-level segment that overlaps the L0 range.
+    /// The result is sorted by segment id ASCENDING (oldest first)
+    /// so the downstream `MergeIterator`'s same-(ts, value) tie
+    /// semantics put the newer LSN's point last, which the
+    /// compactor's per-ts dedup loop then overwrites with — net
+    /// behaviour: last-write-wins under cross-segment OoO writes.
+    ///
+    /// Caller MUST hold `self.mu`.
+    fn collectOverlappingInputsLocked(
+        self: *Engine,
+        policy: InputSelection,
+        out: *std.ArrayList(manifest.SegmentMeta),
+    ) !void {
+        // First pass: collect L0 and bracket the timestamp range.
+        var l0_min: i64 = std.math.maxInt(i64);
+        var l0_max: i64 = std.math.minInt(i64);
+        var l0_count: usize = 0;
+        for (self.man.segments.items) |seg| {
+            if (seg.level == 0) {
+                try out.append(self.allocator, seg);
+                if (seg.min_ts < l0_min) l0_min = seg.min_ts;
+                if (seg.max_ts > l0_max) l0_max = seg.max_ts;
+                l0_count += 1;
+            }
+        }
+
+        if (policy.require_l0 and l0_count == 0) return;
+
+        // Second pass: any higher-level segment overlapping the L0
+        // range gets folded in. The "overlap" test is the standard
+        // closed-interval intersection: NOT (other.max < l0_min
+        // OR other.min > l0_max). When there is no L0 (forced path
+        // on an L0-empty manifest), there's nothing to overlap with,
+        // so the higher-level pass is a no-op.
+        if (l0_count > 0) {
+            for (self.man.segments.items) |seg| {
+                if (seg.level == 0) continue;
+                const overlaps = !(seg.max_ts < l0_min or seg.min_ts > l0_max);
+                if (overlaps) try out.append(self.allocator, seg);
+            }
+        }
+
+        // Sort by segment id ASCENDING so older LSNs come first.
+        // The compactor's per-(ts) dedup overwrites with later
+        // arrivals, so later (higher) segment ids win — i.e.
+        // newest-write-wins. This is the OoO reconciliation rule.
+        std.mem.sort(manifest.SegmentMeta, out.items, {}, struct {
+            fn lessThan(_: void, a: manifest.SegmentMeta, b: manifest.SegmentMeta) bool {
+                return a.id < b.id;
+            }
+        }.lessThan);
+    }
+
+    /// Run the actual merge and commit the result to the manifest.
+    /// Hoisted out of `compactL0` / `compactL0Forced` so both paths
+    /// share the same disk I/O, manifest swap, and cleanup body.
+    fn runMergeAndCommit(
+        self: *Engine,
+        io: std.Io,
+        input_segs: []const manifest.SegmentMeta,
+        new_seg_id: u64,
+    ) !void {
         var paths = std.ArrayList([]const u8).empty;
         defer {
             for (paths.items) |p| self.allocator.free(p);
@@ -1758,8 +1896,7 @@ pub const Engine = struct {
 
         var min_ts: i64 = std.math.maxInt(i64);
         var max_ts: i64 = std.math.minInt(i64);
-
-        for (l0_segs.items) |seg| {
+        for (input_segs) |seg| {
             const p = try segment.segmentPath(self.allocator, self.config.data_dir, seg.id);
             try paths.append(self.allocator, p);
             if (seg.min_ts < min_ts) min_ts = seg.min_ts;
@@ -1771,23 +1908,32 @@ pub const Engine = struct {
 
         // GAP-0001: encryption descriptor for the compactor (no-op
         // when no key is configured).
-        const in_seg_ids_bg = try self.allocator.alloc(u64, l0_segs.items.len);
-        defer self.allocator.free(in_seg_ids_bg);
-        for (l0_segs.items, 0..) |seg, i| in_seg_ids_bg[i] = seg.id;
-        const enc_bg = try self.buildCompactionEncryption(in_seg_ids_bg, new_seg_id);
-        defer if (enc_bg) |e| self.allocator.free(e.inputs);
+        const in_seg_ids = try self.allocator.alloc(u64, input_segs.len);
+        defer self.allocator.free(in_seg_ids);
+        for (input_segs, 0..) |seg, i| in_seg_ids[i] = seg.id;
+        const enc = try self.buildCompactionEncryption(in_seg_ids, new_seg_id);
+        defer if (enc) |e| self.allocator.free(e.inputs);
 
         var compactor = compaction.Compactor.init(self.allocator, self.pool);
-        try compactor.compactSegmentsWithEncryption(paths.items, out_path, enc_bg);
+        try compactor.compactSegmentsWithEncryption(paths.items, out_path, enc);
 
-        // Build an O(1)-lookup hash set of the IDs we just compacted so
-        // the "kept segments" filter below is O(n) over the manifest,
-        // not O(n × k) where k is the number of L0 segments folded into
-        // the new L1. Closes P-ALGO-004 / Q-CPLX-002.
+        // Set of input segment IDs for the manifest swap.
         var compacted_ids = std.AutoHashMap(u64, void).init(self.allocator);
         defer compacted_ids.deinit();
-        try compacted_ids.ensureTotalCapacity(@intCast(l0_segs.items.len));
-        for (l0_segs.items) |seg| compacted_ids.putAssumeCapacity(seg.id, {});
+        try compacted_ids.ensureTotalCapacity(@intCast(input_segs.len));
+        for (input_segs) |seg| compacted_ids.putAssumeCapacity(seg.id, {});
+
+        // Output level rule:
+        //   * Pure-L0 merge → L1 (the historical fan-in behaviour).
+        //   * Any L1+ input folded in (cross-segment OoO path,
+        //     GAP-0010) → stay at the HIGHEST level seen so the
+        //     reconciled segment replaces the older sibling at the
+        //     same tier rather than climbing the level ladder
+        //     unboundedly with every OoO arrival.
+        var out_level: u8 = 1;
+        for (input_segs) |seg| {
+            if (seg.level > out_level) out_level = seg.level;
+        }
 
         {
             self.mu.lockUncancelable(io);
@@ -1804,7 +1950,7 @@ pub const Engine = struct {
                 .id = new_seg_id,
                 .min_ts = min_ts,
                 .max_ts = max_ts,
-                .level = 1,
+                .level = out_level,
             });
 
             self.man.segments.deinit(self.allocator);
@@ -1813,15 +1959,19 @@ pub const Engine = struct {
             try self.man.save();
         }
 
-        for (paths.items, l0_segs.items) |p, seg| {
-            _ = seg;
+        // P-IO-001: invalidate FD cache entries for the compacted
+        // segments before unlinking. Refcount-safe: deferred close
+        // for entries still borrowed by an in-flight query.
+        for (input_segs) |seg| self.reader_cache.invalidate(io, seg.id);
+
+        for (paths.items) |p| {
             std.Io.Dir.cwd().deleteFile(io, p) catch |err| {
                 // The new compacted segment is already durable and
-                // referenced by the manifest; the old L0 segment file
+                // referenced by the manifest; the old segment file
                 // is now an orphan on disk. Surface the failure so
                 // operators can find and reclaim the leak via
-                // `lastBackgroundError` / `error_callback` instead of
-                // silently dropping it on the floor.
+                // `lastBackgroundError` / `error_callback` instead
+                // of silently dropping it on the floor.
                 self.mu.lockUncancelable(io);
                 self.recordBackgroundErrorLocked(.compaction, err);
                 self.mu.unlock(io);
@@ -2780,6 +2930,181 @@ test "opaqueSeriesId: round-trips through Engine append/query (GAP-0002)" {
     defer arena2.deinit();
     var it2 = try engine.queryPoints(arena2.allocator(), other_series, 0, 100);
     try std.testing.expect(it2.next() == null);
+}
+
+test "Engine: cross-segment OoO write reconciled by compaction (GAP-0010)" {
+    // End-to-end demonstration of permissive OoO mode:
+    //
+    //   1. Write monotonic points (ts=100, 200, 300), flush — L0
+    //      segment.
+    //   2. Compact L0 → L1 so the engine's "newest disk segment"
+    //      is at L1.
+    //   3. Write an OoO point (ts=150) that falls INSIDE the L1
+    //      segment's [100..300] range. This is the cross-segment
+    //      OoO case the gap describes.
+    //   4. Flush — produces a new L0 segment that overlaps L1.
+    //   5. compactAll → overlap-aware merge folds both segments
+    //      into a single reconciled L1 segment.
+    //   6. Query returns all 4 points in correct order.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 100,
+        // permissive default
+    }, &pool);
+    defer engine.deinit();
+
+    // Phase 1: monotonic batch -> L0.
+    try engine.appendPoints(1, &.{
+        .{ .ts = 100, .value = 1 },
+        .{ .ts = 200, .value = 2 },
+        .{ .ts = 300, .value = 3 },
+    });
+    try engine.flush();
+    try std.testing.expectEqual(@as(usize, 1), engine.man.segments.items.len);
+
+    // Phase 2: promote L0 -> L1 so the next flush produces a
+    // cross-level overlap, not just adjacent L0 overlap.
+    try engine.compactAll();
+    var l1_count: usize = 0;
+    for (engine.man.segments.items) |seg| if (seg.level == 1) {
+        l1_count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), l1_count);
+
+    // Phase 3: cross-segment OoO write.
+    try engine.appendPoints(1, &.{.{ .ts = 150, .value = 99 }});
+    try engine.flush();
+    try std.testing.expect(engine.man.segments.items.len >= 2);
+
+    // Phase 4: force overlap-aware compaction. Result must be
+    // a single segment (the L1 absorbs the overlapping L0).
+    try engine.compactAll();
+
+    var post_l0: usize = 0;
+    var post_l1: usize = 0;
+    for (engine.man.segments.items) |seg| {
+        if (seg.level == 0) post_l0 += 1;
+        if (seg.level == 1) post_l1 += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), post_l0);
+    try std.testing.expectEqual(@as(usize, 1), post_l1);
+
+    // Phase 5: every point must be queryable in correct order.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var it = try engine.queryPoints(arena.allocator(), 1, 0, 1_000);
+    var observed = std.ArrayList(i64).empty;
+    defer observed.deinit(arena.allocator());
+    while (it.next()) |pt| try observed.append(arena.allocator(), pt.ts);
+
+    try std.testing.expectEqual(@as(usize, 4), observed.items.len);
+    try std.testing.expectEqual(@as(i64, 100), observed.items[0]);
+    try std.testing.expectEqual(@as(i64, 150), observed.items[1]);
+    try std.testing.expectEqual(@as(i64, 200), observed.items[2]);
+    try std.testing.expectEqual(@as(i64, 300), observed.items[3]);
+}
+
+test "Engine: cross-segment OoO with same-timestamp collision resolves last-write-wins (GAP-0010)" {
+    // Two writers race the same (series_id, ts) but produce
+    // different values. The newer write must win — that is the
+    // documented dedup semantics under cross-segment OoO.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 100,
+    }, &pool);
+    defer engine.deinit();
+
+    // Older segment claims (ts=100, value=1).
+    try engine.appendPoints(7, &.{.{ .ts = 100, .value = 1 }});
+    try engine.flush();
+    try engine.compactAll();
+
+    // Newer segment writes (ts=100, value=999). This is the
+    // overlap case: same ts as a sealed L1 segment.
+    try engine.appendPoints(7, &.{.{ .ts = 100, .value = 999 }});
+    try engine.flush();
+
+    try engine.compactAll();
+
+    // The query MUST yield exactly one point at ts=100 with the
+    // newer value. Two points would mean dedup failed; the older
+    // value would mean tie-break direction is reversed.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var it = try engine.queryPoints(arena.allocator(), 7, 0, 1_000);
+    var count: usize = 0;
+    var last_value: i64 = 0;
+    while (it.next()) |pt| {
+        count += 1;
+        last_value = pt.value;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqual(@as(i64, 999), last_value);
+}
+
+test "Engine: strict OoO mode rejects out-of-order point (GAP-0010)" {
+    // allow_cross_segment_ooo = false: any point whose ts falls
+    // before the running per-series watermark must be rejected,
+    // with no on-disk or in-memory state change.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 100,
+        .allow_cross_segment_ooo = false,
+    }, &pool);
+    defer engine.deinit();
+
+    try engine.appendPoints(1, &.{
+        .{ .ts = 100, .value = 1 },
+        .{ .ts = 200, .value = 2 },
+    });
+
+    // OoO arrival.
+    try std.testing.expectError(
+        error.OutOfOrderTimestamp,
+        engine.appendPoints(1, &.{.{ .ts = 150, .value = 99 }}),
+    );
+
+    // The rejected batch left no trace. Two points present, both
+    // monotonic, no watermark drift.
+    const stats = engine.stats();
+    try std.testing.expectEqual(@as(u64, 1), stats.append_count);
+    try std.testing.expectEqual(@as(u64, 2), stats.append_points);
+
+    // Monotonic continuation still works.
+    try engine.appendPoints(1, &.{.{ .ts = 300, .value = 3 }});
 }
 
 test "Engine: pruneExpired returns 0 when retention disabled" {
