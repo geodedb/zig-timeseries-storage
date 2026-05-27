@@ -286,7 +286,10 @@ benchmark-regression:
     paths:
     - benchmarks/results/ci-current.json
     expire_in: 30 days
-  allow_failure: true # advisory until a stable baseline is committed
+  # Closes Q-CI-002: baseline is now committed so the regression gate
+  # is enforced. The default 15% noise floor in compare-bench gives
+  # cross-runner variance plenty of headroom; tighten it with
+  # `--floor` once we have multi-runner statistics.
 
 bench-micro:
   extends: .zig-host-base
