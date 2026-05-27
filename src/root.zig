@@ -54,6 +54,20 @@ pub const EngineConfig = engine.EngineConfig;
 /// Backwards-compatible alias for `EngineConfig`. New code should use `EngineConfig`.
 pub const Config = engine.EngineConfig;
 
+/// Pluggable per-call authorisation seam (GAP-0002 / SEC-007). See
+/// `engine.AccessController` for the contract.
+pub const AccessController = engine.AccessController;
+/// Discriminator for `AccessController.check`.
+pub const AccessOp = engine.AccessOp;
+/// Reference `AccessController` that allows every call.
+pub const PermissiveAccessController = engine.PermissiveAccessController;
+/// Reference `AccessController` that denies every call with
+/// `error.AccessDenied`. Useful in tests and fail-closed defaults.
+pub const DenyAllAccessController = engine.DenyAllAccessController;
+/// Derive an unguessable `SeriesId` from `(tenant, app_key, key)` via
+/// HMAC-SHA256 (GAP-0002 / SEC-008). See `engine.opaqueSeriesId`.
+pub const opaqueSeriesId = engine.opaqueSeriesId;
+
 // ============================================================================
 // Re-exports — named error sets. Most engine APIs still return inferred
 // error sets (`!T`) since their union with allocator/filesystem errors

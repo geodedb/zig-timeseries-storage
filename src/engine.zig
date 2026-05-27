@@ -229,6 +229,15 @@ pub const EngineError = wal_manager.WalError || segment.SegmentError || manifest
     /// was configured with an encryption key. Indicates a missing
     /// migration step or a mixed-mode data directory.
     UnexpectedPlaintextSegment,
+    /// `EngineConfig.access_controller` refused an operation.
+    /// Surfaced by `appendPoints` and `queryPoints` when the
+    /// pluggable seam returns this error from `check`. Adapters
+    /// MAY return any error from `check`; the engine treats them
+    /// all identically (propagate unchanged) — `AccessDenied` is
+    /// the convention used by the reference
+    /// `DenyAllAccessController` and by callers wiring a custom
+    /// authoriser. Closes GAP-0002 / SEC-007.
+    AccessDenied,
 };
 
 /// WAL durability mode (P-IO-002).
@@ -280,6 +289,137 @@ pub const BgPhase = enum { flush, compaction, wal_recovery };
 /// (that would deadlock). Set to `null` (the default) to use the
 /// built-in `last_background_error` slot only.
 pub const ErrorCallback = *const fn (ctx: *anyopaque, phase: BgPhase, err: anyerror) void;
+
+/// Operations the access controller can authorise. Discriminator is
+/// kept narrow on purpose: the engine has exactly two
+/// caller-visible per-series operations (read and write), and adding
+/// more would require corresponding callbacks in every adapter that
+/// implements `AccessController.check`. Future fan-out (e.g. a
+/// distinct `admin` op for retention/compaction) can extend this
+/// enum without breaking the binary contract.
+pub const AccessOp = enum {
+    /// `appendPoints` — writer-side. Triggered before any WAL or
+    /// memtable mutation, so a denied check leaves the engine state
+    /// untouched.
+    append,
+    /// `queryPoints` — reader-side. Triggered before any segment
+    /// reader is acquired or memtable scanned.
+    query,
+};
+
+/// Pluggable per-call authorisation seam (GAP-0002 / SEC-007).
+///
+/// The engine itself has no concept of tenants, users, or scopes —
+/// those live in the calling adapter (Geode, an HTTP layer, etc.).
+/// `AccessController` is the seam that lets that adapter veto an
+/// individual `appendPoints` or `queryPoints` call BEFORE the engine
+/// mutates any state.
+///
+/// Threading: `check` is called WITHOUT the engine's internal mutex
+/// held. Implementations are free to take their own locks, do I/O,
+/// or call into a remote ACL service — anything except call back
+/// into the originating `Engine` (which would deadlock).
+///
+/// Failure: returning any error (the convention is
+/// `error.AccessDenied` for a clean reject) propagates out of
+/// `appendPoints` / `queryPoints` unchanged. The engine surfaces
+/// no error of its own at this layer.
+///
+/// Two reference adapters live alongside this declaration:
+///   * `PermissiveAccessController` — always allows. Wire this when
+///     wiring up the seam in a single-tenant deployment where
+///     authorisation already happens in a higher layer.
+///   * `DenyAllAccessController` — always denies. Useful in tests
+///     and in fail-closed defaults.
+pub const AccessController = struct {
+    /// Opaque caller context passed back to `check`. May be null.
+    ctx: ?*anyopaque = null,
+    /// Authorisation entry point. Implementations should return
+    /// `error.AccessDenied` (or any other error) to refuse the
+    /// operation; returning `void` accepts it. The engine does NOT
+    /// retry on transient failures — adapters that need retry
+    /// semantics must layer them above this seam.
+    check: *const fn (
+        ctx: ?*anyopaque,
+        op: AccessOp,
+        series_id: types.SeriesId,
+    ) anyerror!void,
+};
+
+/// Reference `AccessController` implementation that allows every
+/// call. Equivalent to leaving `EngineConfig.access_controller`
+/// null, but exposed as a value so it can be passed to APIs that
+/// want a concrete non-null seam.
+pub const PermissiveAccessController = AccessController{
+    .ctx = null,
+    .check = struct {
+        fn check(_: ?*anyopaque, _: AccessOp, _: types.SeriesId) anyerror!void {
+            return;
+        }
+    }.check,
+};
+
+/// Reference `AccessController` that denies every call with
+/// `error.AccessDenied`. Used in tests and as a fail-closed
+/// default when wiring custody adapters that have not yet
+/// supplied a real implementation.
+pub const DenyAllAccessController = AccessController{
+    .ctx = null,
+    .check = struct {
+        fn check(_: ?*anyopaque, _: AccessOp, _: types.SeriesId) anyerror!void {
+            return error.AccessDenied;
+        }
+    }.check,
+};
+
+/// Derive an unguessable `SeriesId` from a `(tenant, app_key, key)`
+/// triple via HMAC-SHA256 (GAP-0002 / SEC-008).
+///
+/// Background: the engine stores `SeriesId` as a raw `u128`. When
+/// callers derive the ID deterministically from `(tenant_id, metric)`
+/// — a common pattern — an attacker who learns the derivation can
+/// enumerate every series in the namespace. The opaque-ID design
+/// pattern routes the deterministic input through a keyed PRF so
+/// the on-disk ID is uncorrelated with its plaintext inputs.
+///
+/// Construction:
+///   HMAC-SHA256(key, tenant_le || app_key_le)[0..16] → u128
+///
+/// Properties:
+///   * Same `(tenant, app_key, key)` always produces the same ID
+///     (deterministic — required so the writer and the reader can
+///     find each other's series).
+///   * Without the key, the relationship between `(tenant, app_key)`
+///     and the resulting `SeriesId` is computationally hidden
+///     (HMAC PRF security).
+///   * Truncation to 128 bits is acceptable: HMAC-SHA256 is a PRF,
+///     and the 128-bit truncation leaves a comfortable margin
+///     against birthday collisions at realistic series counts
+///     (2^64 / day is far above any conceivable workload).
+///
+/// Callers (e.g. Geode) own the per-tenant key. The engine never
+/// sees or stores it. This function is a pure helper — no engine
+/// state is consulted.
+///
+/// Security: rotate the `key` to invalidate previously-derived
+/// IDs (effectively a per-tenant kill switch). The `tenant_id` and
+/// `app_key` portions are caller-chosen and treated as opaque
+/// 64-bit values; collision-resistance is delivered by the PRF, not
+/// by their internal structure.
+pub fn opaqueSeriesId(tenant: u64, app_key: u64, key: [32]u8) types.SeriesId {
+    var input: [16]u8 = undefined;
+    std.mem.writeInt(u64, input[0..8], tenant, .little);
+    std.mem.writeInt(u64, input[8..16], app_key, .little);
+
+    var mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, &input, &key);
+
+    // Take the first 16 bytes (128 bits) of the HMAC output as the
+    // little-endian encoding of the u128 SeriesId. Endianness here
+    // is a presentation detail — the engine treats SeriesId as an
+    // opaque integer.
+    return std.mem.readInt(u128, mac[0..16], .little);
+}
 
 /// Canonical engine configuration. The only configuration surface a
 /// caller needs to construct an `Engine`. Replaces both the template
@@ -366,6 +506,30 @@ pub const EngineConfig = struct {
     /// amortise the fsync cost across thousands of appends on
     /// typical workloads.
     wal_sync_interval_ms: u32 = 100,
+
+    /// Optional pluggable authorisation seam (GAP-0002 / SEC-007).
+    /// When set, `Engine.appendPoints` and `Engine.queryPoints`
+    /// route every call through `access_controller.check(...)`
+    /// before mutating any state. When `null` (the default), all
+    /// operations are allowed — preserves backward compatibility
+    /// with callers that already enforce authorisation in a layer
+    /// above the engine.
+    ///
+    /// Rationale: tenant catalogs, ACL stores, and identity
+    /// providers belong outside the storage engine. This seam is
+    /// the minimum boundary the engine needs to expose so an
+    /// adapter (Geode, an HTTP layer, etc.) can veto a hostile
+    /// `appendPoints` or `queryPoints` call BEFORE any WAL or
+    /// memtable mutation lands. The engine itself never enforces
+    /// tenancy; it only honours the adapter's decision.
+    ///
+    /// Threading: `check` runs WITHOUT the engine lock held.
+    /// Implementations must NOT call back into the originating
+    /// `Engine` from `check` (that would deadlock).
+    ///
+    /// See `PermissiveAccessController` and `DenyAllAccessController`
+    /// for reference implementations.
+    access_controller: ?AccessController = null,
 };
 
 /// Backwards-compatible alias. New code should use `EngineConfig`.
@@ -977,6 +1141,16 @@ pub const Engine = struct {
         // per point; bounding the batch bounds the worst-case
         // allocation an external caller can force.
         if (points.len > limits.MAX_APPEND_BATCH_POINTS) return error.BatchTooLarge;
+
+        // GAP-0002 / SEC-007: route through the pluggable authoriser
+        // BEFORE any state mutation. The check runs without the
+        // engine lock held (it may itself take locks, do I/O, or
+        // consult a remote ACL — anything except call back into
+        // this engine). A denied check leaves WAL, memtable, and
+        // counters untouched.
+        if (self.config.access_controller) |ac| {
+            try ac.check(ac.ctx, .append, series_id);
+        }
 
         // P-OBS-001: time the entire critical section. nowMonotonicNs
         // is ~30 ns on commodity hardware — negligible next to the
@@ -1778,6 +1952,16 @@ pub const Engine = struct {
     pub fn queryPoints(self: *Engine, arena: Allocator, series_id: types.SeriesId, start_ts: i64, end_ts: i64) !*iterator.MergeIterator {
         const io = std.Io.Threaded.global_single_threaded.io();
 
+        // GAP-0002 / SEC-007: route through the pluggable authoriser
+        // BEFORE any segment reader is acquired or memtable scanned.
+        // A denied check returns immediately; no iterator is
+        // allocated, no FD cache slot is touched, and no counter is
+        // bumped (the counter bump is gated behind a successful
+        // return).
+        if (self.config.access_controller) |ac| {
+            try ac.check(ac.ctx, .query, series_id);
+        }
+
         // P-OBS-001: latency timer. Covers iterator setup +
         // memtable scan + every segment open/decode. Iteration
         // performed by the caller after we return is NOT included.
@@ -2366,6 +2550,236 @@ test "Engine: reopening an encrypted manifest with no key fails closed (GAP-0001
         .max_memtable_points = 1_000_000,
         .encryption_key = null,
     }, &pool));
+}
+
+test "Engine: AccessController denies appendPoints with AccessDenied (GAP-0002 / SEC-007)" {
+    // Wires DenyAllAccessController and proves:
+    //   1. appendPoints surfaces error.AccessDenied,
+    //   2. NO WAL record was written (the seam runs before any
+    //      mutation),
+    //   3. counters did not bump (also gated behind the seam).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 100,
+        .access_controller = DenyAllAccessController,
+    }, &pool);
+    defer engine.deinit();
+
+    try std.testing.expectError(
+        error.AccessDenied,
+        engine.appendPoints(1, &.{.{ .ts = 1, .value = 1 }}),
+    );
+
+    // No state mutation, no counter bump.
+    const stats = engine.stats();
+    try std.testing.expectEqual(@as(u64, 0), stats.append_count);
+    try std.testing.expectEqual(@as(u64, 0), stats.append_points);
+    try std.testing.expectEqual(@as(usize, 0), engine.active_mem.point_count);
+}
+
+test "Engine: AccessController denies queryPoints with AccessDenied (GAP-0002 / SEC-007)" {
+    // Symmetric coverage for the read path.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 100,
+        .access_controller = DenyAllAccessController,
+    }, &pool);
+    defer engine.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expectError(
+        error.AccessDenied,
+        engine.queryPoints(arena.allocator(), 1, 0, 100),
+    );
+
+    // No counter bump on a denied query either.
+    const stats = engine.stats();
+    try std.testing.expectEqual(@as(u64, 0), stats.query_count);
+}
+
+test "Engine: PermissiveAccessController allows operations (GAP-0002 / SEC-007)" {
+    // Confirms the explicit allow-all reference implementation is
+    // a no-op functionally — appends succeed, queries return data.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 100,
+        .access_controller = PermissiveAccessController,
+    }, &pool);
+    defer engine.deinit();
+
+    try engine.appendPoints(1, &.{
+        .{ .ts = 1, .value = 11 },
+        .{ .ts = 2, .value = 22 },
+    });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var it = try engine.queryPoints(arena.allocator(), 1, 0, 100);
+    var count: usize = 0;
+    while (it.next()) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "Engine: AccessController receives the correct op and series_id (GAP-0002)" {
+    // Captures the (op, series_id) the engine actually passes into
+    // the controller. This is the contract the caller relies on
+    // when implementing per-tenant ACL lookups.
+    const Trace = struct {
+        var last_op: AccessOp = .append;
+        var last_series_id: types.SeriesId = 0;
+        var call_count: usize = 0;
+
+        fn check(_: ?*anyopaque, op: AccessOp, series_id: types.SeriesId) anyerror!void {
+            call_count += 1;
+            last_op = op;
+            last_series_id = series_id;
+        }
+
+        fn reset() void {
+            call_count = 0;
+            last_series_id = 0;
+        }
+    };
+    Trace.reset();
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 100,
+        .access_controller = .{ .ctx = null, .check = Trace.check },
+    }, &pool);
+    defer engine.deinit();
+
+    const series: types.SeriesId = 0xDEADBEEF_CAFE_1234;
+    try engine.appendPoints(series, &.{.{ .ts = 1, .value = 11 }});
+    try std.testing.expectEqual(@as(usize, 1), Trace.call_count);
+    try std.testing.expectEqual(AccessOp.append, Trace.last_op);
+    try std.testing.expectEqual(series, Trace.last_series_id);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    _ = try engine.queryPoints(arena.allocator(), series, 0, 100);
+    try std.testing.expectEqual(@as(usize, 2), Trace.call_count);
+    try std.testing.expectEqual(AccessOp.query, Trace.last_op);
+    try std.testing.expectEqual(series, Trace.last_series_id);
+}
+
+test "opaqueSeriesId: deterministic and key-binding (GAP-0002 / SEC-008)" {
+    const key_a: [32]u8 = [_]u8{0x11} ** 32;
+    const key_b: [32]u8 = [_]u8{0x22} ** 32;
+
+    // 1. Determinism: same inputs produce the same SeriesId.
+    const id1 = opaqueSeriesId(42, 7, key_a);
+    const id2 = opaqueSeriesId(42, 7, key_a);
+    try std.testing.expectEqual(id1, id2);
+
+    // 2. Key binding: different keys produce different SeriesIds
+    //    even though (tenant, app_key) are identical. This is the
+    //    "without the key you cannot enumerate" guarantee.
+    const id3 = opaqueSeriesId(42, 7, key_b);
+    try std.testing.expect(id1 != id3);
+
+    // 3. Input separation: distinct (tenant, app_key) tuples
+    //    produce distinct IDs (HMAC's PRF property).
+    const id4 = opaqueSeriesId(43, 7, key_a);
+    const id5 = opaqueSeriesId(42, 8, key_a);
+    try std.testing.expect(id1 != id4);
+    try std.testing.expect(id1 != id5);
+    try std.testing.expect(id4 != id5);
+
+    // 4. Not the identity function — caller-side input is not
+    //    leaked as-is into the SeriesId.
+    try std.testing.expect(id1 != @as(types.SeriesId, 42));
+}
+
+test "opaqueSeriesId: round-trips through Engine append/query (GAP-0002)" {
+    // Sanity check: a SeriesId derived from opaqueSeriesId is a
+    // perfectly ordinary u128 from the engine's perspective. The
+    // append/query lifecycle does not depend on any structure
+    // beyond u128 equality.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 100,
+    }, &pool);
+    defer engine.deinit();
+
+    const key: [32]u8 = [_]u8{0x42} ** 32;
+    const series = opaqueSeriesId(1000, 1, key);
+
+    try engine.appendPoints(series, &.{
+        .{ .ts = 1, .value = 11 },
+        .{ .ts = 2, .value = 22 },
+    });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var it = try engine.queryPoints(arena.allocator(), series, 0, 100);
+    var count: usize = 0;
+    while (it.next()) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 2), count);
+
+    // Different tenant under the same key derives a different
+    // SeriesId — the query returns no points (no enumeration).
+    const other_series = opaqueSeriesId(1001, 1, key);
+    var arena2 = std.heap.ArenaAllocator.init(allocator);
+    defer arena2.deinit();
+    var it2 = try engine.queryPoints(arena2.allocator(), other_series, 0, 100);
+    try std.testing.expect(it2.next() == null);
 }
 
 test "Engine: pruneExpired returns 0 when retention disabled" {
