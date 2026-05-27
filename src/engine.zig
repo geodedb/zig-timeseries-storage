@@ -73,7 +73,19 @@ const SegmentReaderCache = struct {
     /// `path` and inserts it; if full, evicts the LRU entry whose
     /// refcount is zero. Returns a pointer to the borrowed reader.
     /// Caller MUST balance with `release(id)` exactly once.
-    fn acquire(self: *SegmentReaderCache, io: std.Io, id: u64, path: []const u8) !*segment.SegmentReader {
+    ///
+    /// `encryption` (optional) is passed through to
+    /// `SegmentReader.initWithEncryption` on a cache miss. Cache
+    /// hits return whichever reader was previously inserted —
+    /// callers MUST NOT mix encrypted and plaintext access patterns
+    /// for the same segment id.
+    fn acquire(
+        self: *SegmentReaderCache,
+        io: std.Io,
+        id: u64,
+        path: []const u8,
+        encryption: ?segment.EncryptionContext,
+    ) !*segment.SegmentReader {
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
 
@@ -90,7 +102,7 @@ const SegmentReaderCache = struct {
         // map is below capacity.
         try self.evictLruLocked();
 
-        const reader = try segment.SegmentReader.init(self.allocator, path);
+        const reader = try segment.SegmentReader.initWithEncryption(self.allocator, path, encryption);
         errdefer {
             var r = reader;
             r.deinit();
@@ -210,6 +222,13 @@ pub const EngineError = wal_manager.WalError || segment.SegmentError || manifest
     /// A segment file is present but does not start with `SEGMENT_MAGIC`
     /// or is otherwise too short to be valid.
     SegmentCorrupted,
+    /// An encrypted (TSSEG003) segment was opened with the wrong key,
+    /// no key, or its AES-GCM tag check failed. Closes GAP-0001.
+    DecryptionFailed,
+    /// A plaintext (TSSEG002) segment was opened when the engine
+    /// was configured with an encryption key. Indicates a missing
+    /// migration step or a mixed-mode data directory.
+    UnexpectedPlaintextSegment,
 };
 
 /// WAL durability mode (P-IO-002).
@@ -726,7 +745,10 @@ pub const Engine = struct {
     /// Verify a single segment file. Returns
     /// `error.SegmentFileMissing` if the file does not exist,
     /// `error.SegmentCorrupted` if the magic bytes are wrong or the
-    /// file is too short to even hold one block header.
+    /// file is too short to even hold one block header. Accepts
+    /// both v2 (plaintext) and v3 (encrypted) magics — distinguishing
+    /// between them is done by the reader on open, not by the
+    /// integrity check.
     fn verifyOneSegment(io: std.Io, path: []const u8) !void {
         const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
             return switch (err) {
@@ -744,9 +766,9 @@ pub const Engine = struct {
         var magic_buf: [segment.SEGMENT_MAGIC.len]u8 = undefined;
         const read_len = try file.readPositionalAll(io, &magic_buf, 0);
         if (read_len != segment.SEGMENT_MAGIC.len) return error.SegmentCorrupted;
-        if (!std.mem.eql(u8, &magic_buf, &segment.SEGMENT_MAGIC)) {
-            return error.SegmentCorrupted;
-        }
+        const is_v2 = std.mem.eql(u8, &magic_buf, &segment.SEGMENT_MAGIC);
+        const is_v3 = std.mem.eql(u8, &magic_buf, &segment.SEGMENT_MAGIC_V3);
+        if (!is_v2 and !is_v3) return error.SegmentCorrupted;
     }
 
     /// Reject `data_dir` values that are empty or contain a `..`
@@ -1098,6 +1120,36 @@ pub const Engine = struct {
         }
     }
 
+    /// Build the per-segment encryption context for `segment_id`,
+    /// or null when no key is configured. The graph_uuid comes from
+    /// the engine's manifest (same uuid that identifies the WAL
+    /// stream and the data directory). Closes GAP-0001.
+    fn segmentEncryptionContext(self: *Engine, segment_id: u64) ?segment.EncryptionContext {
+        const key = self.config.encryption_key orelse return null;
+        return .{
+            .key = key,
+            .graph_uuid = self.man.ts_uuid,
+            .segment_id = segment_id,
+        };
+    }
+
+    /// Allocate a `CompactionEncryption` matching the input segment
+    /// list. Caller owns the returned slice and must free it. Closes
+    /// GAP-0001 (compaction path).
+    fn buildCompactionEncryption(
+        self: *Engine,
+        in_seg_ids: []const u64,
+        out_seg_id: u64,
+    ) !?compaction.CompactionEncryption {
+        if (self.config.encryption_key == null) return null;
+        const inputs = try self.allocator.alloc(?segment.EncryptionContext, in_seg_ids.len);
+        for (in_seg_ids, 0..) |id, i| inputs[i] = self.segmentEncryptionContext(id);
+        return .{
+            .inputs = inputs,
+            .output = self.segmentEncryptionContext(out_seg_id),
+        };
+    }
+
     /// Atomic snapshot of the engine's observability counters
     /// (P-OBS-001). All sub-counters are read together under
     /// `self.mu`, so derived ratios (`*_total_ns / *_count`) are
@@ -1250,7 +1302,11 @@ pub const Engine = struct {
         const seg_name = try segment.segmentPath(self.allocator, self.config.data_dir, seg_id);
         defer self.allocator.free(seg_name);
 
-        var writer = try segment.SegmentWriter.init(self.allocator, seg_name);
+        var writer = try segment.SegmentWriter.initWithEncryption(
+            self.allocator,
+            seg_name,
+            self.segmentEncryptionContext(seg_id),
+        );
         defer writer.deinit();
 
         it = mem.series.iterator();
@@ -1411,8 +1467,16 @@ pub const Engine = struct {
         const out_path = try segment.segmentPath(self.allocator, self.config.data_dir, new_seg_id);
         defer self.allocator.free(out_path);
 
+        // GAP-0001: encryption descriptor for the compactor (no-op
+        // when no key is configured).
+        const in_seg_ids_forced = try self.allocator.alloc(u64, l0_segs.items.len);
+        defer self.allocator.free(in_seg_ids_forced);
+        for (l0_segs.items, 0..) |seg, i| in_seg_ids_forced[i] = seg.id;
+        const enc_forced = try self.buildCompactionEncryption(in_seg_ids_forced, new_seg_id);
+        defer if (enc_forced) |e| self.allocator.free(e.inputs);
+
         var compactor = compaction.Compactor.init(self.allocator, self.pool);
-        try compactor.compactSegments(paths.items, out_path);
+        try compactor.compactSegmentsWithEncryption(paths.items, out_path, enc_forced);
 
         var compacted_ids = std.AutoHashMap(u64, void).init(self.allocator);
         defer compacted_ids.deinit();
@@ -1441,15 +1505,9 @@ pub const Engine = struct {
             try self.man.save();
         }
 
-        // P-IO-001: invalidate the FD cache entries for the
-        // compacted-away segments BEFORE we unlink the files. The
-        // cache's refcount guard ensures any in-flight query still
-        // holding a borrow gets to finish — invalidate becomes a
-        // deferred close in that case (see `invalidate` doc).
-        for (l0_segs.items) |seg| self.reader_cache.invalidate(io, seg.id);
-
         // P-IO-001: invalidate FD cache entries for the compacted
-        // segments before unlinking, same as compactL0.
+        // segments before unlinking. Refcount-safe: deferred close
+        // for entries still borrowed by an in-flight query.
         for (l0_segs.items) |seg| self.reader_cache.invalidate(io, seg.id);
 
         for (paths.items) |p| {
@@ -1520,8 +1578,16 @@ pub const Engine = struct {
         const out_path = try segment.segmentPath(self.allocator, self.config.data_dir, new_seg_id);
         defer self.allocator.free(out_path);
 
+        // GAP-0001: encryption descriptor for the compactor (no-op
+        // when no key is configured).
+        const in_seg_ids_bg = try self.allocator.alloc(u64, l0_segs.items.len);
+        defer self.allocator.free(in_seg_ids_bg);
+        for (l0_segs.items, 0..) |seg, i| in_seg_ids_bg[i] = seg.id;
+        const enc_bg = try self.buildCompactionEncryption(in_seg_ids_bg, new_seg_id);
+        defer if (enc_bg) |e| self.allocator.free(e.inputs);
+
         var compactor = compaction.Compactor.init(self.allocator, self.pool);
-        try compactor.compactSegments(paths.items, out_path);
+        try compactor.compactSegmentsWithEncryption(paths.items, out_path, enc_bg);
 
         // Build an O(1)-lookup hash set of the IDs we just compacted so
         // the "kept segments" filter below is O(n) over the manifest,
@@ -1816,7 +1882,7 @@ pub const Engine = struct {
         // P-IO-001 / P-MEM-006: borrow a cached reader instead of
         // opening from scratch. Cache lookup is O(1) under its own
         // mutex; the engine lock is NOT held here.
-        const reader_ptr = self.reader_cache.acquire(io, seg.id, p) catch |err| switch (err) {
+        const reader_ptr = self.reader_cache.acquire(io, seg.id, p, self.segmentEncryptionContext(seg.id)) catch |err| switch (err) {
             // Benign race with compaction: the segment was just
             // unlinked but the in-memory manifest snapshot we
             // captured still references it. Skip.
@@ -2396,8 +2462,8 @@ test "SegmentReaderCache: acquire returns the same reader on hit (P-IO-001)" {
     var cache = SegmentReaderCache.init(allocator, 8);
     defer cache.deinit();
 
-    const a = try cache.acquire(io, 42, path);
-    const b = try cache.acquire(io, 42, path);
+    const a = try cache.acquire(io, 42, path, null);
+    const b = try cache.acquire(io, 42, path, null);
     // Same pointer = same cached reader; no double-open.
     try std.testing.expectEqual(@intFromPtr(a), @intFromPtr(b));
     cache.release(io, 42);
@@ -2425,7 +2491,7 @@ test "SegmentReaderCache: invalidate closes the entry" {
     var cache = SegmentReaderCache.init(allocator, 8);
     defer cache.deinit();
 
-    _ = try cache.acquire(io, 7, path);
+    _ = try cache.acquire(io, 7, path, null);
     cache.release(io, 7);
     try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
 
@@ -2454,12 +2520,104 @@ test "SegmentReaderCache: invalidate defers close for borrowed entries" {
     var cache = SegmentReaderCache.init(allocator, 8);
     defer cache.deinit();
 
-    _ = try cache.acquire(io, 7, path);
+    _ = try cache.acquire(io, 7, path, null);
     // Don't release yet — borrowed.
     cache.invalidate(io, 7);
     // Entry must still be present (deferred close).
     try std.testing.expectEqual(@as(u32, 1), cache.entries.count());
     cache.release(io, 7);
+}
+
+test "Engine: TDE end-to-end — write encrypted, reopen with same key, query (GAP-0001)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    const key: [32]u8 = [_]u8{0x42} ** 32;
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    // Phase 1: write some data with a key and flush so a v3 segment hits disk.
+    {
+        var eng = try Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 100,
+            .encryption_key = key,
+        }, &pool);
+        defer eng.deinit();
+
+        try eng.appendPoints(1, &.{
+            .{ .ts = 1, .value = 11 },
+            .{ .ts = 2, .value = 22 },
+            .{ .ts = 3, .value = 33 },
+        });
+        try eng.flush();
+        try std.testing.expect(eng.man.segments.items.len >= 1);
+    }
+
+    // Phase 2: reopen with the SAME key and query.
+    {
+        var eng = try Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 100,
+            .encryption_key = key,
+        }, &pool);
+        defer eng.deinit();
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var it = try eng.queryPoints(arena.allocator(), 1, 0, 1000);
+        var count: usize = 0;
+        while (it.next()) |_| count += 1;
+        try std.testing.expectEqual(@as(usize, 3), count);
+    }
+}
+
+test "Engine: TDE — reopening encrypted segments with wrong key surfaces DecryptionFailed (GAP-0001)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    const key_a: [32]u8 = [_]u8{0xAA} ** 32;
+    const key_b: [32]u8 = [_]u8{0xBB} ** 32;
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    {
+        var eng = try Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 100,
+            .encryption_key = key_a,
+        }, &pool);
+        defer eng.deinit();
+        try eng.appendPoints(1, &.{.{ .ts = 1, .value = 1 }});
+        try eng.flush();
+    }
+
+    // Reopen with the wrong key. The segments are present so the
+    // verifySegments step succeeds (it only checks magic), but the
+    // query path surfaces DecryptionFailed when it tries to decode
+    // any block.
+    var eng = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 100,
+        .encryption_key = key_b,
+    }, &pool);
+    defer eng.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.DecryptionFailed, eng.queryPoints(arena.allocator(), 1, 0, 1000));
 }
 
 test "Engine: per_call durability mode survives crash without explicit sync (P-IO-002)" {

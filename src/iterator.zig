@@ -48,7 +48,11 @@ pub const SliceIterator = struct {
 pub const SegmentIterator = struct {
     allocator: Allocator,
     reader: segment.SegmentReader,
-    block_it: segment.SegmentReader.BlockIterator,
+    /// Cursor state — replaces the previous `BlockIterator` field
+    /// which held a `*SegmentReader` to a local copy and was a
+    /// dangling-pointer bug waiting to surface.
+    offset: u64,
+    block_index: u32 = 0,
     series_id: types.SeriesId,
     start_ts: i64,
     end_ts: i64,
@@ -56,11 +60,12 @@ pub const SegmentIterator = struct {
     pos: usize = 0,
 
     pub fn init(allocator: Allocator, path: []const u8, series_id: types.SeriesId, start_ts: i64, end_ts: i64) !SegmentIterator {
-        var reader = try segment.SegmentReader.init(allocator, path);
+        const reader = try segment.SegmentReader.init(allocator, path);
         return .{
             .allocator = allocator,
             .reader = reader,
-            .block_it = reader.iterator(),
+            // Both v2 and v3 segment magics are the same length (8).
+            .offset = segment.SEGMENT_MAGIC.len,
             .series_id = series_id,
             .start_ts = start_ts,
             .end_ts = end_ts,
@@ -96,7 +101,19 @@ pub const SegmentIterator = struct {
                 self.current_points = &[_]types.Point{};
             }
 
-            const maybe_block = try self.block_it.next();
+            // Drive the block iterator from our own (offset, block_index)
+            // state — `BlockIterator` carries a `*SegmentReader` that
+            // would dangle if stored as a struct field on the value
+            // path. Construct one fresh per next() call instead.
+            var block_it = segment.SegmentReader.BlockIterator{
+                .reader = &self.reader,
+                .offset = self.offset,
+                .block_index = self.block_index,
+            };
+            const maybe_block = try block_it.next();
+            self.offset = block_it.offset;
+            self.block_index = block_it.block_index;
+
             const block = maybe_block orelse return null;
             if (block.header.series_id != self.series_id) continue;
             if (block.header.stats.max_ts < self.start_ts) continue;

@@ -97,6 +97,19 @@ const BlockStreamIterator = struct {
 /// points). Adjustable via `Compactor.config.target_block_points`.
 const DEFAULT_TARGET_BLOCK_POINTS: usize = 256;
 
+/// Per-input/per-output encryption descriptor for the compactor.
+/// Used so encrypted inputs can be decrypted while reading and the
+/// output can be re-encrypted under the same key. Closes GAP-0001.
+pub const CompactionEncryption = struct {
+    /// Encryption contexts for the input segments, in the same order
+    /// as `input_paths`. `null` entries mean the corresponding input
+    /// is plaintext.
+    inputs: []const ?segment.EncryptionContext,
+    /// Encryption context for the output segment. `null` writes a
+    /// plaintext output.
+    output: ?segment.EncryptionContext,
+};
+
 /// Merge engine for combining multiple segments into a single segment.
 ///
 /// `compactSegments` takes a list of input segment paths and an output
@@ -125,19 +138,32 @@ pub const Compactor = struct {
         };
     }
 
-    /// Streaming compactor (P-MEM-001 / P-MEM-005).
+    /// Backwards-compatible entry point: opens every input as
+    /// plaintext and writes the output as plaintext.
+    pub fn compactSegments(self: *Compactor, input_paths: []const []const u8, output_path: []const u8) !void {
+        return self.compactSegmentsWithEncryption(input_paths, output_path, null);
+    }
+
+    /// Streaming compactor (P-MEM-001 / P-MEM-005) with optional
+    /// per-segment encryption (GAP-0001).
     ///
     /// Peak RAM is O(target_block_points + largest-input-block) per
     /// series at a time, NOT O(all-points-in-all-input-segments).
-    pub fn compactSegments(self: *Compactor, input_paths: []const []const u8, output_path: []const u8) !void {
+    pub fn compactSegmentsWithEncryption(
+        self: *Compactor,
+        input_paths: []const []const u8,
+        output_path: []const u8,
+        encryption: ?CompactionEncryption,
+    ) !void {
         var readers = std.ArrayList(segment.SegmentReader).empty;
         defer {
             for (readers.items) |*r| r.deinit();
             readers.deinit(self.allocator);
         }
 
-        for (input_paths) |path| {
-            const reader = try segment.SegmentReader.init(self.allocator, path);
+        for (input_paths, 0..) |path, i| {
+            const in_enc: ?segment.EncryptionContext = if (encryption) |e| e.inputs[i] else null;
+            const reader = try segment.SegmentReader.initWithEncryption(self.allocator, path, in_enc);
             try readers.append(self.allocator, reader);
         }
 
@@ -164,7 +190,8 @@ pub const Compactor = struct {
             }
         }
 
-        var writer = try segment.SegmentWriter.init(self.allocator, output_path);
+        const out_enc: ?segment.EncryptionContext = if (encryption) |e| e.output else null;
+        var writer = try segment.SegmentWriter.initWithEncryption(self.allocator, output_path, out_enc);
         defer writer.deinit();
 
         var it = series_blocks.iterator();
