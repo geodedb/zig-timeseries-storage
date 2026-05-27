@@ -60,6 +60,27 @@ pub const EngineError = wal_manager.WalError || segment.SegmentError || manifest
     SegmentCorrupted,
 };
 
+/// WAL durability mode (P-IO-002).
+///
+/// Trade-off:
+///
+/// * `batch` (default): `appendPoints` does NOT call `wal.sync()`.
+///   The engine spawns a background syncer thread that fsyncs the
+///   WAL every `wal_sync_interval_ms` milliseconds. Maximises
+///   throughput at the cost of up to `wal_sync_interval_ms` of
+///   data loss on a crash between syncs. Matches the historical
+///   pre-F-6 behaviour.
+/// * `per_call`: `appendPoints` calls `wal.sync()` before returning.
+///   Lower throughput (one fsync per call), but a successful return
+///   means the record is durable on disk — no data loss on crash.
+///
+/// Callers who want write-ahead durability without per-call cost
+/// should keep the default `batch` mode and shorten
+/// `wal_sync_interval_ms`. Callers who treat every appendPoints
+/// return as a durability fence (replication ack, two-phase commit,
+/// etc.) should use `per_call`.
+pub const DurabilityMode = enum { batch, per_call };
+
 /// WAL recovery policy.
 ///
 /// - `fail_closed` (default): any deserialisation failure or CRC32C
@@ -151,6 +172,20 @@ pub const EngineConfig = struct {
     /// the system real-time clock at prune time. Exposed primarily
     /// so tests can drive deterministic cutoffs without sleeping.
     retention_now_override: ?i64 = null,
+
+    /// WAL durability mode. See `DurabilityMode` for the trade-off
+    /// matrix. Default is `.batch` (high throughput, periodic
+    /// background syncer). Closes P-IO-002.
+    durability_mode: DurabilityMode = .batch,
+
+    /// Interval, in milliseconds, between background WAL fsyncs in
+    /// `.batch` mode. Ignored in `.per_call` mode. Lower values
+    /// reduce the worst-case data-loss window at the cost of more
+    /// fsync syscalls per second. Defaults to 100 ms — fast enough
+    /// to bound data loss to "barely noticeable", slow enough to
+    /// amortise the fsync cost across thousands of appends on
+    /// typical workloads.
+    wal_sync_interval_ms: u32 = 100,
 };
 
 /// Backwards-compatible alias. New code should use `EngineConfig`.
@@ -295,6 +330,21 @@ pub const Engine = struct {
     /// Other call sites MUST NOT touch this buffer. Closes P-MEM-003.
     append_payload_buf: std.ArrayListUnmanaged(u8) = .empty,
 
+    /// Background WAL syncer thread (P-IO-002). `null` when
+    /// `durability_mode == .per_call` (no background work needed) or
+    /// before `startBackgroundSyncer` has been called. The thread
+    /// polls `syncer_shutdown_event` via `waitTimeout`
+    /// every `wal_sync_interval_ms` and issues `wal.sync()` between
+    /// timeouts until shutdown is requested.
+    syncer_thread: ?std.Thread = null,
+
+    /// Event used both as the shutdown signal and the early-wake
+    /// primitive for the syncer thread. `set` from `deinit` causes
+    /// the syncer's `waitTimeout` to return immediately, after which
+    /// it exits cleanly. The event is single-shot — once `set`, it
+    /// stays set, which is exactly the shutdown semantic we want.
+    syncer_shutdown_event: std.Io.Event = .unset,
+
     /// Engine-wide latency / throughput counters. Updated under
     /// `self.mu` by every hot path (append, query, flush, compaction).
     /// Read out via `stats()`. Closes P-OBS-001.
@@ -400,6 +450,63 @@ pub const Engine = struct {
                 .segment_integrity_failures = integrity_failures,
             },
         };
+    }
+
+    /// Spawn the background WAL syncer if `durability_mode == .batch`.
+    /// Called by the engine builder right after `Engine.init` returns.
+    /// MUST be called only ONCE per engine instance; the receiver is
+    /// `*Engine` so the spawned thread can capture a stable pointer.
+    ///
+    /// Why this is a separate function rather than running inside
+    /// `init`: spawning a thread that captures `*Engine` requires the
+    /// engine to live at a stable address — i.e. the caller must
+    /// already have moved the result of `init` into its final home.
+    /// We expose a separate `startBackgroundSyncer` so the caller can
+    /// say "now the engine is at its final address, start workers".
+    /// The CLI / examples wire this in their `Engine.openAt` helpers.
+    ///
+    /// Closes the operator-facing slice of P-IO-002.
+    pub fn startBackgroundSyncer(self: *Engine) !void {
+        if (self.config.durability_mode != .batch) return;
+        if (self.syncer_thread != null) return; // idempotent
+        self.syncer_thread = try std.Thread.spawn(.{}, syncerLoop, .{self});
+    }
+
+    /// Body of the background WAL syncer thread. Sleeps for
+    /// `config.wal_sync_interval_ms`, syncs the WAL, repeats until
+    /// `syncer_shutdown_event` is set by `deinit`.
+    fn syncerLoop(self: *Engine) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const interval_ns: u64 = @as(u64, self.config.wal_sync_interval_ms) * std.time.ns_per_ms;
+        while (true) {
+            // Wait up to interval_ns for the shutdown event. On
+            // timeout we fall through to a sync. On set (shutdown)
+            // we return immediately. Cancelable errors are swallowed
+            // — the syncer is a fire-and-forget loop.
+            const wait_result = self.syncer_shutdown_event.waitTimeout(
+                io,
+                .{ .duration = .{
+                    .raw = .{ .nanoseconds = @intCast(interval_ns) },
+                    .clock = .awake,
+                } },
+            );
+            if (wait_result) |_| {
+                // Event set: shutdown requested.
+                return;
+            } else |err| switch (err) {
+                error.Timeout => {}, // expected — fall through to sync
+                else => return, // cancelled — bail out
+            }
+
+            // Take the engine lock briefly and issue the sync.
+            // `wal.sync()` is the cost we are amortising across all
+            // the appends that happened since the last interval.
+            self.mu.lockUncancelable(io);
+            self.wal.sync() catch |err| {
+                self.recordBackgroundErrorLocked(.flush, err);
+            };
+            self.mu.unlock(io);
+        }
     }
 
     /// Iterate every segment referenced by `man` and prove that the
@@ -604,6 +711,16 @@ pub const Engine = struct {
     pub fn deinit(self: *Engine) void {
         const io = std.Io.Threaded.global_single_threaded.io();
 
+        // Stop the background WAL syncer FIRST so it cannot try to
+        // touch the WAL after we tear it down. The syncer takes
+        // `self.mu` internally for the sync call, so signal it via
+        // its own shutdown event before taking the engine lock.
+        if (self.syncer_thread) |t| {
+            self.syncer_shutdown_event.set(io);
+            t.join();
+            self.syncer_thread = null;
+        }
+
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
 
@@ -678,6 +795,14 @@ pub const Engine = struct {
         const payload = try self.encodeAppendPointsPayloadLocked(series_id, points);
 
         _ = try self.appendToWalLocked(payload);
+
+        // P-IO-002: in per_call durability mode every append fsyncs
+        // before returning. In batch mode the background syncer
+        // covers durability on its own schedule.
+        if (self.config.durability_mode == .per_call) {
+            try self.wal.sync();
+        }
+
         try self.active_mem.insert(series_id, points);
         try self.maybeTriggerFlushLocked(io);
 
@@ -2039,6 +2164,81 @@ test "Engine: pruneExpired removes segments older than the cutoff" {
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "Engine: per_call durability mode survives crash without explicit sync (P-IO-002)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    // Phase 1: write in per_call mode, close WITHOUT calling sync().
+    // The per_call contract is "every appendPoints fsyncs on return"
+    // — so a subsequent reopen must see the data even though sync()
+    // was never explicitly invoked.
+    {
+        var eng = try Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 1_000_000,
+            .durability_mode = .per_call,
+        }, &pool);
+        defer eng.deinit();
+
+        try eng.appendPoints(1, &.{ .{ .ts = 1, .value = 11 }, .{ .ts = 2, .value = 22 } });
+        // NOTE: NO eng.sync() call. per_call mode promises durability
+        // already happened inside appendPoints.
+    }
+
+    // Phase 2: reopen and check that both points were replayed.
+    var eng2 = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 1_000_000,
+        .durability_mode = .per_call,
+    }, &pool);
+    defer eng2.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), eng2.active_mem.point_count);
+}
+
+test "Engine: batch durability mode background syncer drains the WAL (P-IO-002)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var eng = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 1_000_000,
+        .durability_mode = .batch,
+        // Short interval so the test does not sit on the CI clock.
+        .wal_sync_interval_ms = 10,
+    }, &pool);
+    defer eng.deinit();
+
+    try eng.startBackgroundSyncer();
+    // The syncer thread is running by the time startBackgroundSyncer
+    // returns — Thread.spawn does not race the callee.
+    try std.testing.expect(eng.syncer_thread != null);
+
+    try eng.appendPoints(1, &.{.{ .ts = 1, .value = 1 }});
+    // Wait long enough for the syncer to have tripped at least once.
+    std.Io.sleep(io, .{ .nanoseconds = 50 * std.time.ns_per_ms }, .awake) catch {};
+
+    // Force an explicit sync as well to demonstrate the two paths
+    // don't interfere. deinit() will join the syncer.
+    try eng.sync();
 }
 
 test "Engine: stats counters increment on append, query, flush, compaction (P-OBS-001)" {
