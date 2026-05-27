@@ -970,6 +970,14 @@ pub const Engine = struct {
         // the engine can come up. Closes GAP-0006.
         try verifySegments(allocator, io, &man, config.data_dir, config.wal_recovery, &integrity_failures);
 
+        // P-LOCK-001 / P-LOCK-003 manifest COW: publish the initial
+        // immutable snapshot AFTER verifySegments has finalised the
+        // accepted segment set. From this point on, queryPoints can
+        // observe the segment list via `man.snapshot()` without
+        // holding engine.mu — concurrent writers stage new snapshots
+        // and publish them atomically.
+        try man.publishInitialSnapshot();
+
         const wal_dir = try std.Io.Dir.cwd().openDir(io, config.data_dir, .{});
         var wal = try wal_manager.WalManager.init(allocator, wal_dir, man.ts_uuid, man.last_checkpoint_lsn, .{
             .create_identity_if_missing = config.create_identity_if_missing,
@@ -2649,13 +2657,20 @@ pub const Engine = struct {
         const merge_it = try arena.create(iterator.MergeIterator);
         merge_it.* = iterator.MergeIterator.init(arena);
 
-        // P-LOCK-002: snapshot the manifest segment list under the
-        // engine lock, then RELEASE the lock before doing any disk
-        // I/O. Concurrent writers (appendPoints, flush, compaction)
-        // are blocked only for the snapshot copy, not for the entire
-        // query body.
-        var segments_snapshot = std.ArrayListUnmanaged(manifest.SegmentMeta).empty;
-        defer segments_snapshot.deinit(arena);
+        // P-LOCK-001 / P-LOCK-003 manifest COW: acquire a refcounted
+        // immutable snapshot of the segment list, lock-free. The
+        // returned `*Snapshot` is stable for the lifetime of the ref
+        // — concurrent writers may stage and publish NEW snapshots
+        // but our view remains coherent until we `release()`.
+        //
+        // queryPoints no longer holds engine.mu at all on the
+        // manifest-read path. The memtable drain still takes
+        // engine.mu briefly (to guarantee POINTER lifetime against
+        // the flush worker's `destroy(flushing_mem)`); the per-shard
+        // mutex inside each memtable continues to serialise the
+        // copy out against concurrent inserts.
+        const man_snap = self.man.snapshot();
+        defer man_snap.release();
 
         {
             self.mu.lockUncancelable(io);
@@ -2674,19 +2689,15 @@ pub const Engine = struct {
             if (self.flushing_mem) |fm| {
                 try queryMemtable(arena, fm, series_id, start_ts, end_ts, merge_it, &points_added);
             }
-
-            try segments_snapshot.ensureTotalCapacity(arena, self.man.segments.items.len);
-            for (self.man.segments.items) |seg| {
-                if (seg.min_ts > end_ts or seg.max_ts < start_ts) continue;
-                segments_snapshot.appendAssumeCapacity(seg);
-            }
         }
 
-        // Iterate the snapshot WITHOUT the engine lock. Concurrent
-        // appends, flushes, and compactions are now free to run.
-        // Compaction's invalidate() / our cache's refcount guard
-        // ensure readers we are using cannot be closed under us.
-        for (segments_snapshot.items) |seg| {
+        // Iterate the manifest snapshot WITHOUT the engine lock.
+        // Concurrent appends, flushes, and compactions are now free
+        // to run. Compaction's invalidate() / our cache's refcount
+        // guard ensure readers we are using cannot be closed under
+        // us.
+        for (man_snap.segments) |seg| {
+            if (seg.min_ts > end_ts or seg.max_ts < start_ts) continue;
             try self.querySegment(arena, io, seg, series_id, start_ts, end_ts, merge_it, &points_added);
         }
 

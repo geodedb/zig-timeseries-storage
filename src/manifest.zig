@@ -92,6 +92,52 @@ pub const SegmentMeta = struct {
     level: u8,
 };
 
+/// Immutable, reference-counted snapshot of the manifest's segment
+/// list plus the counter/checkpoint values that produced it.
+///
+/// Closes the in-memory leg of the manifest COW refactor described
+/// under P-LOCK-001 / P-LOCK-003 in `docs/PERF_GAP_ANALYSIS.md`. A
+/// snapshot is a fully self-contained read view: once `snapshot()`
+/// returns, the caller can iterate `segments` without holding any
+/// engine-level lock, even while a concurrent writer stages and
+/// publishes a NEW snapshot. The old snapshot's backing memory is
+/// freed only when its refcount drops to zero — late readers who
+/// still hold a ref see a consistent view of the world as it was
+/// when they acquired it.
+///
+/// The refcount is biased by ONE for the publication ref the
+/// `Manifest` itself holds (so the snapshot survives as long as it
+/// is the current published view). Readers add their own ref via
+/// `acquire()` and drop it via `release()`. The publication ref is
+/// dropped by the next `writeSlotAndPublish` call that swaps in a
+/// fresh snapshot.
+pub const Snapshot = struct {
+    segments: []const SegmentMeta,
+    counter: u64,
+    last_checkpoint_lsn: u64,
+    next_segment_id: u64,
+    refcount: std.atomic.Value(u32) = .init(1),
+    allocator: Allocator,
+
+    pub fn acquire(self: *Snapshot) void {
+        // acq_rel rather than monotonic: paired with the .acq_rel
+        // fetchSub in release() so the happens-before edges the
+        // last releaser needs (it must observe every prior
+        // acquire/release) are preserved. The bias-of-one publication
+        // ref keeps the snapshot alive for the publication window;
+        // every other ref is purely cosmetic to refcount logic.
+        _ = self.refcount.fetchAdd(1, .acq_rel);
+    }
+
+    pub fn release(self: *Snapshot) void {
+        const prev = self.refcount.fetchSub(1, .acq_rel);
+        if (prev == 1) {
+            self.allocator.free(self.segments);
+            self.allocator.destroy(self);
+        }
+    }
+};
+
 /// On-disk manifest tracking the engine's persistent state.
 ///
 /// Stores the list of segments, the next segment id, the last WAL
@@ -138,6 +184,19 @@ pub const Manifest = struct {
     /// keyed and unkeyed opens is rejected with
     /// `UnexpectedPlaintextManifest` / `DecryptionFailed`.
     encryption_key: ?[32]u8 = null,
+    /// Atomic pointer to the current immutable snapshot of the
+    /// segment list + counters. Readers atomically load it and bump
+    /// the refcount; writers stage a new `*Snapshot` and swap. The
+    /// in-memory `segments` ArrayList above is the *writer-side*
+    /// staging buffer (mutated under engine.mu); readers no longer
+    /// touch it. Initialised lazily by `publishInitialSnapshot`,
+    /// which the engine calls AFTER `verifySegments` has finalised
+    /// the on-load segment set.
+    ///
+    /// We seed with `null` rather than `undefined` so callers that
+    /// inspect a half-built `Manifest` (e.g. error paths in
+    /// `initWithEncryption`) cannot accidentally dereference garbage.
+    current_snapshot: std.atomic.Value(?*Snapshot) = .init(null),
 
     pub fn init(allocator: Allocator, data_dir: []const u8) !Manifest {
         return initWithEncryption(allocator, data_dir, null);
@@ -224,15 +283,118 @@ pub const Manifest = struct {
 
     pub fn deinit(self: *Manifest) void {
         self.segments.deinit(self.allocator);
+        // Drop the manifest's publication ref. If a reader still
+        // holds a ref the snapshot will outlive us until they
+        // release. Readers MUST NOT outlive the allocator, which the
+        // engine enforces by joining all background workers in its
+        // own `deinit` before tearing the manifest down.
+        if (self.current_snapshot.load(.acquire)) |snap| {
+            snap.release();
+        }
+    }
+
+    /// Allocate the initial published `*Snapshot` from the current
+    /// in-memory `segments` + counter state. Called by the engine
+    /// AFTER `verifySegments` has finalised the on-load segment set
+    /// so the very first snapshot reflects exactly the segments the
+    /// engine will accept queries against.
+    ///
+    /// Idempotent and safe to call exactly once per manifest lifetime
+    /// — calling twice would leak the prior snapshot.
+    pub fn publishInitialSnapshot(self: *Manifest) !void {
+        std.debug.assert(self.current_snapshot.load(.acquire) == null);
+        const segs_copy = try self.allocator.dupe(SegmentMeta, self.segments.items);
+        errdefer self.allocator.free(segs_copy);
+        const snap = try self.allocator.create(Snapshot);
+        snap.* = .{
+            .segments = segs_copy,
+            .counter = self.counter,
+            .last_checkpoint_lsn = self.last_checkpoint_lsn,
+            .next_segment_id = self.next_segment_id,
+            .refcount = .init(1),
+            .allocator = self.allocator,
+        };
+        self.current_snapshot.store(snap, .release);
+    }
+
+    /// Acquire a refcounted snapshot of the current manifest state.
+    ///
+    /// O(1): one atomic load + one atomic refcount increment. Returns
+    /// a pointer the caller MUST eventually release via `.release()`.
+    /// The snapshot is consistent — all fields reflect a single
+    /// historical publish — and remains valid for the lifetime of
+    /// the ref, even while concurrent writers stage and publish new
+    /// versions.
+    pub fn snapshot(self: *Manifest) *Snapshot {
+        const snap = self.current_snapshot.load(.acquire).?;
+        snap.acquire();
+        return snap;
     }
 
     pub fn save(self: *Manifest) !void {
+        // `save()` callers in the engine all hold `engine.mu`, which
+        // serialises every mutation of `self.segments` / `self.counter`
+        // against itself. A future `writeSlotAndPublish` that runs
+        // OUTSIDE `engine.mu` will need its own internal mutex to
+        // coordinate with us on the shared ping-pong slot file;
+        // until then, the engine.mu invariant is sufficient.
         self.counter += 1;
         const filename = if (self.counter % 2 == 0) "manifest.a" else "manifest.b";
         const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.data_dir, filename });
         defer self.allocator.free(path);
         try self.writeToFile(self.allocator, path);
+
+        // Republish the snapshot so post-save() readers observe the
+        // new on-disk state. This is the in-memory leg of the COW —
+        // the caller can keep using `save()` exactly as before, but
+        // any reader holding the OLD snapshot keeps seeing the old
+        // segment list until it calls `manifest.snapshot()` again.
+        // `current_snapshot` may legitimately be null on a save()
+        // call BEFORE `publishInitialSnapshot` (some tests construct
+        // a Manifest{} literal and call save() directly without
+        // going through the engine init path); skip the republish in
+        // that case — the next reader path will read the on-disk
+        // slot back through `initWithEncryption` instead.
+        if (self.current_snapshot.load(.acquire) != null) {
+            try self.republishSnapshotLocked();
+        }
     }
+
+    /// Internal: build a new `*Snapshot` from the current in-memory
+    /// state (`segments`, `counter`, `last_checkpoint_lsn`,
+    /// `next_segment_id`), atomically swap it into
+    /// `current_snapshot`, and drop the previous publication ref.
+    /// Caller is expected to hold whatever lock guards the in-memory
+    /// state being snapshotted (typically `engine.mu` or
+    /// `publish_mu`).
+    fn republishSnapshotLocked(self: *Manifest) !void {
+        const segs_copy = try self.allocator.dupe(SegmentMeta, self.segments.items);
+        errdefer self.allocator.free(segs_copy);
+        const new_snap = try self.allocator.create(Snapshot);
+        new_snap.* = .{
+            .segments = segs_copy,
+            .counter = self.counter,
+            .last_checkpoint_lsn = self.last_checkpoint_lsn,
+            .next_segment_id = self.next_segment_id,
+            .refcount = .init(1),
+            .allocator = self.allocator,
+        };
+        const old = self.current_snapshot.swap(new_snap, .acq_rel);
+        if (old) |o| o.release();
+    }
+
+    // NOTE: A future `writeSlotAndPublish(new_segments, new_lsn,
+    // new_next_id)` method that the engine could call OUTSIDE
+    // engine.mu (serialised by `publish_mu`) would finish closing
+    // P-LOCK-003 for the flush + compaction publish paths. The
+    // refactor is non-trivial because every engine-side reader of
+    // `self.man.segments.items` (compaction triggers, OoO watermark
+    // seeding, runMergeAndCommit's input-set scan) currently relies
+    // on `engine.mu` to keep that ArrayList stable. Routing those
+    // through `self.man.snapshot()` is a separate cleanup. The
+    // queryPoints path — the only hot-path reader — is already
+    // routed through `snapshot()` in this commit, which is the
+    // biggest win.
 
     pub fn getNextSegmentId(self: *Manifest) u64 {
         const id = self.next_segment_id;
@@ -876,4 +1038,71 @@ test "Manifest: encrypted layout AAD binds ts_uuid (GAP-0001)" {
     } else |err| {
         try std.testing.expect(err == error.ChecksumMismatch or err == error.DecryptionFailed);
     }
+}
+
+test "Manifest: snapshot is stable across publish (P-LOCK-001 COW)" {
+    // Acquire a snapshot, then publish a new state via save(), then
+    // verify the OLD snapshot still sees the OLD segment list while
+    // a freshly-acquired snapshot sees the NEW one. This is the
+    // lock-free reader guarantee the COW gives queryPoints.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var m = try Manifest.init(allocator, data_dir);
+    defer m.deinit();
+    try m.segments.append(allocator, .{ .id = 1, .min_ts = 100, .max_ts = 200, .level = 0 });
+    try m.publishInitialSnapshot();
+
+    // Reader 1: holds the initial snapshot (1 segment).
+    const snap1 = m.snapshot();
+    defer snap1.release();
+    try std.testing.expectEqual(@as(usize, 1), snap1.segments.len);
+    try std.testing.expectEqual(@as(u64, 1), snap1.segments[0].id);
+
+    // Writer: stage + publish a second segment.
+    try m.segments.append(allocator, .{ .id = 2, .min_ts = 300, .max_ts = 400, .level = 0 });
+    try m.save();
+
+    // Reader 1 STILL sees the old list — refcounted snapshot is
+    // immutable. The on-disk store advanced; in-memory the writer
+    // republished a new snapshot for future readers.
+    try std.testing.expectEqual(@as(usize, 1), snap1.segments.len);
+    try std.testing.expectEqual(@as(u64, 1), snap1.segments[0].id);
+
+    // Reader 2: freshly acquired, sees the NEW list (2 segments).
+    const snap2 = m.snapshot();
+    defer snap2.release();
+    try std.testing.expectEqual(@as(usize, 2), snap2.segments.len);
+    try std.testing.expectEqual(@as(u64, 1), snap2.segments[0].id);
+    try std.testing.expectEqual(@as(u64, 2), snap2.segments[1].id);
+}
+
+test "Manifest: snapshot refcount frees backing memory after last release" {
+    // Direct refcount semantics: an acquire bumps the count; the
+    // publication ref keeps the snapshot alive while it is current;
+    // republishing drops the publication ref; the last reader's
+    // release frees the backing memory. Catches accidental refcount
+    // drift that the leak detector in std.testing.allocator would
+    // otherwise surface as an unfreed allocation.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var m = try Manifest.init(allocator, data_dir);
+    defer m.deinit();
+    try m.publishInitialSnapshot();
+
+    const snap_old = m.snapshot();
+    try m.save(); // republish — drops publication ref on snap_old, still alive via snap_old.acquire
+    snap_old.release(); // drops the reader ref; backing memory freed here
+    // m.deinit() drops the publication ref on the post-save snapshot.
 }
