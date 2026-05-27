@@ -89,15 +89,15 @@ architectural work.
 
 ### Class B — Bench-actionable findings (fit /bench-optimize:run)
 
-These are single-hypothesis optimizations with bench evidence pointing at them:
+These are single-hypothesis optimizations with bench evidence pointing at them.
 
-| ID | Component | Hypothesis | Expected delta |
+| ID | Component | Status | Outcome |
 |---|---|---|---|
-| ENT-001 | `iterator.MergeIterator` | Pre-size internal PriorityQueue from input slice count to drop allocs at K=64 from 71 → ≤K+1 | -5..-15% ns/op at K=64 |
-| ENT-002 | `memtable.Memtable` | Pre-size AutoHashMap capacity and per-series ArrayList capacity hint from `max_points / expected_cardinality` | -1 alloc/insert; ~-20% ns/op on hot single-series ingest |
-| ENT-003 | `segment.SegmentWriter` | Pool/reuse the GorillaEncoder bitset across writeBlock calls (instead of init/deinit per block) | -1 alloc/block + reduced bitset growth |
-| ENT-004 | `compaction.zig` MergeIterator usage | Reuse the same PriorityQueue across compactions instead of init/deinit per call | -k allocs per compaction |
-| ENT-005 (no-ID HashMap defaults from §2 row 31) | `memtable.Memtable` | Tune AutoHashMap load factor for u128 SeriesId keys | TBD; needs measurement |
+| ENT-001 | `iterator.MergeIterator` pre-size | **Closed (`890d9f8`)** | `merge_iter_k64` alloc_count 71 → 66 (5 doubling-grows eliminated) |
+| ENT-002 | `memtable.Memtable` pre-size | **Closed (`ec6114a`)** | `memtable_insert_sorted/ooo` alloc_count 2 → 0; wall_p50 ~halved (581→290 ns, 511→341 ns) |
+| ENT-003 | `segment.SegmentWriter` encoder pool | **Closed (`4d74bcc`)** | `segment_write_block_256` (8 blocks/iter) alloc_count 18 → 11; `compaction_cost` alloc_count 107 → 100 |
+| ENT-004 | `compaction.zig` MergeIterator usage | **Closed (`890d9f8`)** | Production caller in `compactOneSeries` now uses `initCapacity(known K)` |
+| ENT-005 | `memtable.Memtable` HashMap tuning | **Closed (`ec6114a`)** | Subsumed by ENT-002: `ensureTotalCapacity(DEFAULT_EXPECTED_SERIES=1024)` on the `AutoHashMap` |
 
 ### Class C — Bench design / instrumentation gaps (not library issues)
 
@@ -114,31 +114,29 @@ issues, not library issues. Documenting for follow-up.
 
 ---
 
-## Proposed plan
+## Execution outcome
 
-Since `/bench-optimize:run` is the requested vehicle and is scoped to
-single-hypothesis changes, the realistic execution order is:
+Class B fully closed in this session via direct landings (not via
+`/bench-optimize:run`, which hit a STOP on the variance policy on this
+host — see `docs/performance/2026-05-27-mergeiter-presize/baseline-decision.md`).
+Each landed change is validated by `alloc_count` deltas + the full
+test suite (test, test-integration, test-stress, test-engine-e2e).
 
-1. **First pass — Class B items via `/bench-optimize:run` (each is a self-contained workflow):**
-   - ENT-001 (MergeIterator pre-size)
-   - ENT-002 (Memtable pre-size)
-   - ENT-003 (encoder pool in SegmentWriter)
-   - ENT-005 (HashMap load-factor / capacity tuning)
+Remaining work:
 
-2. **Second pass — bench design fixes (Class C) so subsequent measurements are clean:**
-   - BENCH-D1/D2/D3 — restructure scenarios to amortize setup across many ops
+1. **Class A (P-LOCK-001 family + P-ALGO-001 family) — surface for maintainer go/no-go.**
+   The bench evidence is now strong enough to justify the P-LOCK-001 work:
+   `bench_concurrent_append` at N=4 produces 4.67M ops/s vs the
+   single-threaded `append_single_series` ceiling of 4.58M ops/s — **1.02×
+   scaling against the documented ≥3× unblock criterion**. Recommend
+   pursuing in a dedicated branch with `bench_concurrent_append` /
+   `bench_concurrent_rw` as acceptance criteria.
 
-3. **Class A — XL refactors — surface to maintainer for go/no-go.**
-   The bench evidence is now strong enough to justify the P-LOCK-001 work,
-   but it is explicitly multi-PR. Recommend pursuing in a dedicated branch
-   with the new `bench_concurrent_append` / `bench_concurrent_rw` numbers as
-   acceptance criteria (≥3× at N=4).
+2. **Class C bench-design fixes (BENCH-D1/D2/D3)** so subsequent
+   measurements amortize fixture cost more cleanly. Not urgent — the
+   pooled-encoder bench was already restructured to demonstrate the
+   ENT-003 win.
 
-For each Class B item, the `/bench-optimize:run` workflow will:
-
-- Audit the target benchmark and code path
-- Establish a clean baseline (1 warmup + 10 alternating rounds)
-- Propose a falsifiable hypothesis
-- Iterate the smallest plausible change
-- Validate via A/B (with feature flag)
-- Finalize or revert based on `max(15%, 3×stddev)` noise gate.
+3. **Re-baseline the bench host (CPU pinning, dedicated runner) before
+   any future `/bench-optimize:run` cycle** so wall-time signals are
+   detectable above the 5% compiled-micro threshold.
