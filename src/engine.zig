@@ -764,6 +764,126 @@ pub const Engine = struct {
         }
     }
 
+    /// Force compaction of every L0 segment, blocking until the
+    /// resulting L1 segment is durable and the manifest references it.
+    ///
+    /// Differs from the automatic background trigger in two ways:
+    ///
+    ///   1. Ignores the `kL0CompactionThreshold` — a single L0 segment
+    ///      is enough to trigger a merge into L1. This is intentional:
+    ///      operators driving the CLI `compact` subcommand or a
+    ///      maintenance script want a single deterministic action, not
+    ///      a "maybe" depending on how many L0 files happen to exist.
+    ///   2. Runs synchronously on the caller's thread. The thread pool
+    ///      is not involved — there is no benefit to deferring work the
+    ///      caller is already blocking on.
+    ///
+    /// Threading: takes the engine's lock for the manifest snapshot
+    /// and the swap; the actual segment write happens unlocked.
+    /// Concurrent `appendPoints` calls will block briefly while the
+    /// final swap commits, but otherwise proceed normally.
+    pub fn compactAll(self: *Engine) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+
+        // Wait for any in-flight background compaction to drain. We do
+        // not want two compactions racing over the same L0 segments.
+        self.mu.lockUncancelable(io);
+        while (self.compaction_running) {
+            self.done_cv.waitUncancelable(io, &self.mu);
+        }
+        self.compaction_running = true;
+        self.mu.unlock(io);
+
+        defer {
+            self.mu.lockUncancelable(io);
+            self.compaction_running = false;
+            self.done_cv.broadcast(io);
+            self.mu.unlock(io);
+        }
+
+        try self.compactL0Forced();
+    }
+
+    /// Inner body of `compactAll`. Lifted from `compactL0` with the
+    /// threshold gate removed so the synchronous path can fold even a
+    /// single L0 segment into L1.
+    fn compactL0Forced(self: *Engine) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+
+        var l0_segs = std.ArrayList(manifest.SegmentMeta).empty;
+        defer l0_segs.deinit(self.allocator);
+        var new_seg_id: u64 = 0;
+
+        {
+            self.mu.lockUncancelable(io);
+            defer self.mu.unlock(io);
+
+            for (self.man.segments.items) |seg| {
+                if (seg.level == 0) {
+                    try l0_segs.append(self.allocator, seg);
+                }
+            }
+            if (l0_segs.items.len == 0) return;
+            new_seg_id = self.man.getNextSegmentId();
+        }
+
+        var paths = std.ArrayList([]const u8).empty;
+        defer {
+            for (paths.items) |p| self.allocator.free(p);
+            paths.deinit(self.allocator);
+        }
+
+        var min_ts: i64 = std.math.maxInt(i64);
+        var max_ts: i64 = std.math.minInt(i64);
+        for (l0_segs.items) |seg| {
+            const p = try segment.segmentPath(self.allocator, self.config.data_dir, seg.id);
+            try paths.append(self.allocator, p);
+            if (seg.min_ts < min_ts) min_ts = seg.min_ts;
+            if (seg.max_ts > max_ts) max_ts = seg.max_ts;
+        }
+
+        const out_path = try segment.segmentPath(self.allocator, self.config.data_dir, new_seg_id);
+        defer self.allocator.free(out_path);
+
+        var compactor = compaction.Compactor.init(self.allocator, self.pool);
+        try compactor.compactSegments(paths.items, out_path);
+
+        var compacted_ids = std.AutoHashMap(u64, void).init(self.allocator);
+        defer compacted_ids.deinit();
+        try compacted_ids.ensureTotalCapacity(@intCast(l0_segs.items.len));
+        for (l0_segs.items) |seg| compacted_ids.putAssumeCapacity(seg.id, {});
+
+        {
+            self.mu.lockUncancelable(io);
+            defer self.mu.unlock(io);
+
+            var new_segments = std.ArrayListUnmanaged(manifest.SegmentMeta).empty;
+            for (self.man.segments.items) |seg| {
+                if (!compacted_ids.contains(seg.id)) {
+                    try new_segments.append(self.allocator, seg);
+                }
+            }
+            try new_segments.append(self.allocator, .{
+                .id = new_seg_id,
+                .min_ts = min_ts,
+                .max_ts = max_ts,
+                .level = 1,
+            });
+
+            self.man.segments.deinit(self.allocator);
+            self.man.segments = new_segments;
+            try self.man.save();
+        }
+
+        for (paths.items) |p| {
+            std.Io.Dir.cwd().deleteFile(io, p) catch |err| {
+                self.mu.lockUncancelable(io);
+                self.recordBackgroundErrorLocked(.compaction, err);
+                self.mu.unlock(io);
+            };
+        }
+    }
+
     fn compactionWorker(ctx: *anyopaque, _: *thread_pool.TaskContext) void {
         var self: *Engine = @ptrCast(@alignCast(ctx));
         const result = self.compactL0();
@@ -1127,6 +1247,77 @@ test "Engine: lastBackgroundError is null on clean operation and drains" {
 
     // Slot must be drained after a read.
     try std.testing.expect(engine.lastBackgroundError() == null);
+}
+
+test "Engine: compactAll folds L0 segments into a single L1 segment" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 2,
+    }, &pool);
+    defer engine.deinit();
+
+    // Drive enough appends to produce two L0 segments via the
+    // auto-flush threshold (memtable holds at most 2 points).
+    try engine.appendPoints(1, &.{ .{ .ts = 1, .value = 1 }, .{ .ts = 2, .value = 2 } });
+    try engine.flush();
+    try engine.appendPoints(1, &.{ .{ .ts = 3, .value = 3 }, .{ .ts = 4, .value = 4 } });
+    try engine.flush();
+
+    try std.testing.expect(engine.man.segments.items.len >= 2);
+
+    // Forced compaction should consolidate them regardless of the
+    // background threshold.
+    try engine.compactAll();
+
+    var l0_count: usize = 0;
+    var l1_count: usize = 0;
+    for (engine.man.segments.items) |seg| {
+        if (seg.level == 0) l0_count += 1;
+        if (seg.level == 1) l1_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), l0_count);
+    try std.testing.expectEqual(@as(usize, 1), l1_count);
+
+    // Data should still be queryable after compaction.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var it = try engine.queryPoints(arena.allocator(), 1, 0, 100);
+    var count: usize = 0;
+    while (it.next()) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 4), count);
+}
+
+test "Engine: compactAll is a no-op when there are no L0 segments" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 100,
+    }, &pool);
+    defer engine.deinit();
+
+    try engine.compactAll();
+    try std.testing.expectEqual(@as(usize, 0), engine.man.segments.items.len);
 }
 
 test "Engine: error_callback fires when a background error is recorded" {

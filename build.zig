@@ -92,6 +92,15 @@ pub fn build(b: *std.Build) void {
         if (b.args) |args| run_cli.addArgs(args);
         const run_step = b.step("run", "Run the CLI (forwards trailing args after `--`)");
         run_step.dependOn(&run_cli.step);
+
+        // CLI parser / argument tests — run with `zig build test-cli`.
+        // These are pure parser tests (no engine I/O) so we keep them
+        // off the default unit suite to avoid pulling main.zig into
+        // every `zig build test` invocation.
+        const cli_tests = b.addTest(.{ .root_module = cli_module });
+        cli_tests.root_module.link_libc = true;
+        const cli_test_step = b.step("test-cli", "Run CLI argument-parser tests");
+        cli_test_step.dependOn(&b.addRunArtifact(cli_tests).step);
     }
 
     // ------------------------------------------------------------------

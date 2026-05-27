@@ -86,10 +86,20 @@ pub const Manifest = struct {
         const path_b = try std.fmt.allocPrint(allocator, "{s}/manifest.b", .{data_dir});
         defer allocator.free(path_b);
 
-        const a = readFromFile(allocator, path_a) catch null;
-        const b = readFromFile(allocator, path_b) catch null;
+        var a = readFromFile(allocator, path_a) catch null;
+        var b = readFromFile(allocator, path_b) catch null;
 
+        // Pick the higher-counter slot and free the segment list owned
+        // by the loser. Previously the loser's `segments` ArrayList
+        // leaked because `selectManifest` returned the winner by value
+        // and the loser was dropped on the floor.
         var m = selectManifest(a, b) catch Manifest{};
+        if (a) |*ma| {
+            if (ma.counter != m.counter) ma.segments.deinit(allocator);
+        }
+        if (b) |*mb| {
+            if (mb.counter != m.counter) mb.segments.deinit(allocator);
+        }
         m.allocator = allocator;
         m.data_dir = data_dir;
         return m;
