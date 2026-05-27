@@ -27,6 +27,17 @@
 //! Closes phase D of PERF_GAP_ANALYSIS / GAP-0011 for the merge
 //! iterator hot path. Wired via `zig build bench-micro-merge` (added
 //! by a later task in the bench plan).
+//!
+//! ENT-001: this bench constructs the merger via
+//! `MergeIterator.initCapacity(ctx.allocator, K)` rather than the
+//! generic `init(allocator)` constructor. K is a `comptime` parameter
+//! here, so the bench faithfully represents the "known-K" production
+//! call site (compaction over a fixed segment set). Using
+//! `initCapacity` pre-sizes both the iters list and the heap, which
+//! collapses the doubling-growth alloc trail that `addIterator` would
+//! otherwise leave in the `TrackingAllocator`. The drop in
+//! `alloc_count` (especially at K=64) is the load-bearing signal that
+//! the optimisation actually fired.
 
 const std = @import("std");
 const Io = std.Io;
@@ -116,7 +127,10 @@ fn runMerge(ctx: *framework.Context, comptime K: u32) anyerror!void {
     var its: [K]lib.iterator.SliceIterator = undefined;
     for (0..K) |k| its[k] = .{ .slice = streams[k] };
 
-    var merger = lib.iterator.MergeIterator.init(ctx.allocator);
+    // ENT-001: K is known at comptime, so use the capacity-hinted
+    // constructor to skip the doubling-growth allocation trail that
+    // `addIterator` would otherwise produce under the default `init`.
+    var merger = try lib.iterator.MergeIterator.initCapacity(ctx.allocator, K);
     defer merger.deinit();
 
     // Add iterators in ascending k order; the tie-break contract is

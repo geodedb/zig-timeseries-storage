@@ -261,7 +261,16 @@ pub const Compactor = struct {
             try stream_iters.append(self.allocator, si);
         }
 
-        var merger = iterator.MergeIterator.init(self.allocator);
+        // ENT-001: K is known up-front here — one input stream per
+        // partitioned segment in `stream_iters`. Pre-sizing both the
+        // iters list and the heap drops `addIterator` allocator
+        // pressure from O(log K) doubling reallocs to O(1) reserved
+        // capacity. For the L0 default (K=4) the difference is
+        // marginal; for broader fan-in (K up to ~64) it matters.
+        var merger = try iterator.MergeIterator.initCapacity(
+            self.allocator,
+            @intCast(stream_iters.items.len),
+        );
         defer merger.deinit();
         for (stream_iters.items) |si| {
             try merger.addIterator(si.pointIterator());

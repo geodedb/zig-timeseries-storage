@@ -205,6 +205,36 @@ pub const MergeIterator = struct {
         };
     }
 
+    /// Construct an empty `MergeIterator` pre-sized for `hint`
+    /// iterators (ENT-001).
+    ///
+    /// Pre-grows both the `iters` list and the `heap` so each
+    /// subsequent `addIterator` call lands in already-reserved
+    /// storage. Callers who know K up front — e.g. compaction over a
+    /// fixed segment set, or any other code path with a bounded
+    /// fan-in — should prefer this constructor over `init`: it drops
+    /// per-`addIterator` allocator pressure from O(log K) doubling
+    /// reallocations to O(1) up-front reservations.
+    ///
+    /// `init(allocator)` remains the correct constructor when K is
+    /// unknown (e.g. multi-segment query fan-in discovered at
+    /// runtime). Both ownership rules in the type-level doc comment
+    /// apply unchanged: the caller still owns the underlying point
+    /// data, and `deinit` must be called when the iterator was built
+    /// against a real allocator rather than an arena.
+    pub fn initCapacity(allocator: Allocator, hint: u32) !MergeIterator {
+        var iters: std.ArrayListUnmanaged(PointIterator) = .empty;
+        try iters.ensureTotalCapacity(allocator, hint);
+        var heap = HeapType.empty;
+        try heap.ensureTotalCapacity(allocator, hint);
+        return .{
+            .magic = MAGIC,
+            .allocator = allocator,
+            .iters = iters,
+            .heap = heap,
+        };
+    }
+
     pub fn deinit(self: *MergeIterator) void {
         self.iters.deinit(self.allocator);
         self.heap.deinit(self.allocator);
@@ -373,6 +403,40 @@ test "MergeIterator: K=10 streams, correct ordering and tie-break (P-ALGO-002)" 
     for (0..K) |s| its[s] = SliceIterator{ .slice = &slices[s] };
 
     var merger = MergeIterator.init(allocator);
+    defer merger.deinit();
+    for (0..K) |s| try merger.addIterator(its[s].iterator());
+
+    var expected_ts: i64 = 0;
+    var produced: usize = 0;
+    while (merger.next()) |pt| {
+        try std.testing.expectEqual(expected_ts, pt.ts);
+        expected_ts += 1;
+        produced += 1;
+    }
+    try std.testing.expectEqual(@as(usize, K * N), produced);
+}
+
+test "MergeIterator: initCapacity preserves K=10 ordering contract (ENT-001)" {
+    const allocator = std.testing.allocator;
+
+    const K = 10;
+    const N = 25;
+
+    // Same construction as the K=10 ordering test, but the merger is
+    // built via `initCapacity(allocator, K)`. The contract under test
+    // is that pre-sizing changes ONLY allocator pressure — the merge
+    // output sequence must remain bit-identical to the `init` path.
+    var slices: [K][N]types.Point = undefined;
+    for (0..K) |s| {
+        for (0..N) |n| {
+            slices[s][n] = .{ .ts = @intCast(s + n * K), .value = @intCast(s) };
+        }
+    }
+
+    var its: [K]SliceIterator = undefined;
+    for (0..K) |s| its[s] = SliceIterator{ .slice = &slices[s] };
+
+    var merger = try MergeIterator.initCapacity(allocator, K);
     defer merger.deinit();
     for (0..K) |s| try merger.addIterator(its[s].iterator());
 
