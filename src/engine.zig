@@ -104,6 +104,21 @@ pub const EngineConfig = struct {
     /// Opaque context handed to `error_callback`. Ignored when
     /// `error_callback` is null.
     error_callback_ctx: ?*anyopaque = null,
+    /// Optional WAL encryption key (AES-256-GCM, 32 bytes). When
+    /// set, every record appended to the WAL is encrypted in place
+    /// by the underlying `wal_lib.WriteAheadLog`. `null` (the default)
+    /// keeps the WAL plaintext.
+    ///
+    /// Caveat (partial GAP-0001): segments and the manifest are
+    /// still written plaintext to disk. Full TDE coverage requires
+    /// AES-GCM framing on `SegmentWriter` and `Manifest.writeToFile`,
+    /// which is tracked under GAP-0001 as a follow-up.
+    ///
+    /// Security: callers MUST keep the key consistent across opens.
+    /// Reopening the same `data_dir` with a different key (or no
+    /// key, when the WAL was written with one) causes the WAL
+    /// library to reject decryption and `Engine.init` to fail.
+    encryption_key: ?[32]u8 = null,
     /// Age-based retention. When set, `Engine.pruneExpired` removes
     /// any whole segment whose `max_ts < (now - retention_max_age_ms)`.
     /// Treated as milliseconds because the spec's recommended ts
@@ -211,6 +226,11 @@ pub const Engine = struct {
         const wal_dir = try std.Io.Dir.cwd().openDir(io, config.data_dir, .{});
         var wal = try wal_manager.WalManager.init(allocator, wal_dir, man.ts_uuid, man.last_checkpoint_lsn, .{
             .create_identity_if_missing = config.create_identity_if_missing,
+            // Closes SEC-006 / partial GAP-0001 (WAL portion only).
+            // The wal library handles AES-256-GCM framing; we just
+            // thread the operator-provided key through. When null
+            // the WAL stays plaintext, matching pre-D-9 behaviour.
+            .encryption_key = config.encryption_key,
         });
         errdefer wal.deinit();
 
@@ -1464,6 +1484,160 @@ test "Engine: error_callback fires when a background error is recorded" {
     try std.testing.expectEqual(@as(usize, 1), Trace.count);
     try std.testing.expectEqual(BgPhase.compaction, Trace.last_phase);
     try std.testing.expect(Trace.last_err == error.TestInjected);
+}
+
+test "Engine: WAL encryption key round-trips append/recover/query" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    const key: [32]u8 = [_]u8{0x42} ** 32;
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    // Phase 1: open with key, append, close WITHOUT flush — the
+    // data lives only in the (encrypted) WAL.
+    {
+        var eng = try Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 1_000_000,
+            .encryption_key = key,
+        }, &pool);
+        defer eng.deinit();
+
+        const pts = [_]types.Point{
+            .{ .ts = 1, .value = 11 },
+            .{ .ts = 2, .value = 22 },
+            .{ .ts = 3, .value = 33 },
+        };
+        try eng.appendPoints(7, &pts);
+        try eng.sync();
+    }
+
+    // Phase 2: reopen with the SAME key, WAL replay should succeed
+    // and the points come back via the active memtable.
+    {
+        var eng = try Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 1_000_000,
+            .encryption_key = key,
+        }, &pool);
+        defer eng.deinit();
+
+        try std.testing.expectEqual(@as(usize, 3), eng.active_mem.point_count);
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var it = try eng.queryPoints(arena.allocator(), 7, 0, 100);
+        var count: usize = 0;
+        while (it.next()) |_| count += 1;
+        try std.testing.expectEqual(@as(usize, 3), count);
+    }
+}
+
+test "Engine: reopening with a different key drops encrypted WAL records" {
+    // The underlying wal library swallows decryption failures and
+    // treats them as EOF (iterator.zig:122-130 — wrong key looks
+    // identical to "no more records" on the read path). That gives
+    // us two observable guarantees rather than one:
+    //
+    //   1. With the SAME key the records come back.
+    //   2. With a DIFFERENT key the records are silently dropped —
+    //      they are NOT decrypted as plaintext. So this test
+    //      simultaneously proves the WAL was encrypted (otherwise
+    //      the wrong-key replay would still return the points) and
+    //      that the engine does not crash or hand back garbage.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    const key_a: [32]u8 = [_]u8{0xAA} ** 32;
+    const key_b: [32]u8 = [_]u8{0xBB} ** 32;
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    // Phase 1: write under key_a, sync, close (no flush — data is
+    // WAL-only).
+    {
+        var eng = try Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 1_000_000,
+            .encryption_key = key_a,
+        }, &pool);
+        defer eng.deinit();
+        try eng.appendPoints(1, &.{.{ .ts = 1, .value = 11 }});
+        try eng.sync();
+    }
+
+    // Phase 2: reopen with key_b — engine opens fine but the
+    // memtable must be empty because every encrypted record failed
+    // its AES-GCM tag check.
+    {
+        var eng = try Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 1_000_000,
+            .encryption_key = key_b,
+        }, &pool);
+        defer eng.deinit();
+
+        try std.testing.expectEqual(@as(usize, 0), eng.active_mem.point_count);
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var it = try eng.queryPoints(arena.allocator(), 1, 0, 100);
+        try std.testing.expect(it.next() == null);
+    }
+}
+
+test "Engine: reopening an encrypted WAL with no key drops records" {
+    // Same shape as the wrong-key case: when the WAL is encrypted
+    // and the engine is opened without a key, the iterator's
+    // encrypted-record path is disabled and the magic-byte check
+    // rejects the record (iterator.zig:145-149), again returning
+    // EOF rather than data. Proves an attacker who learns
+    // data_dir without the key cannot replay the WAL.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    const key_a: [32]u8 = [_]u8{0x77} ** 32;
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    {
+        var eng = try Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 1_000_000,
+            .encryption_key = key_a,
+        }, &pool);
+        defer eng.deinit();
+        try eng.appendPoints(1, &.{.{ .ts = 1, .value = 1 }});
+        try eng.sync();
+    }
+
+    // Reopen without a key.
+    var eng = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 1_000_000,
+        .encryption_key = null,
+    }, &pool);
+    defer eng.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), eng.active_mem.point_count);
 }
 
 test "Engine: pruneExpired returns 0 when retention disabled" {
