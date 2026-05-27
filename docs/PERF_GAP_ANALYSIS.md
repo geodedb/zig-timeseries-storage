@@ -39,8 +39,8 @@ pass.
 | ID          | Title                                                    | Reason                                                                                                                                                                                                                                                                                                                       | Unblock criteria                                                                                                                                                                                                                                                  |
 |-------------|----------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | P-LOCK-001  | Single global RwLock decomposition                        | XL architectural refactor. Requires bench-validated proof, multi-PR effort, and a manifest copy-on-write design that touches every hot-path call site. Several mitigations already in place: manifest snapshot under shared lock + LRU SegmentReader cache (commit `6a5d087`) decouple query I/O from write/flush already.    | (1) Write lock-decomposition ADR. (2) Implement manifest COW + per-shard memtable. (3) Bench-validate ≥2× throughput on the mixed workload under contended load. (4) Land in a dedicated branch with rollback path.                                                |
-| P-LOCK-003  | flushInternal holds lock during fsync                     | Depends on P-LOCK-001 + manifest COW. Sequenced after the lock decomposition; fixing in isolation produces a torn-manifest hazard.                                                                                                                                                                                            | Same as P-LOCK-001.                                                                                                                                                                                                                                                |
-| P-LOCK-004  | compactL0 finalization holds lock during fsync            | Same dependency chain as P-LOCK-003.                                                                                                                                                                                                                                                                                          | Same as P-LOCK-001.                                                                                                                                                                                                                                                |
+| P-LOCK-003  | flushInternal holds lock during fsync                     | **Partially Closed (this session).** Conservative scope-down landed: the WAL truncate (which rewrites + fsyncs the entire WAL file) now runs OUTSIDE `engine.mu`, while the `man.save()` fsync remains inside the lock (moving it out requires manifest COW, still XL). The reorder also fixes a pre-existing durability bug: the previous code truncated the WAL BEFORE saving the manifest, which on crash between the two could lose records the flush had just absorbed into a new segment. New ordering — `addSegment` → `man.save()` (durable) → release lock → `wal.truncate` — preserves the WAL-after-manifest invariant. `deinit` now waits on the new `flush_workers_active` counter so the post-publish I/O cannot run against torn-down state. | Remaining: full manifest COW so `man.save()` fsync can also move outside the lock — same chain as P-LOCK-001.                                                                                                                                                       |
+| P-LOCK-004  | compactL0 finalization holds lock during fsync            | **No-op this session.** Compaction has no WAL truncate, so the conservative scope-down that closed half of P-LOCK-003 does not apply here — the only fsync inside the compaction publish lock is `man.save()`, and moving it out requires the same manifest COW that P-LOCK-001 / P-LOCK-003 are gated on. The heavy compactor work (open inputs, merge, write+fsync output segment) already runs OUTSIDE the lock. Doc-only update on `runMergeAndCommit` clarifies the residual cost. | Same chain as P-LOCK-001 (manifest COW so the publish-side `man.save()` fsync can move outside the lock).                                                                                                                                                          |
 | P-LOCK-005  | appendPoints holds lock during WAL pwrite                 | Depends on P-LOCK-001. Moving the WAL pwrite outside the lock without a memtable shard scheme would create lost-update races.                                                                                                                                                                                                  | Same as P-LOCK-001.                                                                                                                                                                                                                                                |
 | P-ALGO-001  | Per-series block index                                    | **Partially Closed (this session).** Backwards-compatible additive footer landed in `src/segment.zig` / `src/iterator.zig` / `src/engine.zig` — NEW segments now carry a sorted `(series_id, first_block_offset, block_count)` index after the last data block, plus a 16-byte `[FOOTER_OFFSET][FOOTER_MAGIC]` sentinel. Old segments without the footer continue to read unchanged. `Engine.querySegment` consults `SegmentReader.findSeries` and skips the whole segment when the footer proves the series is absent. Synthetic bench (1000 series × 5 blocks × 64 points, 100 random single-series lookups, ReleaseFast): full scan ≈ 328 ms total → footer-indexed ≈ 0.39 ms total (~850× speedup). Migration tooling for existing on-disk segments + manifest-level Bloom/min-max sidecars remain deferred. | Remaining: (1) Optional migration tool to retrofit footers onto existing segments. (2) Manifest-level Bloom filter for series presence. (3) Manifest-level min/max sidecars.                                                                                       |
 | P-COMP-002  | L1→L2 tiered compaction                                    | Depends on P-ALGO-001 + lock decomposition. Without the per-series index, L2 compaction is no cheaper than rewriting every L1 segment in place, which is what the engine already does on full compaction.                                                                                                                     | Same chain as P-ALGO-001.                                                                                                                                                                                                                                          |
@@ -72,8 +72,8 @@ pass.
 
 ### Deferred (Phase E XL or won't-do)
 
-Won't-do: P-LOCK-001, P-LOCK-003, P-LOCK-004, P-LOCK-005, P-COMP-002.
-Partially Closed: P-ALGO-001 (additive footer landed; migration tooling + manifest Bloom remain).
+Won't-do: P-LOCK-001, P-LOCK-005, P-COMP-002.
+Partially Closed: P-ALGO-001 (additive footer landed; migration tooling + manifest Bloom remain), P-LOCK-003 (WAL truncate fsync out of `engine.mu`; manifest fsync still inside, gated on manifest COW), P-LOCK-004 (no scope-down possible without manifest COW — doc-only this session).
 Remaining open (no-ID, deferred): HashMap defaults (rank 31), Allocator hygiene (rank 32).
 
 ### Status Legend
@@ -313,23 +313,23 @@ out of `init()`.
 
 ### P-LOCK-003 — `flushInternal` holds exclusive lock during fsync-heavy work
 
-**Status: Deferred (Phase E XL)** -- depends on P-LOCK-001 manifest COW.
+**Status: Partially Closed (this session)** -- conservative scope-down landed;
+full `man.save()` move-out still depends on P-LOCK-001 manifest COW.
 
 - **Category:** Concurrency / lock-coupled fsync
 - **Severity:** P1
 - **PerfScore:** 80 (Impact 4 × Likelihood 5 × 4)
 - **Confidence:** confirmed
 - **Hot path:** flush
-- **Evidence:** `src/engine.zig:235-251`. Inside `self.lock.lockUncancelable(io)`: `self.man.addSegment`, `self.wal.truncate(...)` (rewrite + fsync), `self.man.save()` (fsync). 10-50ms blackout window per flush.
-- **Root cause:** WAL truncation and manifest save are durability operations; both involve fsync. Holding the writer lock during fsync stalls every other op.
-- **Expected delta if fixed:** Writer pause window collapses from 10-50ms to <1ms.
-- **Recommended fix:**
-  - Stage manifest changes under exclusive lock; release lock; perform `wal.truncate` + `man.save` lock-free; reacquire briefly to publish the new manifest pointer.
-  - Pair with COW manifest from P-LOCK-001.
+- **Evidence:** `src/engine.zig:flushInternal`. Before this session: `self.man.addSegment` + `self.wal.truncate(...)` (rewrite + fsync) + `self.man.save()` (fsync) all ran inside `engine.mu`. After this session: `wal.truncate` (the heavier of the two fsyncs, since it rewrites the entire WAL file via tmp + fsync + rename) now runs OUTSIDE `engine.mu`. `man.save()` still runs inside the lock.
+- **Root cause:** WAL truncation and manifest save are durability operations; both involve fsync. The WAL fsync is now lock-free (WAL has its own internal mutex per ENT-006). The manifest fsync remains inside the engine lock until manifest COW lands — moving the manifest save out without COW would race against concurrent `addSegment` callers and could publish a torn segment list.
+- **Concurrent durability bug fixed by the reorder:** the previous code did `wal.truncate(lsn)` BEFORE `man.save()`. A crash between those two would leave the on-disk manifest pointing at the OLD `last_checkpoint_lsn` while the WAL had been compacted past the new one — recovery would start from the old LSN, look for records that no longer exist in the WAL, and lose the segment's data even though the segment file itself was on disk. The new ordering (manifest durable → release lock → WAL truncate) preserves the WAL-after-manifest invariant under any crash window.
+- **Worker-lifetime invariant:** a new `flush_workers_active` counter ensures `Engine.deinit` waits for the post-publish I/O (WAL truncate + compaction trigger) to drain before tearing down `self.wal` / `self.man`. Without that, the worker could touch freed state after the lock-clear of `flushing_mem` woke `deinit`.
+- **Remaining work:** full `man.save()` move-out via manifest COW (stage in inactive slot, publish under brief reacquire). Same chain as P-LOCK-001.
 - **Validation plan:**
   - Bench: continuous write at 50k pts/s with `max_memtable_points` tuned to cause flushes every ~5s. Histogram of append latencies; verify no 10ms tail spikes during flush.
-- **Rollout risk:** Medium. Crash-recovery semantics must remain: WAL not truncated until manifest durable.
-- **Affected paths:** `engine.zig:flushInternal`.
+- **Rollout risk:** Medium. Crash-recovery semantics preserved by the new ordering (manifest durable BEFORE WAL truncate).
+- **Affected paths:** `engine.zig:flushInternal`, `engine.zig:flushWorker`, `engine.zig:deinit`.
 - **Platform issue:** TBD (token write access required).
 
 ---
@@ -439,19 +439,23 @@ correct concurrency with the compaction lock.
 
 ### P-LOCK-004 — `compactL0` finalization holds exclusive lock during manifest fsync
 
-**Status: Deferred (Phase E XL)** -- same pattern as P-LOCK-003; depends on P-LOCK-001 COW.
+**Status: Partially Closed (this session — doc-only)** -- compaction has no
+WAL truncate, so the conservative scope-down that closed half of P-LOCK-003
+does not apply; the residual `man.save()` fsync move-out depends on the same
+manifest COW as P-LOCK-001 / P-LOCK-003.
 
 - **Category:** Concurrency
 - **Severity:** P1
 - **PerfScore:** 64
 - **Confidence:** confirmed
 - **Hot path:** compact
-- **Evidence:** `src/engine.zig:333-358`. Inside writer lock: rebuild segment list, `man.save()` (fsync).
-- **Root cause:** Same pattern as P-LOCK-003 for compaction.
-- **Expected delta:** No flush/append stalls during compaction publish (currently each compaction finalization adds a ~10-50ms window).
-- **Recommended fix:** Stage the new segment list, release lock, fsync manifest, reacquire briefly to publish.
+- **Evidence:** `src/engine.zig:runMergeAndCommit`. Inside `engine.mu`: segment-list rebuild + `man.save()` (fsync). All other compaction work (open inputs, merge, write+fsync output segment) already runs OUTSIDE the lock.
+- **Root cause:** Same pattern as P-LOCK-003 for compaction, minus the WAL piece. The manifest fsync cannot move out without manifest COW: any release-and-reacquire window would let a concurrent `addSegment` (from a parallel flush) interleave between our snapshot of the segment list and our publish swap, producing a torn manifest that drops the flush's new segment.
+- **Expected delta if fully closed:** No flush/append stalls during compaction publish (currently each compaction finalization adds a ~10-50ms window).
+- **Recommended fix:** Stage the new segment list, release lock, fsync manifest via a cloned manifest writing to the inactive ping-pong slot, reacquire briefly to publish (advance the in-memory counter + segment list under the lock). Same manifest-COW surface as P-LOCK-001 / P-LOCK-003.
 - **Validation plan:** Same as P-LOCK-003; measure append latency during a compaction event.
 - **Rollout risk:** Same as P-LOCK-003.
+- **Affected paths (this session — doc-only):** `engine.zig:runMergeAndCommit` (added doc-comment explaining residual cost is gated on manifest COW).
 - **Platform issue:** TBD (token write access required).
 
 ---

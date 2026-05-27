@@ -799,6 +799,20 @@ pub const Engine = struct {
     /// fetches across this file. Closes P-IO-004.
     io: std.Io,
     compaction_running: bool = false,
+    /// Number of flush worker invocations that have entered
+    /// `flushWorker` and not yet returned. Distinct from
+    /// `flushing_mem` — that slot is cleared inside the lock as
+    /// soon as the manifest commit publishes the segment, but the
+    /// worker MAY still be running post-publish I/O outside the
+    /// lock (P-LOCK-003 WAL truncate, `triggerCompaction`). Used by
+    /// `deinit` to wait for the worker to fully exit before
+    /// tearing down `self.wal` / `self.man`.
+    ///
+    /// Concurrency: incremented at the top of `flushWorker` under
+    /// `self.mu`, decremented at the bottom of `flushWorker` under
+    /// `self.mu`, broadcast on `done_cv` so `deinit` wakes when it
+    /// drains to zero.
+    flush_workers_active: u32 = 0,
     /// Most recent error observed by a background flush or compaction
     /// worker. Cleared by `lastBackgroundError`. Workers set this under
     /// `mu` so concurrent reads always observe a consistent value;
@@ -1278,8 +1292,18 @@ pub const Engine = struct {
 
         // Wait for all background tasks to finish. Park on the condition
         // variable so we burn no CPU; workers broadcast it as they
-        // clear `flushing_mem` / `compaction_running`.
-        while (self.flushing_mem != null or self.compaction_running) {
+        // clear `flushing_mem` / `compaction_running` /
+        // `flush_workers_active`.
+        //
+        // `flush_workers_active` matters here because P-LOCK-003
+        // moves the WAL truncate fsync OUTSIDE the engine lock —
+        // `flushing_mem` is cleared as soon as the manifest commit
+        // publishes the new segment, but the worker is still
+        // running post-publish I/O (the truncate + the compaction
+        // trigger) after that point. Waiting on
+        // `flush_workers_active == 0` ensures the worker has fully
+        // exited before we tear down `self.wal` / `self.man`.
+        while (self.flushing_mem != null or self.compaction_running or self.flush_workers_active > 0) {
             self.done_cv.waitUncancelable(io, &self.mu);
         }
 
@@ -1609,9 +1633,20 @@ pub const Engine = struct {
 
     fn flushWorker(ctx: *anyopaque, _: *thread_pool.TaskContext) void {
         var self = safety.castCtx(Engine, ctx);
+        const io = self.io;
+
+        // P-LOCK-003: count the worker as active across the entire
+        // body (including the post-publish I/O that runs OUTSIDE
+        // `engine.mu`). `deinit` parks on `flush_workers_active == 0`
+        // so it never races with the trailing `wal.truncate` /
+        // `triggerCompaction` calls that touch `self.wal` /
+        // `self.man` after the lock has been released.
+        self.mu.lockUncancelable(io);
+        self.flush_workers_active += 1;
+        self.mu.unlock(io);
+
         const t_start = nowMonotonicNs();
         self.flushInternal() catch |err| {
-            const io = self.io;
             self.mu.lockUncancelable(io);
             if (self.flushing_mem) |fm| {
                 fm.deinit();
@@ -1629,6 +1664,11 @@ pub const Engine = struct {
             self.done_cv.broadcast(io);
             self.mu.unlock(io);
         };
+
+        self.mu.lockUncancelable(io);
+        self.flush_workers_active -= 1;
+        self.done_cv.broadcast(io);
+        self.mu.unlock(io);
     }
 
     /// Store `err` as the engine's most recent background-worker
@@ -1734,9 +1774,16 @@ pub const Engine = struct {
     ///
     /// If the active memtable is empty this is a no-op. Otherwise, the
     /// memtable is rotated into the flushing slot, a flush job is
-    /// submitted, and the call blocks until `flushing_mem` is cleared
-    /// (segment header written, manifest updated, WAL truncated past
-    /// the checkpoint).
+    /// submitted, and the call blocks until the segment has been
+    /// written and the manifest has been fsynced (which is the
+    /// durability barrier — see Q-REL-008 / P-IO-003). The WAL
+    /// truncate that reclaims the now-redundant log space runs
+    /// asynchronously AFTER the manifest commit (P-LOCK-003) and
+    /// MAY still be in flight when `flush()` returns. This is
+    /// crash-safe: the manifest is the source of truth for
+    /// durability, so recovery after a crash between manifest
+    /// commit and WAL truncate simply skips the now-stale records
+    /// past `last_checkpoint_lsn`.
     ///
     /// Threading: safe to call concurrently with other engine methods,
     /// but the engine serialises flushes one at a time — overlapping
@@ -1903,6 +1950,35 @@ pub const Engine = struct {
         // landed on disk (Q-REL-008 / P-IO-003).
         try writer.sync();
 
+        // P-LOCK-003 conservative scope-down: keep the manifest fsync
+        // inside `engine.mu` (it mutates `self.man.segments` and
+        // `self.man.counter` — both protected by the engine lock and
+        // would require a manifest COW refactor to safely move out),
+        // but lift the WAL truncate (and its fsync) OUT of the lock.
+        // The WAL has its own internal mutex (ENT-006), so its
+        // truncate is safe to call lock-free, and its fsync no
+        // longer holds the engine lock against concurrent appends or
+        // queries.
+        //
+        // Durability ordering: manifest MUST be durable BEFORE the
+        // WAL is truncated. The previous code violated this — it
+        // called `wal.truncate` BEFORE `man.save`, so a crash
+        // between the two would lose the records covered by the new
+        // segment because the manifest on disk would still point at
+        // the OLD last_checkpoint_lsn while the WAL had already
+        // dropped them. With the truncate moved AFTER the save and
+        // AFTER the engine lock is released, a crash between
+        // `man.save` returning and `wal.truncate` running merely
+        // leaves stale records in the WAL past
+        // `last_checkpoint_lsn`; recovery starts from
+        // `last_checkpoint_lsn + 1` and skips them, so no data is
+        // lost. The next successful flush will reclaim the space.
+        //
+        // We snapshot the checkpoint LSN inside the lock so the
+        // unlock-side truncate uses exactly the value the manifest
+        // recorded — concurrent appends past that point are
+        // intentionally preserved.
+        var checkpoint_lsn: u64 = 0;
         {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
@@ -1915,7 +1991,7 @@ pub const Engine = struct {
             });
 
             self.man.last_checkpoint_lsn = self.wal.currentLsn();
-            try self.wal.truncate(self.man.last_checkpoint_lsn);
+            checkpoint_lsn = self.man.last_checkpoint_lsn;
             try self.man.save();
 
             mem.deinit();
@@ -1926,6 +2002,21 @@ pub const Engine = struct {
             _ = self.counters.flush_total_ns.fetchAdd(nowMonotonicNs() - t_start, .release);
             self.done_cv.broadcast(io);
         }
+
+        // P-LOCK-003: WAL truncate runs OUTSIDE engine.mu. The
+        // manifest above already records `checkpoint_lsn` as the new
+        // durable boundary, so a failure here is non-fatal — it just
+        // leaves space-reclaimable WAL bytes on disk. Surface the
+        // failure through the background-error pipeline rather than
+        // returning it, so the flush worker's error-path handler
+        // does not double-bump the counters we already incremented
+        // and does not try to deinit `flushing_mem` (which we
+        // already cleared inside the lock).
+        self.wal.truncate(checkpoint_lsn) catch |err| {
+            self.mu.lockUncancelable(io);
+            self.recordBackgroundErrorLocked(.flush, err);
+            self.mu.unlock(io);
+        };
 
         self.triggerCompaction() catch |err| {
             // A failed compaction trigger is not fatal — the flush
@@ -2155,6 +2246,20 @@ pub const Engine = struct {
     /// Run the actual merge and commit the result to the manifest.
     /// Hoisted out of `compactL0` / `compactL0Forced` so both paths
     /// share the same disk I/O, manifest swap, and cleanup body.
+    ///
+    /// P-LOCK-004 (Partial): the heavy work — opening input readers,
+    /// running the compactor, writing+fsyncing the output segment —
+    /// already runs OUTSIDE `engine.mu`. The residual cost inside
+    /// the lock is the segment-list swap plus `man.save()` (a tmp-
+    /// write + fsync + rename of the manifest slot). Moving the
+    /// `man.save()` fsync outside the lock requires a manifest COW
+    /// refactor (clone-and-publish) so the on-disk swap can happen
+    /// against a stable local snapshot while concurrent
+    /// flush/prune/compaction still see a coherent in-memory
+    /// manifest. That COW is deferred (still XL; documented under
+    /// P-LOCK-001 in `docs/PERF_GAP_ANALYSIS.md`); when it lands,
+    /// the swap-and-save block below can split into two phases —
+    /// stage outside the lock, publish under a brief reacquire.
     fn runMergeAndCommit(
         self: *Engine,
         io: std.Io,
