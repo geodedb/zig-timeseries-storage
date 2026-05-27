@@ -21,6 +21,23 @@ const wal_record = @import("wal_record.zig");
 /// compaction work over enough memtable flushes to matter.
 const kL0CompactionThreshold: usize = 4;
 
+/// Monotonic-clock nanoseconds helper used by the observability
+/// counters (P-OBS-001). Uses the `.awake` clock (Linux:
+/// `CLOCK_MONOTONIC`) so NTP slews and wall-clock adjustments do
+/// not produce negative deltas that would underflow the unsigned
+/// counters.
+///
+/// Each call is a `clock_gettime` (~30 ns on x86_64) — cheap enough
+/// that we can stamp every `appendPoints`, `queryPoints`,
+/// `flushInternal`, and compaction boundary without measurable
+/// overhead. The same helper is used by the bench framework, so the
+/// engine and the bench numbers share a clock source.
+fn nowMonotonicNs() u64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const ts = std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+    return if (ts < 0) 0 else @intCast(ts);
+}
+
 /// Engine-level error set, unioning the named sets from each module
 /// the engine builds on plus a handful of engine-only conditions.
 ///
@@ -139,6 +156,74 @@ pub const EngineConfig = struct {
 /// Backwards-compatible alias. New code should use `EngineConfig`.
 pub const Config = EngineConfig;
 
+/// Point-in-time snapshot of the engine's observability counters.
+///
+/// Closes P-OBS-001 (and completes the metrics-counters portion of
+/// SEC-014). Counters cover the four hot paths — ingest, query,
+/// flush, compaction — plus two reliability flags (`wal_records_dropped`
+/// and `segment_integrity_failures`) that operators most often
+/// reach for when triaging.
+///
+/// Every count and total is read while holding `Engine.mu`, so the
+/// snapshot is internally consistent — `*_total_ns / *_count` always
+/// yields the average latency for the same window. The snapshot is a
+/// value type; callers can hold onto it across engine ops without
+/// fear of mutation.
+///
+/// All durations are in nanoseconds, sourced from the `.awake`
+/// monotonic clock (see `nowMonotonicNs`). The clock is cheap enough
+/// (~30 ns per read) that instrumenting every `appendPoints` call is
+/// unmeasurable next to the WAL fsync amortised cost.
+pub const StatsSnapshot = struct {
+    /// Number of completed `appendPoints` calls (regardless of point
+    /// count). Bumps after the memtable insert succeeds; failed calls
+    /// are not counted.
+    append_count: u64,
+    /// Total number of points accepted across all `appendPoints`
+    /// calls. Roughly correlates with ingest throughput.
+    append_points: u64,
+    /// Cumulative wall time spent inside `appendPoints` (including
+    /// WAL append, memtable insert, and any flush-trigger work).
+    append_total_ns: u64,
+
+    /// Number of completed `queryPoints` calls. A call is counted on
+    /// successful return regardless of the number of points yielded.
+    query_count: u64,
+    /// Cumulative wall time spent inside `queryPoints` (planning +
+    /// disk reads + decode + iterator construction). Iteration time
+    /// AFTER the call returns is not measured here.
+    query_total_ns: u64,
+    /// Total number of points returned across all `queryPoints`
+    /// calls (counted by the engine as it filters and copies blocks
+    /// into the merge iterator). Useful for read-throughput metrics.
+    query_points_returned: u64,
+
+    /// Number of memtable -> segment flushes that completed (success
+    /// OR failure). Increments inside `flushInternal` just before
+    /// `done_cv.broadcast`.
+    flush_count: u64,
+    /// Cumulative wall time spent inside `flushInternal` (the
+    /// per-flush worker body — encode, write, fsync, manifest commit).
+    flush_total_ns: u64,
+
+    /// Number of L0 -> L1 compaction passes that completed (success
+    /// OR failure). Increments inside `compactL0` / `compactL0Forced`.
+    compaction_count: u64,
+    /// Cumulative wall time spent inside compaction worker bodies.
+    compaction_total_ns: u64,
+
+    /// Number of WAL records the engine has explicitly dropped (e.g.
+    /// payload-level malformed records in `applyWalRecord`). Hard
+    /// failures bubble up as errors; this counter only tracks the
+    /// silent drop path.
+    wal_records_dropped: u64,
+    /// Number of segment-integrity failures (`SegmentFileMissing`,
+    /// `SegmentCorrupted`, `BlockCorrupted`) the engine has reported
+    /// via the background error pipeline. Bumps on every recorded
+    /// failure, NOT every read attempt.
+    segment_integrity_failures: u64,
+};
+
 /// LSM-style time-series storage engine.
 ///
 /// Every mutation is appended to a CRC32C-protected write-ahead log and
@@ -210,6 +295,24 @@ pub const Engine = struct {
     /// Other call sites MUST NOT touch this buffer. Closes P-MEM-003.
     append_payload_buf: std.ArrayListUnmanaged(u8) = .empty,
 
+    /// Engine-wide latency / throughput counters. Updated under
+    /// `self.mu` by every hot path (append, query, flush, compaction).
+    /// Read out via `stats()`. Closes P-OBS-001.
+    counters: StatsSnapshot = .{
+        .append_count = 0,
+        .append_points = 0,
+        .append_total_ns = 0,
+        .query_count = 0,
+        .query_total_ns = 0,
+        .query_points_returned = 0,
+        .flush_count = 0,
+        .flush_total_ns = 0,
+        .compaction_count = 0,
+        .compaction_total_ns = 0,
+        .wal_records_dropped = 0,
+        .segment_integrity_failures = 0,
+    },
+
     /// Open (or create) an engine over `config.data_dir`.
     ///
     /// On open, the engine loads the manifest (if present), opens the
@@ -236,12 +339,17 @@ pub const Engine = struct {
         var man = try manifest.Manifest.init(allocator, config.data_dir);
         errdefer man.deinit();
 
+        // P-OBS-001: track integrity failures encountered during
+        // segment verification so we can surface them in the first
+        // stats() snapshot.
+        var integrity_failures: u64 = 0;
+
         // Verify the on-disk segments referenced by the manifest before
         // we accept any traffic. In `fail_closed` mode any missing or
         // corrupt segment aborts the open; in `salvage` mode the
         // segment is silently dropped from the in-memory manifest so
         // the engine can come up. Closes GAP-0006.
-        try verifySegments(allocator, &man, config.data_dir, config.wal_recovery);
+        try verifySegments(allocator, &man, config.data_dir, config.wal_recovery, &integrity_failures);
 
         const io = std.Io.Threaded.global_single_threaded.io();
         const wal_dir = try std.Io.Dir.cwd().openDir(io, config.data_dir, .{});
@@ -258,6 +366,9 @@ pub const Engine = struct {
         var mem = memtable.Memtable.init(allocator, config.max_memtable_points);
         errdefer mem.deinit();
 
+        // P-OBS-001: counter accumulates WAL drops during replay.
+        var wal_drops: u64 = 0;
+
         // Replay WAL into the memtable. The default `fail_closed`
         // policy uses `forEachFromStrict`, which surfaces CRC32C
         // checksum mismatches and deserialisation errors instead of
@@ -265,7 +376,7 @@ pub const Engine = struct {
         // under GAP-0005 / SEC-002 / SEC-003 / Q-REL-001). Operators
         // who explicitly accept lossy recovery can opt in with
         // `wal_recovery = .salvage`.
-        try replayWalIntoMemtable(allocator, &wal, &mem, man.last_checkpoint_lsn + 1, config.wal_recovery);
+        try replayWalIntoMemtable(allocator, &wal, &mem, man.last_checkpoint_lsn + 1, config.wal_recovery, &wal_drops);
 
         return Engine{
             .allocator = allocator,
@@ -274,6 +385,20 @@ pub const Engine = struct {
             .man = man,
             .active_mem = mem,
             .pool = pool,
+            .counters = .{
+                .append_count = 0,
+                .append_points = 0,
+                .append_total_ns = 0,
+                .query_count = 0,
+                .query_total_ns = 0,
+                .query_points_returned = 0,
+                .flush_count = 0,
+                .flush_total_ns = 0,
+                .compaction_count = 0,
+                .compaction_total_ns = 0,
+                .wal_records_dropped = wal_drops,
+                .segment_integrity_failures = integrity_failures,
+            },
         };
     }
 
@@ -292,6 +417,7 @@ pub const Engine = struct {
         man: *manifest.Manifest,
         data_dir: []const u8,
         policy: WalRecoveryPolicy,
+        integrity_counter: ?*u64,
     ) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
 
@@ -308,6 +434,7 @@ pub const Engine = struct {
                 kept.appendAssumeCapacity(seg);
                 continue;
             } else |err| {
+                if (integrity_counter) |c| c.* += 1;
                 switch (policy) {
                     .fail_closed => return err,
                     .salvage => {
@@ -384,15 +511,17 @@ pub const Engine = struct {
         mem: *memtable.Memtable,
         start_lsn: u64,
         policy: WalRecoveryPolicy,
+        dropped_counter: ?*u64,
     ) !void {
         switch (policy) {
             .fail_closed => {
                 const ReplayCtx = struct {
                     allocator: Allocator,
                     mem: *memtable.Memtable,
+                    dropped: ?*u64,
 
                     fn apply(self: @This(), rec: *const wal_record.WalRecord) anyerror!void {
-                        try applyWalRecord(self.allocator, self.mem, rec);
+                        try applyWalRecord(self.allocator, self.mem, rec, self.dropped);
                     }
                 };
                 var failure: ?wal_manager.ReplayFailure = null;
@@ -400,7 +529,7 @@ pub const Engine = struct {
                     start_lsn,
                     allocator,
                     &failure,
-                    ReplayCtx{ .allocator = allocator, .mem = mem },
+                    ReplayCtx{ .allocator = allocator, .mem = mem, .dropped = dropped_counter },
                     ReplayCtx.apply,
                 ) catch |err| return err;
             },
@@ -411,7 +540,7 @@ pub const Engine = struct {
                     allocator.free(records);
                 }
                 for (records) |*r| {
-                    try applyWalRecord(allocator, mem, r);
+                    try applyWalRecord(allocator, mem, r, dropped_counter);
                 }
             },
         }
@@ -425,13 +554,22 @@ pub const Engine = struct {
     /// the original recovery behaviour; the strict path validates the
     /// envelope (header + CRC32C) but cannot diagnose payload-level
     /// corruption short of an inner re-encoding.
+    ///
+    /// `dropped_counter` (optional) is incremented for every payload
+    /// silently skipped, feeding the `wal_records_dropped` observability
+    /// counter (P-OBS-001). Non-`append_points` records do NOT count
+    /// as drops — they are deliberately ignored, not dropped.
     fn applyWalRecord(
         allocator: Allocator,
         mem: *memtable.Memtable,
         rec: *const wal_record.WalRecord,
+        dropped_counter: ?*u64,
     ) !void {
         if (rec.record_type != .append_points) return;
-        if (rec.payload.len < 16 or (rec.payload.len - 16) % 16 != 0) return;
+        if (rec.payload.len < 16 or (rec.payload.len - 16) % 16 != 0) {
+            if (dropped_counter) |c| c.* += 1;
+            return;
+        }
 
         const series_id = std.mem.readInt(u128, rec.payload[0..16], .little);
         const num_points = (rec.payload.len - 16) / 16;
@@ -524,6 +662,11 @@ pub const Engine = struct {
         // allocation an external caller can force.
         if (points.len > limits.MAX_APPEND_BATCH_POINTS) return error.BatchTooLarge;
 
+        // P-OBS-001: time the entire critical section. nowMonotonicNs
+        // is ~30 ns on commodity hardware — negligible next to the
+        // WAL fsync this call ultimately amortises into.
+        const t_start = nowMonotonicNs();
+
         const io = std.Io.Threaded.global_single_threaded.io();
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
@@ -537,6 +680,13 @@ pub const Engine = struct {
         _ = try self.appendToWalLocked(payload);
         try self.active_mem.insert(series_id, points);
         try self.maybeTriggerFlushLocked(io);
+
+        // Counters are bumped only on a clean return; failed calls
+        // do not pollute the latency average. We are still under the
+        // engine lock here.
+        self.counters.append_count += 1;
+        self.counters.append_points += @intCast(points.len);
+        self.counters.append_total_ns += nowMonotonicNs() - t_start;
     }
 
     /// Serialise `(series_id, points)` into the engine-owned payload
@@ -613,6 +763,7 @@ pub const Engine = struct {
 
     fn flushWorker(ctx: *anyopaque, _: *thread_pool.TaskContext) void {
         var self = safety.castCtx(Engine, ctx);
+        const t_start = nowMonotonicNs();
         self.flushInternal() catch |err| {
             const io = std.Io.Threaded.global_single_threaded.io();
             self.mu.lockUncancelable(io);
@@ -620,8 +771,11 @@ pub const Engine = struct {
             self.flushing_mem = null;
             // A failed flush still counts as a completed scheduling
             // round so flush() callers are not stuck waiting forever
-            // for a flush that errored out.
+            // for a flush that errored out. Counter likewise bumps —
+            // operators want to see failed flushes in the rate too.
             self.flushes_completed += 1;
+            self.counters.flush_count += 1;
+            self.counters.flush_total_ns += nowMonotonicNs() - t_start;
             self.recordBackgroundErrorLocked(.flush, err);
             self.done_cv.broadcast(io);
             self.mu.unlock(io);
@@ -632,8 +786,23 @@ pub const Engine = struct {
     /// failure and dispatch it to `error_callback` (if configured).
     /// Caller MUST hold `self.mu`. The callback runs under the lock
     /// — callers MUST NOT re-enter the engine from the callback.
+    ///
+    /// Side effect: integrity-class errors (segment file missing,
+    /// segment corrupted, block corrupted) bump
+    /// `counters.segment_integrity_failures` so operators can spot a
+    /// growing corruption rate without filtering on the error
+    /// callback. Closes the metrics-counters slice of P-OBS-001.
     fn recordBackgroundErrorLocked(self: *Engine, phase: BgPhase, err: anyerror) void {
         self.last_background_error = err;
+        switch (err) {
+            error.SegmentFileMissing,
+            error.SegmentCorrupted,
+            error.BlockCorrupted,
+            error.InvalidMagic,
+            error.InvalidFile,
+            => self.counters.segment_integrity_failures += 1,
+            else => {},
+        }
         if (self.config.error_callback) |cb| {
             // The callback ctx may legitimately be null when the
             // caller has no per-instance state to thread through;
@@ -642,6 +811,25 @@ pub const Engine = struct {
             const ctx_ptr = self.config.error_callback_ctx orelse @as(*anyopaque, @ptrCast(self));
             cb(ctx_ptr, phase, err);
         }
+    }
+
+    /// Atomic snapshot of the engine's observability counters
+    /// (P-OBS-001). All sub-counters are read together under
+    /// `self.mu`, so derived ratios (`*_total_ns / *_count`) are
+    /// computed against the same window.
+    ///
+    /// Counter semantics are documented on `StatsSnapshot` itself.
+    /// Returning a value type avoids any aliasing or post-snapshot
+    /// mutation: callers can stash, diff, or transport the result
+    /// without re-acquiring the lock.
+    ///
+    /// Threading: takes the engine's lock; safe to call concurrently
+    /// with other engine methods. Overhead is negligible (a struct copy).
+    pub fn stats(self: *Engine) StatsSnapshot {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        return self.counters;
     }
 
     /// Drain and return the most recent background-worker error
@@ -732,6 +920,10 @@ pub const Engine = struct {
         var min_ts: i64 = std.math.maxInt(i64);
         var max_ts: i64 = std.math.minInt(i64);
 
+        // P-OBS-001: time the entire flush worker body so the average
+        // includes encode + write + fsync + manifest commit.
+        const t_start = nowMonotonicNs();
+
         self.mu.lockUncancelable(io);
         var mem = self.flushing_mem orelse return;
         self.mu.unlock(io);
@@ -741,6 +933,8 @@ pub const Engine = struct {
             mem.deinit();
             self.flushing_mem = null;
             self.flushes_completed += 1;
+            self.counters.flush_count += 1;
+            self.counters.flush_total_ns += nowMonotonicNs() - t_start;
             self.done_cv.broadcast(io);
             self.mu.unlock(io);
             return;
@@ -804,6 +998,8 @@ pub const Engine = struct {
             mem.deinit();
             self.flushing_mem = null;
             self.flushes_completed += 1;
+            self.counters.flush_count += 1;
+            self.counters.flush_total_ns += nowMonotonicNs() - t_start;
             self.done_cv.broadcast(io);
         }
 
@@ -872,8 +1068,15 @@ pub const Engine = struct {
         self.compaction_running = true;
         self.mu.unlock(io);
 
+        // P-OBS-001: time the forced compaction body. Same accounting
+        // policy as the background worker — counter bumps regardless
+        // of success / failure.
+        const t_start = nowMonotonicNs();
+
         defer {
             self.mu.lockUncancelable(io);
+            self.counters.compaction_count += 1;
+            self.counters.compaction_total_ns += nowMonotonicNs() - t_start;
             self.compaction_running = false;
             self.done_cv.broadcast(io);
             self.mu.unlock(io);
@@ -964,12 +1167,17 @@ pub const Engine = struct {
 
     fn compactionWorker(ctx: *anyopaque, _: *thread_pool.TaskContext) void {
         var self = safety.castCtx(Engine, ctx);
+        const t_start = nowMonotonicNs();
         const result = self.compactL0();
         const io = std.Io.Threaded.global_single_threaded.io();
         self.mu.lockUncancelable(io);
         if (result) |_| {} else |err| {
             self.recordBackgroundErrorLocked(.compaction, err);
         }
+        // Always count completed compactions — success or failure —
+        // so the rate reflects work attempted, not just successful work.
+        self.counters.compaction_count += 1;
+        self.counters.compaction_total_ns += nowMonotonicNs() - t_start;
         self.compaction_running = false;
         self.done_cv.broadcast(io);
         self.mu.unlock(io);
@@ -1185,21 +1393,30 @@ pub const Engine = struct {
     pub fn queryPoints(self: *Engine, arena: Allocator, series_id: types.SeriesId, start_ts: i64, end_ts: i64) !*iterator.MergeIterator {
         const io = std.Io.Threaded.global_single_threaded.io();
 
+        // P-OBS-001: latency timer. Covers iterator setup +
+        // memtable scan + every segment open/decode. Iteration
+        // performed by the caller after we return is NOT included.
+        const t_start = nowMonotonicNs();
+        var points_added: u64 = 0;
+
         const merge_it = try arena.create(iterator.MergeIterator);
         merge_it.* = iterator.MergeIterator.init(arena);
 
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
 
-        try queryMemtable(arena, &self.active_mem, series_id, start_ts, end_ts, merge_it);
+        try queryMemtable(arena, &self.active_mem, series_id, start_ts, end_ts, merge_it, &points_added);
         if (self.flushing_mem) |*mem| {
-            try queryMemtable(arena, mem, series_id, start_ts, end_ts, merge_it);
+            try queryMemtable(arena, mem, series_id, start_ts, end_ts, merge_it, &points_added);
         }
         for (self.man.segments.items) |seg| {
             if (seg.min_ts > end_ts or seg.max_ts < start_ts) continue;
-            try self.querySegment(arena, seg, series_id, start_ts, end_ts, merge_it);
+            try self.querySegment(arena, seg, series_id, start_ts, end_ts, merge_it, &points_added);
         }
 
+        self.counters.query_count += 1;
+        self.counters.query_points_returned += points_added;
+        self.counters.query_total_ns += nowMonotonicNs() - t_start;
         return merge_it;
     }
 
@@ -1218,6 +1435,7 @@ pub const Engine = struct {
         start_ts: i64,
         end_ts: i64,
         merge_it: *iterator.MergeIterator,
+        points_added: *u64,
     ) !void {
         const pts = mem.getSortedPoints(series_id);
         if (pts.len == 0) return;
@@ -1229,6 +1447,7 @@ pub const Engine = struct {
         }
         if (filtered_pts.items.len == 0) return;
 
+        points_added.* += filtered_pts.items.len;
         var slice_it = try arena.create(iterator.SliceIterator);
         slice_it.* = .{ .slice = try filtered_pts.toOwnedSlice(arena) };
         try merge_it.addIterator(slice_it.iterator());
@@ -1258,6 +1477,7 @@ pub const Engine = struct {
         start_ts: i64,
         end_ts: i64,
         merge_it: *iterator.MergeIterator,
+        points_added: *u64,
     ) !void {
         const p = try segment.segmentPath(self.allocator, self.config.data_dir, seg.id);
         defer self.allocator.free(p);
@@ -1286,6 +1506,7 @@ pub const Engine = struct {
             }
             if (filtered_pts.items.len == 0) continue;
 
+            points_added.* += filtered_pts.items.len;
             var slice_it = try arena.create(iterator.SliceIterator);
             slice_it.* = .{ .slice = try filtered_pts.toOwnedSlice(arena) };
             try merge_it.addIterator(slice_it.iterator());
@@ -1818,6 +2039,113 @@ test "Engine: pruneExpired removes segments older than the cutoff" {
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "Engine: stats counters increment on append, query, flush, compaction (P-OBS-001)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 2,
+    }, &pool);
+    defer engine.deinit();
+
+    // Baseline: every counter starts at zero on a fresh engine.
+    {
+        const s = engine.stats();
+        try std.testing.expectEqual(@as(u64, 0), s.append_count);
+        try std.testing.expectEqual(@as(u64, 0), s.append_points);
+        try std.testing.expectEqual(@as(u64, 0), s.append_total_ns);
+        try std.testing.expectEqual(@as(u64, 0), s.query_count);
+        try std.testing.expectEqual(@as(u64, 0), s.query_points_returned);
+        try std.testing.expectEqual(@as(u64, 0), s.query_total_ns);
+        try std.testing.expectEqual(@as(u64, 0), s.flush_count);
+        try std.testing.expectEqual(@as(u64, 0), s.flush_total_ns);
+        try std.testing.expectEqual(@as(u64, 0), s.compaction_count);
+        try std.testing.expectEqual(@as(u64, 0), s.compaction_total_ns);
+        try std.testing.expectEqual(@as(u64, 0), s.wal_records_dropped);
+        try std.testing.expectEqual(@as(u64, 0), s.segment_integrity_failures);
+    }
+
+    // Two append batches (3 + 2 = 5 points). max_memtable_points = 2,
+    // so the first batch alone trips the flush threshold.
+    try engine.appendPoints(1, &.{
+        .{ .ts = 1, .value = 1 },
+        .{ .ts = 2, .value = 2 },
+        .{ .ts = 3, .value = 3 },
+    });
+    try engine.appendPoints(1, &.{ .{ .ts = 4, .value = 4 }, .{ .ts = 5, .value = 5 } });
+    try engine.flush();
+
+    {
+        const s = engine.stats();
+        try std.testing.expectEqual(@as(u64, 2), s.append_count);
+        try std.testing.expectEqual(@as(u64, 5), s.append_points);
+        try std.testing.expect(s.append_total_ns > 0);
+        try std.testing.expect(s.flush_count >= 1);
+        try std.testing.expect(s.flush_total_ns > 0);
+    }
+
+    // Query: expect both count and points_returned to bump.
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var it = try engine.queryPoints(arena.allocator(), 1, 0, 100);
+        var n: usize = 0;
+        while (it.next()) |_| n += 1;
+        try std.testing.expect(n >= 1);
+
+        const s = engine.stats();
+        try std.testing.expectEqual(@as(u64, 1), s.query_count);
+        try std.testing.expect(s.query_points_returned >= @as(u64, n));
+        try std.testing.expect(s.query_total_ns > 0);
+    }
+
+    // Force a compaction: drive enough flushes to surface an L0 fold,
+    // then call compactAll.
+    try engine.appendPoints(2, &.{ .{ .ts = 10, .value = 10 }, .{ .ts = 11, .value = 11 } });
+    try engine.flush();
+    try engine.compactAll();
+    {
+        const s = engine.stats();
+        try std.testing.expect(s.compaction_count >= 1);
+        try std.testing.expect(s.compaction_total_ns > 0);
+    }
+}
+
+test "Engine: stats() returns a value snapshot (no aliasing) (P-OBS-001)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var engine = try Engine.init(allocator, .{ .data_dir = data_dir }, &pool);
+    defer engine.deinit();
+
+    const snap_before = engine.stats();
+    try engine.appendPoints(1, &.{.{ .ts = 1, .value = 1 }});
+    const snap_after = engine.stats();
+
+    // Snapshot semantics: snap_before was captured BEFORE the
+    // append and must remain at zero counts even after the call.
+    try std.testing.expectEqual(@as(u64, 0), snap_before.append_count);
+    try std.testing.expectEqual(@as(u64, 1), snap_after.append_count);
+    try std.testing.expectEqual(@as(u64, 1), snap_after.append_points);
 }
 
 test "Engine: pruneExpired keeps straddling segments untouched" {
