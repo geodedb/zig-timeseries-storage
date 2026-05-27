@@ -276,14 +276,118 @@ pub fn build(b: *std.Build) void {
     const micro_example_step = b.step("bench-micro-example", "Example micro-benchmark");
     micro_example_step.dependOn(&run_micro_example.step);
 
+    // codec
+    const micro_codec_exe = b.addExecutable(.{
+        .name = "timeseries-storage-micro-codec",
+        .root_module = benchModule(b, "benchmarks/micro/codec.zig", target, module, framework_module, thread_pool),
+    });
+    const run_micro_codec = b.addRunArtifact(micro_codec_exe);
+    if (b.args) |args| run_micro_codec.addArgs(args);
+    const micro_codec_step = b.step("bench-micro-codec", "Gorilla encode/decode micros");
+    micro_codec_step.dependOn(&run_micro_codec.step);
+
+    // segment read/write
+    const micro_segment_rw_exe = b.addExecutable(.{
+        .name = "timeseries-storage-micro-segment-rw",
+        .root_module = benchModule(b, "benchmarks/micro/segment_rw.zig", target, module, framework_module, thread_pool),
+    });
+    const run_micro_segment_rw = b.addRunArtifact(micro_segment_rw_exe);
+    if (b.args) |args| run_micro_segment_rw.addArgs(args);
+    const micro_segment_rw_step = b.step("bench-micro-segment-rw", "Segment write/read block micros");
+    micro_segment_rw_step.dependOn(&run_micro_segment_rw.step);
+
+    // merge iterator
+    const micro_merge_exe = b.addExecutable(.{
+        .name = "timeseries-storage-micro-merge",
+        .root_module = benchModule(b, "benchmarks/micro/merge.zig", target, module, framework_module, thread_pool),
+    });
+    const run_micro_merge = b.addRunArtifact(micro_merge_exe);
+    if (b.args) |args| run_micro_merge.addArgs(args);
+    const micro_merge_step = b.step("bench-micro-merge", "k-way merge iterator micros");
+    micro_merge_step.dependOn(&run_micro_merge.step);
+
+    // WAL I/O
+    const micro_wal_exe = b.addExecutable(.{
+        .name = "timeseries-storage-micro-wal",
+        .root_module = benchModule(b, "benchmarks/micro/wal_io.zig", target, module, framework_module, thread_pool),
+    });
+    const run_micro_wal = b.addRunArtifact(micro_wal_exe);
+    if (b.args) |args| run_micro_wal.addArgs(args);
+    const micro_wal_step = b.step("bench-micro-wal", "WAL append micro");
+    micro_wal_step.dependOn(&run_micro_wal.step);
+
+    // Manifest I/O
+    const micro_manifest_exe = b.addExecutable(.{
+        .name = "timeseries-storage-micro-manifest",
+        .root_module = benchModule(b, "benchmarks/micro/manifest_io.zig", target, module, framework_module, thread_pool),
+    });
+    const run_micro_manifest = b.addRunArtifact(micro_manifest_exe);
+    if (b.args) |args| run_micro_manifest.addArgs(args);
+    const micro_manifest_step = b.step("bench-micro-manifest", "Manifest write/read micro");
+    micro_manifest_step.dependOn(&run_micro_manifest.step);
+
+    // Memtable
+    const micro_memtable_exe = b.addExecutable(.{
+        .name = "timeseries-storage-micro-memtable",
+        .root_module = benchModule(b, "benchmarks/micro/memtable.zig", target, module, framework_module, thread_pool),
+    });
+    const run_micro_memtable = b.addRunArtifact(micro_memtable_exe);
+    if (b.args) |args| run_micro_memtable.addArgs(args);
+    const micro_memtable_step = b.step("bench-micro-memtable", "Memtable insert (sorted/ooo) micros");
+    micro_memtable_step.dependOn(&run_micro_memtable.step);
+
+    // Integration benches (concurrent, ooo, recovery)
+    const bench_integration_exe = b.addExecutable(.{
+        .name = "timeseries-storage-bench-integration",
+        .root_module = benchModule(b, "benchmarks/bench_integration.zig", target, module, framework_module, thread_pool),
+    });
+    const run_bench_integration = b.addRunArtifact(bench_integration_exe);
+    if (b.args) |args| run_bench_integration.addArgs(args);
+    const bench_integration_step = b.step("bench-integration", "Integration benches: concurrent, ooo, recovery");
+    bench_integration_step.dependOn(&run_bench_integration.step);
+
     const micro_all_step = b.step("bench-micro", "Run all micro-benchmarks");
     micro_all_step.dependOn(&run_micro_example.step);
+    micro_all_step.dependOn(&run_micro_codec.step);
+    micro_all_step.dependOn(&run_micro_segment_rw.step);
+    micro_all_step.dependOn(&run_micro_merge.step);
+    micro_all_step.dependOn(&run_micro_wal.step);
+    micro_all_step.dependOn(&run_micro_manifest.step);
+    micro_all_step.dependOn(&run_micro_memtable.step);
+
+    // bench-ci: fast CI bench = bench + bench-micro
+    const bench_ci_step = b.step("bench-ci", "Fast CI bench: bench + bench-micro");
+    bench_ci_step.dependOn(&run_bench.step);
+    bench_ci_step.dependOn(&run_micro_example.step);
+    bench_ci_step.dependOn(&run_micro_codec.step);
+    bench_ci_step.dependOn(&run_micro_segment_rw.step);
+    bench_ci_step.dependOn(&run_micro_merge.step);
+    bench_ci_step.dependOn(&run_micro_wal.step);
+    bench_ci_step.dependOn(&run_micro_manifest.step);
+    bench_ci_step.dependOn(&run_micro_memtable.step);
+
+    // bench-smoke: cross-platform liveness. Caller passes `-- --samples 1 --quiet`.
+    const bench_smoke_step = b.step("bench-smoke", "Cross-platform liveness smoke (pass --samples 1)");
+    bench_smoke_step.dependOn(bench_ci_step);
+
+    // bench-ab: orchestrator script
+    const bench_ab_run = b.addSystemCommand(&.{ "bash", "benchmarks/scripts/bench_ab.sh" });
+    if (b.args) |args| bench_ab_run.addArgs(args);
+    const bench_ab_step = b.step("bench-ab", "Run A/B bench between two refs");
+    bench_ab_step.dependOn(&bench_ab_run.step);
 
     const tools_step = b.step("tools", "Build benchmark tooling artifacts");
     tools_step.dependOn(&bench_exe.step);
     tools_step.dependOn(&scale_bench_exe.step);
     tools_step.dependOn(&compare_bench_exe.step);
     tools_step.dependOn(&micro_example_exe.step);
+    tools_step.dependOn(&micro_codec_exe.step);
+    tools_step.dependOn(&micro_segment_rw_exe.step);
+    tools_step.dependOn(&micro_merge_exe.step);
+    tools_step.dependOn(&micro_wal_exe.step);
+    tools_step.dependOn(&micro_manifest_exe.step);
+    tools_step.dependOn(&micro_memtable_exe.step);
+    tools_step.dependOn(&bench_integration_exe.step);
 }
 
 fn benchModule(

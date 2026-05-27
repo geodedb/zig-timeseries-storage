@@ -1,0 +1,514 @@
+{
+  "date": "2026-05-27",
+  "slug": "codec-micro-mixed-rw",
+  "target_repo": "devnw/zig/timeseries-storage",
+  "language": "zig",
+  "baseline_ref": "main",
+  "candidate_ref": "HEAD",
+  "baseline_note": "At design time main and HEAD are the same commit (b938d22). The first A/B run is a sanity baseline; A == B medians within the noise gate is the expected outcome.",
+  "scenarios": [
+    {
+      "id": "gorilla_encode_256",
+      "layer": "micro",
+      "language": "zig",
+      "source_file": "benchmarks/micro/codec.zig",
+      "entry_point": "zig build bench-micro-codec -- --filter gorilla_encode_256",
+      "ops_per_iteration": 256,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "metrics": [
+        "wall_ns_p50",
+        "wall_ns_stddev",
+        "throughput_ops_per_sec",
+        "alloc_count",
+        "alloc_bytes",
+        "peak_live_bytes"
+      ],
+      "concurrency_shapes": ["N=1"],
+      "target_gain_pct": 5.0,
+      "max_regression_pct": -3.0,
+      "zero_alloc_expected": false,
+      "zero_alloc_note": "GorillaEncoder.initForPoints allocates DynamicBitSet in setup; iteration itself must not re-alloc after initial capacity is reached. alloc_count > 1 after warmup indicates unexpected growth."
+    },
+    {
+      "id": "gorilla_encode_4096",
+      "layer": "micro",
+      "language": "zig",
+      "source_file": "benchmarks/micro/codec.zig",
+      "entry_point": "zig build bench-micro-codec -- --filter gorilla_encode_4096",
+      "ops_per_iteration": 4096,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "metrics": [
+        "wall_ns_p50",
+        "wall_ns_stddev",
+        "throughput_ops_per_sec",
+        "alloc_count",
+        "alloc_bytes",
+        "peak_live_bytes"
+      ],
+      "concurrency_shapes": ["N=1"],
+      "target_gain_pct": 5.0,
+      "max_regression_pct": -3.0,
+      "zero_alloc_expected": false,
+      "zero_alloc_note": "Same as gorilla_encode_256. alloc_count expected = 1 per iteration (DynamicBitSet initial alloc) for a fresh encoder; scenario re-creates encoder each iteration to exercise the pre-sizing path."
+    },
+    {
+      "id": "gorilla_decode_256",
+      "layer": "micro",
+      "language": "zig",
+      "source_file": "benchmarks/micro/codec.zig",
+      "entry_point": "zig build bench-micro-codec -- --filter gorilla_decode_256",
+      "ops_per_iteration": 256,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "metrics": [
+        "wall_ns_p50",
+        "wall_ns_stddev",
+        "throughput_ops_per_sec",
+        "alloc_count",
+        "alloc_bytes",
+        "peak_live_bytes"
+      ],
+      "concurrency_shapes": ["N=1"],
+      "target_gain_pct": 0.0,
+      "max_regression_pct": -3.0,
+      "zero_alloc_expected": true,
+      "zero_alloc_probe": "GorillaDecoder is structurally allocation-free: GorillaDecoder.init(bytes, num_points) holds no allocator and decodePoint cannot allocate (gorilla.zig lines 333-347, 442). The decode loop in the scenario body is therefore zero-alloc by construction. Note: TrackingAllocator.alloc_count reported per-sample will be non-zero because the encoder fixture allocation (initForPoints + getCompressedData) happens inside the same run() callback that the framework wraps. To assert decoder zero-alloc, separate the fixture build into the scenario user_data setup or invoke with --no-track."
+    },
+    {
+      "id": "gorilla_decode_4096",
+      "layer": "micro",
+      "language": "zig",
+      "source_file": "benchmarks/micro/codec.zig",
+      "entry_point": "zig build bench-micro-codec -- --filter gorilla_decode_4096",
+      "ops_per_iteration": 4096,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "metrics": [
+        "wall_ns_p50",
+        "wall_ns_stddev",
+        "throughput_ops_per_sec",
+        "alloc_count",
+        "alloc_bytes",
+        "peak_live_bytes"
+      ],
+      "concurrency_shapes": ["N=1"],
+      "target_gain_pct": 0.0,
+      "max_regression_pct": -3.0,
+      "zero_alloc_expected": true,
+      "zero_alloc_probe": "Same as gorilla_decode_256 — decoder hot path is alloc-free by construction; TrackingAllocator counts only the encoder fixture allocations preceding the measured decode loop."
+    },
+    {
+      "id": "segment_write_block_256",
+      "layer": "micro",
+      "language": "zig",
+      "source_file": "benchmarks/micro/segment_rw.zig",
+      "entry_point": "zig build bench-micro-segment-rw -- --filter segment_write_block_256",
+      "ops_per_iteration": 256,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "metrics": [
+        "wall_ns_p50",
+        "wall_ns_p95",
+        "wall_ns_stddev",
+        "throughput_ops_per_sec",
+        "alloc_count",
+        "alloc_bytes",
+        "peak_live_bytes"
+      ],
+      "concurrency_shapes": ["N=1"],
+      "target_gain_pct": 5.0,
+      "max_regression_pct": -3.0,
+      "zero_alloc_expected": false,
+      "zero_alloc_note": "SegmentWriter.writeBlock allocates GorillaEncoder bitset + compressed output slice. Expected alloc_count = 2 per iteration (initForPoints + getCompressedData). segment.zig lines 287-298."
+    },
+    {
+      "id": "segment_read_block_256",
+      "layer": "micro",
+      "language": "zig",
+      "source_file": "benchmarks/micro/segment_rw.zig",
+      "entry_point": "zig build bench-micro-segment-rw -- --filter segment_read_block_256",
+      "ops_per_iteration": 256,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "metrics": [
+        "wall_ns_p50",
+        "wall_ns_p95",
+        "wall_ns_stddev",
+        "throughput_ops_per_sec",
+        "alloc_count",
+        "alloc_bytes",
+        "peak_live_bytes"
+      ],
+      "concurrency_shapes": ["N=1"],
+      "target_gain_pct": 0.0,
+      "max_regression_pct": -3.0,
+      "zero_alloc_expected": false,
+      "zero_alloc_note": "Block.decodePoints allocates the output point slice. Expected alloc_count = 1 per iteration."
+    },
+    {
+      "id": "merge_iter_k4",
+      "layer": "micro",
+      "language": "zig",
+      "source_file": "benchmarks/micro/merge.zig",
+      "entry_point": "zig build bench-micro-merge -- --filter merge_iter_k4",
+      "ops_per_iteration": 4000,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "metrics": [
+        "wall_ns_p50",
+        "wall_ns_stddev",
+        "throughput_ops_per_sec",
+        "alloc_count",
+        "peak_live_bytes"
+      ],
+      "concurrency_shapes": ["N=1"],
+      "target_gain_pct": 0.0,
+      "max_regression_pct": -3.0,
+      "zero_alloc_expected": false,
+      "zero_alloc_note": "MergeIterator uses PriorityQueue which allocates. Setup is in fixture; timed region is the drain loop. iterator.zig lines 175-end."
+    },
+    {
+      "id": "merge_iter_k16",
+      "layer": "micro",
+      "language": "zig",
+      "source_file": "benchmarks/micro/merge.zig",
+      "entry_point": "zig build bench-micro-merge -- --filter merge_iter_k16",
+      "ops_per_iteration": 16000,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "metrics": [
+        "wall_ns_p50",
+        "wall_ns_stddev",
+        "throughput_ops_per_sec",
+        "alloc_count",
+        "peak_live_bytes"
+      ],
+      "concurrency_shapes": ["N=1"],
+      "target_gain_pct": 5.0,
+      "max_regression_pct": -3.0,
+      "zero_alloc_expected": false
+    },
+    {
+      "id": "merge_iter_k64",
+      "layer": "micro",
+      "language": "zig",
+      "source_file": "benchmarks/micro/merge.zig",
+      "entry_point": "zig build bench-micro-merge -- --filter merge_iter_k64",
+      "ops_per_iteration": 64000,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "metrics": [
+        "wall_ns_p50",
+        "wall_ns_stddev",
+        "throughput_ops_per_sec",
+        "alloc_count",
+        "peak_live_bytes"
+      ],
+      "concurrency_shapes": ["N=1"],
+      "target_gain_pct": 5.0,
+      "max_regression_pct": -3.0,
+      "zero_alloc_expected": false
+    },
+    {
+      "id": "wal_append_record",
+      "layer": "micro",
+      "language": "zig",
+      "source_file": "benchmarks/micro/wal_io.zig",
+      "entry_point": "zig build bench-micro-wal -- --filter wal_append_record",
+      "ops_per_iteration": 1,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "metrics": [
+        "wall_ns_p50",
+        "wall_ns_p95",
+        "wall_ns_stddev",
+        "throughput_ops_per_sec",
+        "alloc_count",
+        "peak_live_bytes"
+      ],
+      "concurrency_shapes": ["N=1"],
+      "target_gain_pct": 0.0,
+      "max_regression_pct": -5.0,
+      "zero_alloc_expected": false,
+      "zero_alloc_note": "WAL appendRecord allocates a serialization buffer. wal_record.zig lines 36-end."
+    },
+    {
+      "id": "manifest_write_read",
+      "layer": "micro",
+      "language": "zig",
+      "source_file": "benchmarks/micro/manifest_io.zig",
+      "entry_point": "zig build bench-micro-manifest -- --filter manifest_write_read",
+      "ops_per_iteration": 2,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "metrics": [
+        "wall_ns_p50",
+        "wall_ns_p95",
+        "wall_ns_stddev",
+        "throughput_ops_per_sec",
+        "alloc_count",
+        "peak_live_bytes"
+      ],
+      "concurrency_shapes": ["N=1"],
+      "target_gain_pct": 0.0,
+      "max_regression_pct": -5.0,
+      "zero_alloc_expected": false,
+      "zero_alloc_note": "Manifest serialize/deserialize allocates the segment list and the on-disk buffer. manifest.zig MANIFEST_MAGIC at line 13."
+    },
+    {
+      "id": "memtable_insert_sorted",
+      "layer": "micro",
+      "language": "zig",
+      "source_file": "benchmarks/micro/memtable.zig",
+      "entry_point": "zig build bench-micro-memtable -- --filter memtable_insert_sorted",
+      "ops_per_iteration": 256,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "metrics": [
+        "wall_ns_p50",
+        "wall_ns_stddev",
+        "throughput_ops_per_sec",
+        "alloc_count",
+        "peak_live_bytes"
+      ],
+      "concurrency_shapes": ["N=1"],
+      "target_gain_pct": 0.0,
+      "max_regression_pct": -3.0,
+      "zero_alloc_expected": false,
+      "zero_alloc_note": "Memtable.insert allocates via AutoHashMap.getOrPut and ArrayListUnmanaged.appendSlice on first call per series. memtable.zig lines 81-100."
+    },
+    {
+      "id": "memtable_insert_ooo",
+      "layer": "micro",
+      "language": "zig",
+      "source_file": "benchmarks/micro/memtable.zig",
+      "entry_point": "zig build bench-micro-memtable -- --filter memtable_insert_ooo",
+      "ops_per_iteration": 256,
+      "warmup_iterations": 2,
+      "sample_iterations": 10,
+      "metrics": [
+        "wall_ns_p50",
+        "wall_ns_stddev",
+        "throughput_ops_per_sec",
+        "alloc_count",
+        "peak_live_bytes"
+      ],
+      "concurrency_shapes": ["N=1"],
+      "target_gain_pct": 0.0,
+      "max_regression_pct": -3.0,
+      "zero_alloc_expected": false,
+      "zero_alloc_note": "OoO insert only flips the sorted flag; no sort is performed on the write path (P-ALGO-003, memtable.zig lines 19-38). alloc_count should equal the sorted variant."
+    },
+    {
+      "id": "bench_concurrent_append",
+      "layer": "integration",
+      "language": "zig",
+      "source_file": "benchmarks/bench_integration.zig",
+      "entry_point": "zig build bench-integration -- --filter bench_concurrent_append",
+      "ops_per_iteration": 100000,
+      "warmup_iterations": 1,
+      "sample_iterations": 5,
+      "metrics": [
+        "wall_ns_p50",
+        "wall_ns_p95",
+        "wall_ns_stddev",
+        "throughput_ops_per_sec",
+        "alloc_count",
+        "peak_live_bytes",
+        "rss_current_bytes"
+      ],
+      "concurrency_shapes": ["N=4"],
+      "target_gain_pct": 0.0,
+      "max_regression_pct": -5.0,
+      "zero_alloc_expected": false,
+      "gap_reference": "PERF_GAP_ANALYSIS.md:182",
+      "note": "4 goroutines each appending 25k points to disjoint series IDs. Baseline for P-LOCK-001 lock-decomposition ADR. alloc_count undercounts goroutine-internal allocations (TrackingAllocator is not thread-safe, tracking_allocator.zig line 14)."
+    },
+    {
+      "id": "bench_concurrent_rw",
+      "layer": "integration",
+      "language": "zig",
+      "source_file": "benchmarks/bench_integration.zig",
+      "entry_point": "zig build bench-integration -- --filter bench_concurrent_rw",
+      "ops_per_iteration": 52000,
+      "warmup_iterations": 1,
+      "sample_iterations": 5,
+      "metrics": [
+        "wall_ns_p50",
+        "wall_ns_p95",
+        "wall_ns_stddev",
+        "throughput_ops_per_sec",
+        "alloc_count",
+        "peak_live_bytes",
+        "rss_current_bytes"
+      ],
+      "concurrency_shapes": ["N=4"],
+      "target_gain_pct": 0.0,
+      "max_regression_pct": -5.0,
+      "zero_alloc_expected": false,
+      "gap_reference": "PERF_GAP_ANALYSIS.md:182",
+      "note": "2 writers (25k pts each) + 2 readers (1k pts each) against a single Engine. Measures the read-write lock contention regime. IO context shared via std.Io.Threaded.global_single_threaded.io() as in bench.zig lines 113-114."
+    },
+    {
+      "id": "bench_ooo_append",
+      "layer": "integration",
+      "language": "zig",
+      "source_file": "benchmarks/bench_integration.zig",
+      "entry_point": "zig build bench-integration -- --filter bench_ooo_append",
+      "ops_per_iteration": 11000,
+      "warmup_iterations": 1,
+      "sample_iterations": 5,
+      "metrics": [
+        "wall_ns_p50",
+        "wall_ns_p95",
+        "wall_ns_stddev",
+        "throughput_ops_per_sec",
+        "alloc_count",
+        "peak_live_bytes"
+      ],
+      "concurrency_shapes": ["N=1"],
+      "target_gain_pct": 0.0,
+      "max_regression_pct": -5.0,
+      "zero_alloc_expected": false,
+      "gap_reference": "PERF_GAP_ANALYSIS.md:328",
+      "note": "10k in-order points flushed to produce a sealed segment, then 1k OoO points (ts < segment.max_ts) appended with allow_cross_segment_ooo=true, then explicit flush. Measures the overlap-aware compaction path cost. Engine config: allow_cross_segment_ooo=true (engine.zig line 538)."
+    },
+    {
+      "id": "bench_recovery_latency",
+      "layer": "integration",
+      "language": "zig",
+      "source_file": "benchmarks/bench_integration.zig",
+      "entry_point": "zig build bench-integration -- --filter bench_recovery_latency",
+      "ops_per_iteration": 1,
+      "warmup_iterations": 1,
+      "sample_iterations": 5,
+      "metrics": [
+        "wall_ns_p50",
+        "wall_ns_p95",
+        "wall_ns_stddev",
+        "alloc_count",
+        "peak_live_bytes",
+        "rss_current_bytes"
+      ],
+      "concurrency_shapes": ["N=1"],
+      "target_gain_pct": 0.0,
+      "max_regression_pct": -10.0,
+      "zero_alloc_expected": false,
+      "note": "Engine.init over a pre-populated 4-segment data directory (4 x 500 points per segment, WAL with 200 replay records). Measures startup/recovery latency. The fixture directory is created once per iteration in benchTmpDir (bench.zig lines 112-121 pattern). ops_per_iteration=1 means wall_ns_p50 is directly the startup latency in nanoseconds."
+    }
+  ],
+  "commands": {
+    "bench-ci": "zig build bench-ci",
+    "bench-micro": "zig build bench-micro",
+    "bench-micro-codec": "zig build bench-micro-codec",
+    "bench-micro-segment-rw": "zig build bench-micro-segment-rw",
+    "bench-micro-merge": "zig build bench-micro-merge",
+    "bench-micro-wal": "zig build bench-micro-wal",
+    "bench-micro-manifest": "zig build bench-micro-manifest",
+    "bench-micro-memtable": "zig build bench-micro-memtable",
+    "bench-integration": "zig build bench-integration",
+    "bench-ab": "zig build bench-ab",
+    "bench-compare": "zig build compare-bench -- --baseline docs/performance/2026-05-27-codec-micro-mixed-rw/runs/ref_a.json --current docs/performance/2026-05-27-codec-micro-mixed-rw/runs/ref_b.json",
+    "bench-smoke": "zig build bench-smoke"
+  },
+  "ab_protocol": {
+    "ref_a": "main",
+    "ref_b": "HEAD",
+    "warmups": 1,
+    "rounds": 10,
+    "stress_multiplier": 20,
+    "variance_gate_formula": "max(floor_pct, 3.0 * (baseline_throughput_stddev / baseline_throughput) * 100)",
+    "variance_gate_multiplier": 3.0,
+    "fixed_floor_pct_initial": 15.0,
+    "fixed_floor_pct_stable": 5.0,
+    "fixed_floor_pct_tight": 3.0,
+    "fixed_floor_note": "15% for first 3 CI runs per scenario; 5% after two stable baselines (stddev < 3%); 3% after five stable baselines with stddev < 1%. Matches compare.zig line 36 default and --floor override.",
+    "target_gain_pct": 5.0,
+    "max_regression_pct": -3.0,
+    "first_run_expectation": "A == B medians within noise gate (sanity baseline; both refs are the same commit at design time)"
+  },
+  "build_step_preservation": {
+    "must_not_rename": [
+      "bench",
+      "scale-bench",
+      "compare-bench",
+      "bench-micro",
+      "bench-micro-example"
+    ],
+    "protected_scenario_names": [
+      "append_single_series",
+      "append_high_cardinality",
+      "query_recent",
+      "query_full_range",
+      "flush_cost",
+      "compaction_cost"
+    ],
+    "protected_result_row_fields": [
+      "git_sha",
+      "run_timestamp_unix_s",
+      "zig_version",
+      "os",
+      "arch",
+      "cpu",
+      "scenario_name",
+      "ops_per_iteration",
+      "sample_count",
+      "wall_ns_min",
+      "wall_ns_p50",
+      "wall_ns_p95",
+      "wall_ns_p99",
+      "wall_ns_max",
+      "wall_ns_stddev",
+      "throughput_ops_per_sec",
+      "throughput_stddev_ops_per_sec",
+      "alloc_count",
+      "alloc_bytes",
+      "peak_live_bytes",
+      "rss_current_bytes",
+      "rss_peak_bytes"
+    ]
+  },
+  "ci_placement": {
+    "fast_ci_steps": [
+      "bench",
+      "bench-micro"
+    ],
+    "fast_ci_note": "bench-ci aggregates these two; wired to the existing benchmark-regression job (non-allow_failure). Runs on default branch push + schedule.",
+    "scheduled_only_steps": [
+      "bench-integration",
+      "scale-bench"
+    ],
+    "scheduled_only_note": "bench-integration (concurrent and OoO scenarios, ~2-5 min) runs on schedule and manual trigger only. scale-bench likewise.",
+    "smoke_steps": [
+      "bench-smoke"
+    ],
+    "smoke_note": "bench-smoke runs on every push for all platforms including macOS M1 and Windows. Single sample, no regression gate, just a liveness check."
+  },
+  "cross_platform": {
+    "linux_x86_64": {
+      "status": "full bench suite + regression gate",
+      "rss_fields": "populated from /proc/self/status"
+    },
+    "macos_aarch64": {
+      "status": "bench-smoke only (liveness check)",
+      "rss_fields": "zero (reporter.zig line 131)"
+    },
+    "windows_x86_64": {
+      "status": "bench-smoke only (liveness check)",
+      "rss_fields": "zero"
+    }
+  },
+  "evidence_layout": {
+    "run_dir_pattern": "docs/performance/2026-05-27-codec-micro-mixed-rw/runs/<YYYY-MM-DD>-<sha-A>-vs-<sha-B>/",
+    "files": [
+      "ref_a.json",
+      "ref_b.json",
+      "compare.txt",
+      "decision.md"
+    ],
+    "baseline_json": "benchmarks/results/baseline.json",
+    "baseline_update_policy": "Merge ref_a.json rows into baseline.json only after a sanity A==B run passes. Use additive append to the rows array. Do not overwrite existing rows."
+  }
+}
