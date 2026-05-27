@@ -231,7 +231,11 @@ pub const SegmentWriter = struct {
     pub fn writeBlock(self: *SegmentWriter, series_id: types.SeriesId, points: []const types.Point) !void {
         if (points.len == 0) return;
 
-        var encoder = try gorilla.GorillaEncoder.init(self.allocator);
+        // P-MEM-002: pre-size the encoder bitset for the known input
+        // count, eliminating most realloc-doubling cycles during the
+        // hot encode loop. The estimate clamps internally so an
+        // adversarial input cannot drive an absurd up-front allocation.
+        var encoder = try gorilla.GorillaEncoder.initForPoints(self.allocator, points.len);
         defer encoder.deinit();
 
         for (points) |p| {

@@ -25,9 +25,41 @@ pub const GorillaEncoder = struct {
     prev_leading: u8,
     prev_trailing: u8,
 
+    /// Lower bound for the initial bitset capacity. Even when the
+    /// caller knows zero points, we keep a minimum of 128 bits so the
+    /// first `writeBit` does not trigger an immediate resize.
+    pub const MIN_INITIAL_BITS: usize = 128;
+
+    /// Typical Gorilla compression for "real" workloads lands near
+    /// 1.3 bits per value plus the two 64-bit raw values for the
+    /// first point. We use 18 bits / point as a slightly conservative
+    /// average that covers both timestamp and value channels for a
+    /// mid-range delta-of-delta + XOR encoding (real-world rates are
+    /// typically 12–18 bits / point combined). Pre-sizing to this
+    /// budget eliminates almost every realloc-doubling cycle on the
+    /// hot writeBlock path. Closes P-MEM-002.
+    pub const TYPICAL_BITS_PER_POINT: usize = 18;
+
     pub fn init(allocator: std.mem.Allocator) !GorillaEncoder {
+        return initWithCapacity(allocator, 65536);
+    }
+
+    /// Allocate an encoder pre-sized for an estimated bit budget.
+    /// `estimated_bits` is clamped to `[MIN_INITIAL_BITS,
+    /// MAX_POINTS_PER_BLOCK_ABSOLUTE * 128]`. Closes P-MEM-002.
+    ///
+    /// The cap matches the upper limit of what `encodePoint` will
+    /// ever produce — `MAX_POINTS_PER_BLOCK_ABSOLUTE` points at the
+    /// theoretical worst-case 128 bits per point (no compression at
+    /// all). Larger requests are silently clamped because anything
+    /// above the cap would also be refused by `encodePoint`.
+    pub fn initWithCapacity(allocator: std.mem.Allocator, estimated_bits: usize) !GorillaEncoder {
+        const MAX_BITS = limits.MAX_POINTS_PER_BLOCK_ABSOLUTE * 128;
+        var cap = estimated_bits;
+        if (cap < MIN_INITIAL_BITS) cap = MIN_INITIAL_BITS;
+        if (cap > MAX_BITS) cap = MAX_BITS;
         return .{
-            .bits = try std.DynamicBitSet.initEmpty(allocator, 65536),
+            .bits = try std.DynamicBitSet.initEmpty(allocator, cap),
             .bit_pos = 0,
             .stats = .{
                 .min_ts = std.math.maxInt(i64),
@@ -46,6 +78,18 @@ pub const GorillaEncoder = struct {
             .prev_leading = 0,
             .prev_trailing = 0,
         };
+    }
+
+    /// Convenience: pre-size for `num_points` using
+    /// `TYPICAL_BITS_PER_POINT`. Closes P-MEM-002.
+    pub fn initForPoints(allocator: std.mem.Allocator, num_points: usize) !GorillaEncoder {
+        // Saturate the multiplication: the upper clamp inside
+        // `initWithCapacity` will trim anything pathological.
+        const estimated = if (num_points > std.math.maxInt(usize) / TYPICAL_BITS_PER_POINT)
+            std.math.maxInt(usize)
+        else
+            num_points * TYPICAL_BITS_PER_POINT;
+        return initWithCapacity(allocator, estimated);
     }
 
     pub fn deinit(self: *GorillaEncoder) void {
@@ -606,6 +650,59 @@ test "GorillaDecoder: readBits surfaces EndOfStream past the buffer (P-ALGO-005)
     try std.testing.expectError(error.EndOfStream, dec.readBits(8));
     // Position MUST NOT advance on error.
     try std.testing.expectEqual(@as(usize, 4), dec.bit_pos);
+}
+
+test "GorillaEncoder: initForPoints pre-sizes the bitset (P-MEM-002)" {
+    const allocator = std.testing.allocator;
+
+    // For 1000 points the estimated_bits = 1000 * 18 = 18_000. The
+    // bitset rounds up to the nearest mask-int boundary internally,
+    // but capacity must be at least 18_000.
+    var enc = try GorillaEncoder.initForPoints(allocator, 1000);
+    defer enc.deinit();
+
+    try std.testing.expect(enc.bits.capacity() >= 18_000);
+}
+
+test "GorillaEncoder: initWithCapacity clamps below MIN and above MAX (P-MEM-002)" {
+    const allocator = std.testing.allocator;
+
+    // Below MIN — must be raised to MIN_INITIAL_BITS.
+    var small = try GorillaEncoder.initWithCapacity(allocator, 1);
+    defer small.deinit();
+    try std.testing.expect(small.bits.capacity() >= GorillaEncoder.MIN_INITIAL_BITS);
+
+    // Above the cap — must be clamped to MAX_POINTS_PER_BLOCK_ABSOLUTE * 128.
+    var huge = try GorillaEncoder.initWithCapacity(allocator, std.math.maxInt(usize));
+    defer huge.deinit();
+    try std.testing.expect(huge.bits.capacity() <= limits.MAX_POINTS_PER_BLOCK_ABSOLUTE * 128 + 64);
+}
+
+test "GorillaEncoder: pre-sized encoder produces the same bitstream as default-sized (P-MEM-002)" {
+    const allocator = std.testing.allocator;
+
+    const pts = [_]types.Point{
+        .{ .ts = 1, .value = 1 },
+        .{ .ts = 2, .value = 2 },
+        .{ .ts = 3, .value = 3 },
+        .{ .ts = 100, .value = -7 },
+        .{ .ts = 200, .value = 99 },
+    };
+
+    var enc_default = try GorillaEncoder.init(allocator);
+    defer enc_default.deinit();
+    for (pts) |p| try enc_default.encodePoint(p);
+    const out_default = try enc_default.getCompressedData(allocator);
+    defer allocator.free(out_default);
+
+    var enc_sized = try GorillaEncoder.initForPoints(allocator, pts.len);
+    defer enc_sized.deinit();
+    for (pts) |p| try enc_sized.encodePoint(p);
+    const out_sized = try enc_sized.getCompressedData(allocator);
+    defer allocator.free(out_sized);
+
+    try std.testing.expectEqualSlices(u8, out_default, out_sized);
+    try std.testing.expectEqual(enc_default.bit_pos, enc_sized.bit_pos);
 }
 
 test "GorillaEncoder: refuses to grow past the absolute point cap" {
