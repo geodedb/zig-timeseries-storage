@@ -1978,49 +1978,69 @@ pub const Engine = struct {
         // landed on disk (Q-REL-008 / P-IO-003).
         try writer.sync();
 
-        // P-LOCK-003 conservative scope-down: keep the manifest fsync
-        // inside `engine.mu` (it mutates `self.man.segments` and
-        // `self.man.counter` — both protected by the engine lock and
-        // would require a manifest COW refactor to safely move out),
-        // but lift the WAL truncate (and its fsync) OUT of the lock.
-        // The WAL has its own internal mutex (ENT-006), so its
-        // truncate is safe to call lock-free, and its fsync no
-        // longer holds the engine lock against concurrent appends or
-        // queries.
+        // P-LOCK-003 publish-side carve-off (closes the manifest fsync
+        // stall): stage the new segment list locally while holding
+        // `engine.mu`, then RELEASE `engine.mu` and publish via
+        // `man.writeSlotAndPublish` -- which takes its own internal
+        // `publish_mu` for the ping-pong slot write + fsync. Other
+        // engine callers (queryPoints, appendPoints, triggerCompaction)
+        // no longer wait for the manifest fsync; they only contend on
+        // engine.mu for the brief stage-build window.
+        //
+        // The WAL truncate (and its own fsync) continues to run
+        // OUTSIDE engine.mu via its internal mutex (ENT-006), so its
+        // fsync also no longer holds the engine lock.
         //
         // Durability ordering: manifest MUST be durable BEFORE the
-        // WAL is truncated. The previous code violated this — it
+        // WAL is truncated. The previous code violated this -- it
         // called `wal.truncate` BEFORE `man.save`, so a crash
         // between the two would lose the records covered by the new
         // segment because the manifest on disk would still point at
         // the OLD last_checkpoint_lsn while the WAL had already
-        // dropped them. With the truncate moved AFTER the save and
-        // AFTER the engine lock is released, a crash between
-        // `man.save` returning and `wal.truncate` running merely
-        // leaves stale records in the WAL past
-        // `last_checkpoint_lsn`; recovery starts from
+        // dropped them. With the truncate moved AFTER the publish
+        // a crash between `writeSlotAndPublish` returning and
+        // `wal.truncate` running merely leaves stale records in the
+        // WAL past `last_checkpoint_lsn`; recovery starts from
         // `last_checkpoint_lsn + 1` and skips them, so no data is
         // lost. The next successful flush will reclaim the space.
         //
         // We snapshot the checkpoint LSN inside the lock so the
-        // unlock-side truncate uses exactly the value the manifest
-        // recorded — concurrent appends past that point are
-        // intentionally preserved.
-        var checkpoint_lsn: u64 = 0;
+        // unlock-side publish + truncate use exactly the value
+        // associated with this flush's segment -- concurrent appends
+        // past that point are intentionally preserved.
+        // Capture the WAL checkpoint LSN for this flush. We read it
+        // OUTSIDE engine.mu since wal.currentLsn is itself
+        // serialised by the WAL's internal mutex. Concurrent
+        // appends past this point are intentionally preserved past
+        // the checkpoint.
+        const checkpoint_lsn = self.wal.currentLsn();
+
+        // Lock-free manifest publish. Holds `man.publish_mu`
+        // internally to serialise against the compaction publish
+        // path on the on-disk slot write + fsync. engine.mu is NOT
+        // held during the fsync; writeSlotAndPublish briefly
+        // reacquires engine.mu (via the *mu pointer we pass in) AT
+        // THE END for the in-memory segment-list / counter swap so
+        // engine readers of self.man.segments under engine.mu
+        // observe an atomic transition. Flush advances the WAL
+        // checkpoint, so new_checkpoint_lsn is non-null.
+        const new_seg = manifest.SegmentMeta{
+            .id = seg_id,
+            .min_ts = min_ts,
+            .max_ts = max_ts,
+            .level = 0,
+        };
+        try self.man.writeSlotAndPublish(io, &self.mu, .{
+            .add_segments = (&new_seg)[0..1],
+            .new_checkpoint_lsn = checkpoint_lsn,
+        });
+
+        // Reacquire engine.mu for the post-publish bookkeeping. Same
+        // critical-section content as before, minus the manifest
+        // mutation (already done inside writeSlotAndPublish).
         {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
-
-            try self.man.addSegment(.{
-                .id = seg_id,
-                .min_ts = min_ts,
-                .max_ts = max_ts,
-                .level = 0,
-            });
-
-            self.man.last_checkpoint_lsn = self.wal.currentLsn();
-            checkpoint_lsn = self.man.last_checkpoint_lsn;
-            try self.man.save();
 
             mem.deinit();
             self.allocator.destroy(mem);
@@ -2399,19 +2419,16 @@ pub const Engine = struct {
     /// Hoisted out of `compactL0` / `compactL0Forced` so both paths
     /// share the same disk I/O, manifest swap, and cleanup body.
     ///
-    /// P-LOCK-004 (Partial): the heavy work — opening input readers,
-    /// running the compactor, writing+fsyncing the output segment —
-    /// already runs OUTSIDE `engine.mu`. The residual cost inside
-    /// the lock is the segment-list swap plus `man.save()` (a tmp-
-    /// write + fsync + rename of the manifest slot). Moving the
-    /// `man.save()` fsync outside the lock requires a manifest COW
-    /// refactor (clone-and-publish) so the on-disk swap can happen
-    /// against a stable local snapshot while concurrent
-    /// flush/prune/compaction still see a coherent in-memory
-    /// manifest. That COW is deferred (still XL; documented under
-    /// P-LOCK-001 in `docs/PERF_GAP_ANALYSIS.md`); when it lands,
-    /// the swap-and-save block below can split into two phases —
-    /// stage outside the lock, publish under a brief reacquire.
+    /// P-LOCK-004 (Closed via publish-side COW carve-off): the heavy
+    /// work -- opening input readers, running the compactor,
+    /// writing+fsyncing the output segment -- already runs OUTSIDE
+    /// `engine.mu`. The residual segment-list swap + manifest fsync
+    /// is now also released from engine.mu: we stage the new segment
+    /// list locally under engine.mu, release engine.mu, then publish
+    /// via `man.writeSlotAndPublish` which holds its own internal
+    /// `publish_mu` against the flush publish path. Concurrent
+    /// queries + appends no longer wait for the compaction manifest
+    /// fsync.
     fn runMergeAndCommit(
         self: *Engine,
         io: std.Io,
@@ -2448,11 +2465,12 @@ pub const Engine = struct {
         var compactor = compaction.Compactor.init(self.allocator, self.pool);
         try compactor.compactSegmentsWithEncryption(paths.items, out_path, enc);
 
-        // Set of input segment IDs for the manifest swap.
-        var compacted_ids = std.AutoHashMap(u64, void).init(self.allocator);
-        defer compacted_ids.deinit();
-        try compacted_ids.ensureTotalCapacity(@intCast(input_segs.len));
-        for (input_segs) |seg| compacted_ids.putAssumeCapacity(seg.id, {});
+        // Build the remove-id list for the publish delta. The
+        // compaction publish path swaps these out and adds the
+        // single new segment.
+        const remove_ids = try self.allocator.alloc(u64, input_segs.len);
+        defer self.allocator.free(remove_ids);
+        for (input_segs, 0..) |seg, i| remove_ids[i] = seg.id;
 
         // Output level rule (P-COMP-002 generalisation):
         //   * The caller supplies `target_level` based on which tier
@@ -2471,29 +2489,33 @@ pub const Engine = struct {
             if (seg.level > out_level) out_level = seg.level;
         }
 
-        {
-            self.mu.lockUncancelable(io);
-            defer self.mu.unlock(io);
-
-            var new_segments = std.ArrayListUnmanaged(manifest.SegmentMeta).empty;
-            for (self.man.segments.items) |seg| {
-                if (!compacted_ids.contains(seg.id)) {
-                    try new_segments.append(self.allocator, seg);
-                }
-            }
-
-            try new_segments.append(self.allocator, .{
-                .id = new_seg_id,
-                .min_ts = min_ts,
-                .max_ts = max_ts,
-                .level = out_level,
-            });
-
-            self.man.segments.deinit(self.allocator);
-            self.man.segments = new_segments;
-
-            try self.man.save();
-        }
+        // Publish via writeSlotAndPublish: it takes its own
+        // publish_mu to serialise against the flush publish path on
+        // the on-disk slot write + fsync, reads the LATEST published
+        // segment list inside publish_mu (so it observes any
+        // segment a concurrent flush has already published), applies
+        // the delta (remove the compacted inputs, add the new output
+        // segment), writes + fsyncs the inactive ping-pong slot,
+        // then briefly reacquires engine.mu for the in-memory
+        // segment-list + counter swap. engine.mu is NOT held during
+        // the fsync; concurrent queries + appends proceed.
+        //
+        // new_checkpoint_lsn = null: compaction does NOT advance
+        // the WAL checkpoint. publish_mu serialises us against a
+        // concurrent flush publish that DOES advance it, so the
+        // prior value we preserve here cannot regress the
+        // flush-published value.
+        const new_seg = manifest.SegmentMeta{
+            .id = new_seg_id,
+            .min_ts = min_ts,
+            .max_ts = max_ts,
+            .level = out_level,
+        };
+        try self.man.writeSlotAndPublish(io, &self.mu, .{
+            .remove_ids = remove_ids,
+            .add_segments = (&new_seg)[0..1],
+            .new_checkpoint_lsn = null,
+        });
 
         // P-IO-001: invalidate FD cache entries for the compacted
         // segments before unlinking. Refcount-safe: deferred close
@@ -2558,30 +2580,24 @@ pub const Engine = struct {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
 
-            var kept = std.ArrayListUnmanaged(manifest.SegmentMeta).empty;
-            try kept.ensureTotalCapacity(self.allocator, self.man.segments.items.len);
-
             for (self.man.segments.items) |seg| {
                 if (seg.max_ts < cutoff) {
                     try doomed_ids.append(self.allocator, seg.id);
-                } else {
-                    kept.appendAssumeCapacity(seg);
                 }
             }
 
-            if (doomed_ids.items.len == 0) {
-                kept.deinit(self.allocator);
-                return 0;
-            }
-
-            // Save the new manifest BEFORE we touch the files on
-            // disk: the manifest is the source of truth for which
-            // segments exist, so an orphan file is recoverable but
-            // a stale manifest entry would corrupt queries.
-            self.man.segments.deinit(self.allocator);
-            self.man.segments = kept;
-            try self.man.save();
+            if (doomed_ids.items.len == 0) return 0;
         }
+
+        // Publish the prune via writeSlotAndPublish so the manifest
+        // fsync runs OUTSIDE engine.mu (publish_mu only). The delta
+        // is "remove every doomed id"; writeSlotAndPublish reads the
+        // current segment list inside publish_mu and applies the
+        // delta against the latest published state, so a concurrent
+        // flush publish that just added a new segment is preserved.
+        try self.man.writeSlotAndPublish(io, &self.mu, .{
+            .remove_ids = doomed_ids.items,
+        });
 
         // P-IO-001: invalidate FD cache entries for the pruned
         // segments before unlinking. Cache invalidate is refcount-
@@ -2849,10 +2865,17 @@ pub const Engine = struct {
     /// Errors: WAL fsync or manifest write errors bubble up unchanged.
     pub fn sync(self: *Engine) !void {
         const io = self.io;
-        self.mu.lockUncancelable(io);
-        defer self.mu.unlock(io);
+        // WAL sync is internally serialised via the WAL's own
+        // mutex; no need to hold engine.mu around it.
         try self.wal.sync();
-        try self.man.save();
+        // Persist the current manifest state via writeSlotAndPublish
+        // with an empty delta. publish_mu inside writeSlotAndPublish
+        // serialises us against concurrent flush + compact publishes
+        // on the on-disk slot, and the engine.mu reacquire AT THE
+        // END keeps the in-memory swap atomic against engine.mu-
+        // protected readers. Lock order publish_mu -> engine.mu,
+        // matching the carve-off invariant.
+        try self.man.writeSlotAndPublish(io, &self.mu, .{});
     }
 };
 

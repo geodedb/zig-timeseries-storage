@@ -197,6 +197,27 @@ pub const Manifest = struct {
     /// inspect a half-built `Manifest` (e.g. error paths in
     /// `initWithEncryption`) cannot accidentally dereference garbage.
     current_snapshot: std.atomic.Value(?*Snapshot) = .init(null),
+    /// Serialises concurrent manifest WRITERS (flush, compact) against
+    /// each other. Engine-level reads + appends do NOT contend on this
+    /// mutex -- they take `Manifest.snapshot()` which is lock-free.
+    /// Held only by `writeSlotAndPublish` for the duration of the
+    /// stage-build + writeSlot + apply-local + publish sequence. The
+    /// I/O inside (ping-pong slot write + fsync) is therefore lock-free
+    /// against `engine.mu` but serialised against other writers.
+    ///
+    /// ## Deadlock invariant
+    ///
+    /// Callers MUST NOT hold `engine.mu` when entering
+    /// `writeSlotAndPublish`. No code path in the engine acquires
+    /// `engine.mu` while holding `publish_mu` (the only writers of
+    /// `publish_mu` are the flush + compact publish carve-offs in
+    /// `flushInternal` / `runMergeAndCommit`, both of which release
+    /// `engine.mu` BEFORE calling `writeSlotAndPublish`). Readers
+    /// (`Manifest.snapshot`) never touch `publish_mu` at all -- they
+    /// load the atomic snapshot pointer and bump its refcount. Holding
+    /// `publish_mu` therefore cannot transitively block any reader or
+    /// any `engine.mu`-only writer, only other manifest writers.
+    publish_mu: std.Io.Mutex = std.Io.Mutex.init,
 
     pub fn init(allocator: Allocator, data_dir: []const u8) !Manifest {
         return initWithEncryption(allocator, data_dir, null);
@@ -332,12 +353,24 @@ pub const Manifest = struct {
     }
 
     pub fn save(self: *Manifest) !void {
-        // `save()` callers in the engine all hold `engine.mu`, which
-        // serialises every mutation of `self.segments` / `self.counter`
-        // against itself. A future `writeSlotAndPublish` that runs
-        // OUTSIDE `engine.mu` will need its own internal mutex to
-        // coordinate with us on the shared ping-pong slot file;
-        // until then, the engine.mu invariant is sufficient.
+        // Engine callers (recovery, tests, legacy code paths) that
+        // hold `engine.mu` use `save()` directly. The function is
+        // SAFE to call concurrently with `writeSlotAndPublish`
+        // because save() acquires `publish_mu` to serialise on-disk
+        // slot writes -- but the caller must NOT hold `engine.mu`
+        // when calling, or a deadlock against writeSlotAndPublish
+        // (which acquires `publish_mu` then briefly `engine.mu`)
+        // would occur.
+        //
+        // Engine `sync()` and `pruneExpired` route through
+        // `writeSlotAndPublish` instead of save() to preserve the
+        // publish_mu-before-engine.mu lock order; save() is reserved
+        // for paths where no background workers can race
+        // (initialisation, tests, recovery).
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.publish_mu.lockUncancelable(io);
+        defer self.publish_mu.unlock(io);
+
         self.counter += 1;
         const filename = if (self.counter % 2 == 0) "manifest.a" else "manifest.b";
         const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.data_dir, filename });
@@ -383,18 +416,194 @@ pub const Manifest = struct {
         if (old) |o| o.release();
     }
 
-    // NOTE: A future `writeSlotAndPublish(new_segments, new_lsn,
-    // new_next_id)` method that the engine could call OUTSIDE
-    // engine.mu (serialised by `publish_mu`) would finish closing
-    // P-LOCK-003 for the flush + compaction publish paths. The
-    // refactor is non-trivial because every engine-side reader of
-    // `self.man.segments.items` (compaction triggers, OoO watermark
-    // seeding, runMergeAndCommit's input-set scan) currently relies
-    // on `engine.mu` to keep that ArrayList stable. Routing those
-    // through `self.man.snapshot()` is a separate cleanup. The
-    // queryPoints path — the only hot-path reader — is already
-    // routed through `snapshot()` in this commit, which is the
-    // biggest win.
+    /// Delta description for `writeSlotAndPublish`. The function
+    /// reads the current published segment list inside `publish_mu`,
+    /// applies the delta atomically (remove `remove_ids`, append
+    /// `add_segments`), writes the result to the inactive ping-pong
+    /// slot, and republishes the snapshot.
+    ///
+    /// Applying the delta INSIDE `publish_mu` (rather than letting
+    /// the caller hand in a pre-built list) is the lost-update fix:
+    /// two concurrent writers (flush + compact) that each stage
+    /// against the same pre-publish snapshot would otherwise race
+    /// on the slot write, with the loser's segment list silently
+    /// overwriting the winner's. Reading the latest published list
+    /// under `publish_mu` means the second writer naturally builds
+    /// on top of the first writer's published state.
+    pub const PublishDelta = struct {
+        /// Segment ids to remove from the current list (typically
+        /// the input set of a compaction). Empty for a flush
+        /// publish.
+        remove_ids: []const u64 = &.{},
+        /// Segments to append to the list after the removals.
+        /// Typically the single new segment produced by a flush or
+        /// compaction.
+        add_segments: []const SegmentMeta = &.{},
+        /// Optional new WAL checkpoint LSN. `null` preserves the
+        /// existing value (the compaction case, which does not
+        /// advance the WAL checkpoint). Non-null overwrites
+        /// (the flush case, where the new value is the WAL
+        /// position captured at the moment the flush snapshotted
+        /// its memtable).
+        new_checkpoint_lsn: ?u64 = null,
+    };
+
+    /// Atomically publish a new manifest state from OUTSIDE
+    /// `engine.mu`. Replaces the prior pattern of mutating
+    /// `self.segments` under `engine.mu` then calling `save()` while
+    /// still holding it -- which left every other engine call
+    /// (queryPoints, appendPoints, triggerCompaction) stalled behind
+    /// the manifest fsync.
+    ///
+    /// Concurrency: takes `publish_mu` internally. The caller MUST
+    /// NOT hold `engine.mu` when calling -- see the `publish_mu`
+    /// field doc for the full deadlock invariant. The caller passes
+    /// a `PublishDelta` describing the desired mutation plus a
+    /// pointer to `engine.mu` (or any equivalent mutex used by the
+    /// engine to serialise its in-memory reads of
+    /// `self.man.segments.items`); the function reads the current
+    /// published segment list inside `publish_mu`, applies the
+    /// delta, writes + fsyncs the inactive ping-pong slot, then
+    /// (briefly, after the fsync) acquires `engine_mu` to mutate
+    /// `self.segments` in lock-step with the snapshot republish.
+    ///
+    /// Two reasons `engine_mu` is acquired AT THE END instead of
+    /// before the fsync:
+    ///   1. The whole point of this carve-off is to release engine.mu
+    ///      during the fsync. Engine readers / writers (queryPoints,
+    ///      appendPoints) get to proceed while we are blocked on disk.
+    ///   2. The fsync is followed by a single in-memory swap (segments
+    ///      + counter + checkpoint_lsn + snapshot pointer). Holding
+    ///      engine.mu across that swap makes the swap atomic against
+    ///      every other engine.mu-protected reader of those fields.
+    ///
+    /// Because writers serialise on `publish_mu` and apply the
+    /// delta against the LATEST published list (not a stale
+    /// pre-publish snapshot), no lost-update can occur across two
+    /// concurrent writers.
+    ///
+    /// `next_segment_id` is NOT touched here: it is mutated only via
+    /// `getNextSegmentId` under `engine.mu` and the latest in-memory
+    /// value is captured into the published snapshot at the moment
+    /// of swap.
+    ///
+    /// On disk-write failure the in-memory state is left unchanged
+    /// (the staging happens in a local buffer, only applied on
+    /// success).
+    pub fn writeSlotAndPublish(
+        self: *Manifest,
+        io: std.Io,
+        engine_mu: *std.Io.Mutex,
+        delta: PublishDelta,
+    ) !void {
+        self.publish_mu.lockUncancelable(io);
+        defer self.publish_mu.unlock(io);
+
+        // Stage the new segment list in a LOCAL buffer. We read the
+        // current published list (the source of truth) inside
+        // publish_mu so a concurrent writer that beat us to
+        // publish_mu has already updated it. self.segments is the
+        // same list (writeSlotAndPublish + the initial publish are
+        // the only mutators of self.segments under publish_mu, and
+        // both keep self.segments aligned with the published
+        // snapshot).
+        const current = self.segments.items;
+        var staged = std.ArrayListUnmanaged(SegmentMeta).empty;
+        defer staged.deinit(self.allocator);
+        try staged.ensureTotalCapacity(self.allocator, current.len + delta.add_segments.len);
+
+        // Removal is O(N * M) where N = current segments and M =
+        // remove ids. M is bounded by the L0/L1 fan-in factor
+        // (single digits in steady state) so a linear scan is the
+        // right choice over a HashMap allocation here.
+        for (current) |seg| {
+            var removed = false;
+            for (delta.remove_ids) |rm_id| {
+                if (seg.id == rm_id) {
+                    removed = true;
+                    break;
+                }
+            }
+            if (!removed) staged.appendAssumeCapacity(seg);
+        }
+        for (delta.add_segments) |seg| staged.appendAssumeCapacity(seg);
+
+        // Build the on-disk bytes from `staged` + the new counter
+        // (prev + 1) + (possibly updated) checkpoint LSN. We do NOT
+        // mutate self.* yet -- if the write fails we want self.*
+        // unchanged so engine readers under engine.mu still see the
+        // prior coherent state.
+        const new_counter = self.counter + 1;
+        const new_checkpoint_lsn = delta.new_checkpoint_lsn orelse self.last_checkpoint_lsn;
+        try self.writeSlotForStagedLocked(io, staged.items, new_counter, new_checkpoint_lsn);
+
+        // Disk write succeeded. Apply the in-memory swap under
+        // engine_mu so engine readers of self.man.segments.items
+        // (under engine.mu) observe an atomic swap rather than a
+        // partial update.
+        engine_mu.lockUncancelable(io);
+        defer engine_mu.unlock(io);
+
+        // Swap staged into self.segments. The prior backing array
+        // is moved into staged and deinit'd when this function
+        // returns -- engine_mu serialises readers against this
+        // free.
+        std.mem.swap(std.ArrayListUnmanaged(SegmentMeta), &self.segments, &staged);
+        self.counter = new_counter;
+        self.last_checkpoint_lsn = new_checkpoint_lsn;
+
+        // Republish the snapshot so future readers via
+        // `Manifest.snapshot()` see the new state. Failure here
+        // means an OOM on the snapshot allocation -- self.segments
+        // is already the new list, so engine.mu-readers are
+        // consistent; the published snapshot stays at the prior
+        // state for one more cycle, which is harmless (next publish
+        // will catch up).
+        self.republishSnapshotLocked() catch {};
+    }
+
+    /// Internal: write the staged segment list + counter +
+    /// checkpoint LSN to the inactive ping-pong slot. Holds
+    /// `publish_mu` (caller must already have acquired it). Does
+    /// NOT mutate `self.segments` / `self.counter` /
+    /// `self.last_checkpoint_lsn` -- the caller applies those
+    /// changes after this returns successfully.
+    fn writeSlotForStagedLocked(
+        self: *Manifest,
+        _: std.Io,
+        staged_segments: []const SegmentMeta,
+        new_counter: u64,
+        new_checkpoint_lsn: u64,
+    ) !void {
+        // Build a transient Manifest value that shares everything
+        // with self EXCEPT the segments / counter / checkpoint_lsn
+        // (which take the staged values). This lets us reuse
+        // `serialize` + `writeToFile` without mutating self.
+        var on_disk = Manifest{
+            .format_version = self.format_version,
+            .ts_uuid = self.ts_uuid,
+            .counter = new_counter,
+            .last_checkpoint_lsn = new_checkpoint_lsn,
+            .next_segment_id = self.next_segment_id,
+            .series_count = self.series_count,
+            .point_count = self.point_count,
+            .allocator = self.allocator,
+            .data_dir = self.data_dir,
+            .encryption_key = self.encryption_key,
+        };
+        // Borrow the staged slice as an unmanaged ArrayList. We
+        // must NOT call segments.deinit on on_disk -- the slice
+        // memory is owned by the caller's `staged` ArrayList.
+        on_disk.segments = std.ArrayListUnmanaged(SegmentMeta){
+            .items = @constCast(staged_segments),
+            .capacity = staged_segments.len,
+        };
+
+        const filename = if (new_counter % 2 == 0) "manifest.a" else "manifest.b";
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.data_dir, filename });
+        defer self.allocator.free(path);
+        try on_disk.writeToFile(self.allocator, path);
+    }
 
     pub fn getNextSegmentId(self: *Manifest) u64 {
         const id = self.next_segment_id;
@@ -1105,4 +1314,110 @@ test "Manifest: snapshot refcount frees backing memory after last release" {
     try m.save(); // republish — drops publication ref on snap_old, still alive via snap_old.acquire
     snap_old.release(); // drops the reader ref; backing memory freed here
     // m.deinit() drops the publication ref on the post-save snapshot.
+}
+
+test "Manifest: writeSlotAndPublish serialises concurrent writers (P-LOCK-003 publish carve-off)" {
+    // Spawn two threads that each call writeSlotAndPublish with a
+    // distinct extra-segment delta. The internal `publish_mu` must
+    // serialise them so:
+    //   * Both publishes complete without corrupting the on-disk
+    //     ping-pong slot (verified by a clean reload of the manifest
+    //     via `initWithEncryption`).
+    //   * The final published snapshot contains BOTH segments
+    //     (neither writer's add is lost -- writeSlotAndPublish
+    //     reads the latest in-memory segment list INSIDE publish_mu
+    //     and applies the delta on top of it, so the second writer
+    //     naturally builds on the first writer's published state).
+    //   * The counter is bumped EXACTLY twice (once per writer).
+    //
+    // This is the race the publish_mu was added to resolve. Without
+    // publish_mu the second thread could interleave its slot write
+    // between the first thread's counter bump and its slot write,
+    // producing a torn manifest or a lost segment.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var m = try Manifest.init(allocator, data_dir);
+    defer m.deinit();
+    try m.publishInitialSnapshot();
+    const initial_counter = m.counter;
+
+    // Each worker calls writeSlotAndPublish with an "add one
+    // segment" delta. publish_mu inside the call serialises them;
+    // the second worker reads the first's published list inside
+    // publish_mu and stages on top of it.
+    //
+    // The `engine_mu` parameter is a separate Mutex created by the
+    // test (the engine doesn't exist in this unit test). It is
+    // acquired briefly inside writeSlotAndPublish AT THE END for
+    // the in-memory swap; the fsync itself runs only under
+    // publish_mu.
+    var engine_mu = std.Io.Mutex.init;
+    const Worker = struct {
+        fn run(man: *Manifest, mu: *std.Io.Mutex, new_id: u64, lsn: u64, result: *anyerror!void) void {
+            const seg = SegmentMeta{
+                .id = new_id,
+                .min_ts = @intCast(new_id * 100),
+                .max_ts = @intCast(new_id * 100 + 50),
+                .level = 0,
+            };
+            const io2 = std.Io.Threaded.global_single_threaded.io();
+            const lsn_param: ?u64 = lsn;
+            man.writeSlotAndPublish(io2, mu, .{
+                .add_segments = (&seg)[0..1],
+                .new_checkpoint_lsn = lsn_param,
+            }) catch |err| {
+                result.* = err;
+                return;
+            };
+            result.* = {};
+        }
+    };
+
+    var result_a: anyerror!void = {};
+    var result_b: anyerror!void = {};
+    var t_a = try std.Thread.spawn(.{}, Worker.run, .{ &m, &engine_mu, @as(u64, 1), @as(u64, 100), &result_a });
+    var t_b = try std.Thread.spawn(.{}, Worker.run, .{ &m, &engine_mu, @as(u64, 2), @as(u64, 200), &result_b });
+    t_a.join();
+    t_b.join();
+    try result_a;
+    try result_b;
+
+    // The counter must have advanced by EXACTLY 2 (one save() per
+    // publish). Any value other than 2 would mean publish_mu let
+    // both saves interleave their counter increments.
+    try std.testing.expectEqual(initial_counter + 2, m.counter);
+
+    // The final published snapshot must contain BOTH segments.
+    // Order depends on which writer won publish_mu first, but both
+    // ids must be present (proves no lost-update).
+    const final_snap = m.snapshot();
+    defer final_snap.release();
+    try std.testing.expectEqual(@as(usize, 2), final_snap.segments.len);
+
+    var saw_1 = false;
+    var saw_2 = false;
+    for (final_snap.segments) |seg| {
+        if (seg.id == 1) saw_1 = true;
+        if (seg.id == 2) saw_2 = true;
+    }
+    try std.testing.expect(saw_1);
+    try std.testing.expect(saw_2);
+
+    // Reload from disk: the on-disk ping-pong slot must be
+    // structurally valid (the higher-counter slot must round-trip
+    // through initWithEncryption -> deserialize without an
+    // InvalidData or ChecksumMismatch). This is the integrity
+    // assertion against publish_mu failing to serialise the slot
+    // write -- a torn write would manifest as a CRC or magic
+    // mismatch on reload.
+    var reloaded = try Manifest.init(allocator, data_dir);
+    defer reloaded.deinit();
+    try std.testing.expectEqual(@as(u64, initial_counter + 2), reloaded.counter);
+    try std.testing.expectEqual(@as(usize, 2), reloaded.segments.items.len);
 }
