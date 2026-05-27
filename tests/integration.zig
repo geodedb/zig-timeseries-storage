@@ -516,3 +516,150 @@ test "integration: P-COMP-002 L1->L2 tiered compaction triggers and cleans up L1
     const expected: usize = (num_rounds + 1) * points_per_round;
     try std.testing.expectEqual(expected, count);
 }
+
+test "P-ALGO-001 migration: retrofit footers onto pre-existing segments via engine round-trip" {
+    // End-to-end: drive a real engine to write three segments, strip
+    // the footer from two of them to simulate pre-`4ec8c3a` on-disk
+    // artefacts, then run the migration through the public library
+    // surface and verify the engine reopens, queries succeed, and the
+    // retrofitted footers are observed by `SegmentReader`.
+    //
+    // We use 3 segments (below the L0 compaction threshold of 4) so
+    // the test does not race with a background compaction worker
+    // consolidating our distinct segments into one.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    const series_id: u128 = 31415;
+    const num_segments: usize = 3;
+    const points_per_seg: usize = 8;
+
+    var seg_paths: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (seg_paths.items) |p| allocator.free(p);
+        seg_paths.deinit(allocator);
+    }
+    var data_end_offsets: std.ArrayListUnmanaged(u64) = .empty;
+    defer data_end_offsets.deinit(allocator);
+
+    // Phase 1: write three distinct segments via the engine. Below the
+    // L0 compaction threshold, so each `flush()` call produces a fresh
+    // segment without consolidation.
+    {
+        var eng = try lib.Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = points_per_seg,
+        }, &pool);
+        defer eng.deinit();
+
+        var next_ts: i64 = 1;
+        for (0..num_segments) |_| {
+            var batch: [points_per_seg]lib.types.Point = undefined;
+            for (0..points_per_seg) |i| {
+                batch[i] = .{ .ts = next_ts, .value = next_ts };
+                next_ts += 1;
+            }
+            try eng.appendPoints(series_id, &batch);
+            try eng.flush();
+        }
+
+        try std.testing.expectEqual(num_segments, eng.man.segments.items.len);
+
+        // Capture every segment path + data_end_offset.
+        for (eng.man.segments.items) |seg| {
+            const p = try lib.segment.segmentPath(allocator, data_dir, seg.id);
+            try seg_paths.append(allocator, p);
+
+            var r = try lib.segment.SegmentReader.init(allocator, p);
+            defer r.deinit();
+            try std.testing.expect(r.footer != null);
+            try data_end_offsets.append(allocator, r.data_end_offset);
+        }
+    }
+
+    // Phase 2: hand-truncate the first two segments back to their
+    // data_end_offset. This synthesises pre-`4ec8c3a` segments on
+    // disk WITHOUT changing any of the data-region bytes.
+    const num_stripped: usize = 2;
+    for (seg_paths.items[0..num_stripped], 0..) |p, idx| {
+        const f = try std.Io.Dir.cwd().openFile(io, p, .{ .mode = .read_write });
+        defer f.close(io);
+        try f.setLength(io, data_end_offsets.items[idx]);
+        try f.sync(io);
+    }
+
+    // Sanity: the truncated segments now lack a footer; the remaining
+    // one still carries one.
+    for (seg_paths.items[0..num_stripped]) |p| {
+        var r = try lib.segment.SegmentReader.init(allocator, p);
+        defer r.deinit();
+        try std.testing.expect(r.footer == null);
+    }
+    for (seg_paths.items[num_stripped..]) |p| {
+        var r = try lib.segment.SegmentReader.init(allocator, p);
+        defer r.deinit();
+        try std.testing.expect(r.footer != null);
+    }
+
+    // Phase 3: run the migration through the public library surface.
+    const results = try lib.migration.migrateSegmentFooters(allocator, io, data_dir);
+    defer lib.migration.freeResults(allocator, results);
+    try std.testing.expectEqual(num_segments, results.len);
+
+    var upgraded: usize = 0;
+    var already_indexed: usize = 0;
+    for (results) |r| {
+        if (r.upgraded) upgraded += 1;
+        if (r.already_indexed) already_indexed += 1;
+    }
+    try std.testing.expectEqual(num_stripped, upgraded);
+    try std.testing.expectEqual(num_segments - num_stripped, already_indexed);
+
+    // Every segment must now carry a footer.
+    for (seg_paths.items) |p| {
+        var r = try lib.segment.SegmentReader.init(allocator, p);
+        defer r.deinit();
+        try std.testing.expect(r.footer != null);
+        try std.testing.expect(r.findSeries(series_id) != null);
+    }
+
+    // Phase 4: reopen the engine; queries must still return every
+    // point we wrote. This is the load-bearing assertion — if the
+    // migration corrupted any block region the decode would fail.
+    {
+        var eng = try lib.Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = points_per_seg,
+        }, &pool);
+        defer eng.deinit();
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var it = try eng.queryPoints(arena.allocator(), series_id, 0, std.math.maxInt(i64));
+        var count: usize = 0;
+        var last_ts: i64 = 0;
+        while (it.next()) |pt| {
+            count += 1;
+            try std.testing.expect(pt.ts >= last_ts);
+            last_ts = pt.ts;
+        }
+        try std.testing.expectEqual(num_segments * points_per_seg, count);
+    }
+
+    // Phase 5: a second migration must be a no-op.
+    const results2 = try lib.migration.migrateSegmentFooters(allocator, io, data_dir);
+    defer lib.migration.freeResults(allocator, results2);
+    try std.testing.expectEqual(num_segments, results2.len);
+    for (results2) |r| {
+        try std.testing.expect(r.already_indexed);
+        try std.testing.expect(!r.upgraded);
+    }
+}

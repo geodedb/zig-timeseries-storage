@@ -119,6 +119,7 @@ pub const SubCommand = enum {
     restore,
     prune,
     migrate,
+    migrate_footers,
     help,
 
     pub fn parse(s: []const u8) ?SubCommand {
@@ -133,6 +134,7 @@ pub const SubCommand = enum {
             .{ "restore", SubCommand.restore },
             .{ "prune", SubCommand.prune },
             .{ "migrate", SubCommand.migrate },
+            .{ "migrate-footers", SubCommand.migrate_footers },
             .{ "help", SubCommand.help },
             .{ "-h", SubCommand.help },
             .{ "--help", SubCommand.help },
@@ -342,6 +344,36 @@ fn cmdMigrate(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: Args) !void
     try out.print("done: {d} migrated, {d} skipped\n", .{ migrated, skipped });
 }
 
+fn cmdMigrateFooters(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: Args) !void {
+    // P-ALGO-001: retrofit the optional per-segment footer index onto
+    // every *.tsseg file in --data-dir that does not already carry one.
+    //
+    // Idempotent + crash-safe per `migration.migrateSegmentFooters`.
+    // Operators can re-run after a crash without supervision; the
+    // engine never strictly needs this — un-migrated segments work,
+    // just slower.
+    const data_dir = try requireDataDir(args);
+
+    const results = try lib.migration.migrateSegmentFooters(gpa, io, data_dir);
+    defer lib.migration.freeResults(gpa, results);
+
+    var upgraded: usize = 0;
+    var already_indexed: usize = 0;
+    var total_appended: u64 = 0;
+    var total_series: u64 = 0;
+    for (results) |r| {
+        if (r.upgraded) upgraded += 1;
+        if (r.already_indexed) already_indexed += 1;
+        total_appended += r.bytes_appended;
+        total_series += r.series_count;
+    }
+
+    try out.print(
+        "migrate-footers: {d} segments inspected (upgraded={d}, already_indexed={d}); appended {d} bytes, {d} series indexed\n",
+        .{ results.len, upgraded, already_indexed, total_appended, total_series },
+    );
+}
+
 fn cmdHelp(out: *Io.Writer) !void {
     try out.writeAll(
         \\timeseries-storage CLI
@@ -370,6 +402,13 @@ fn cmdHelp(out: *Io.Writer) !void {
         \\  migrate  --src <v1-dir> --dst <v2-dir>
         \\           Upgrade every *.tsseg file from TSSEG001 to TSSEG002
         \\           (adds per-block CRC32C). Source files are left intact.
+        \\  migrate-footers --data-dir <dir>
+        \\           Retrofit the per-series footer index onto every *.tsseg
+        \\           file that lacks it (P-ALGO-001). Segments are modified
+        \\           in place by APPEND only; existing bytes are preserved.
+        \\           Idempotent: re-running against an indexed data_dir is
+        \\           a no-op. Crash-safe: a partial append is detected and
+        \\           re-emitted on the next invocation.
         \\
         \\Exit codes: 0 = ok, 1 = usage error, 2 = engine error.
         \\
@@ -453,6 +492,7 @@ fn dispatch(
         .restore => try cmdRestore(gpa, io, out, args),
         .prune => try cmdPrune(gpa, io, out, args),
         .migrate => try cmdMigrate(gpa, io, out, args),
+        .migrate_footers => try cmdMigrateFooters(gpa, io, out, args),
         .help => try cmdHelp(out),
     }
 }
@@ -472,6 +512,7 @@ test "SubCommand.parse: every documented name resolves" {
     try std.testing.expectEqual(SubCommand.restore, SubCommand.parse("restore").?);
     try std.testing.expectEqual(SubCommand.prune, SubCommand.parse("prune").?);
     try std.testing.expectEqual(SubCommand.migrate, SubCommand.parse("migrate").?);
+    try std.testing.expectEqual(SubCommand.migrate_footers, SubCommand.parse("migrate-footers").?);
     try std.testing.expectEqual(SubCommand.help, SubCommand.parse("help").?);
     try std.testing.expectEqual(SubCommand.help, SubCommand.parse("--help").?);
     try std.testing.expectEqual(SubCommand.help, SubCommand.parse("-h").?);
