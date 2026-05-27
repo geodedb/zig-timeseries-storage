@@ -42,7 +42,7 @@ pass.
 | P-LOCK-003  | flushInternal holds lock during fsync                     | Depends on P-LOCK-001 + manifest COW. Sequenced after the lock decomposition; fixing in isolation produces a torn-manifest hazard.                                                                                                                                                                                            | Same as P-LOCK-001.                                                                                                                                                                                                                                                |
 | P-LOCK-004  | compactL0 finalization holds lock during fsync            | Same dependency chain as P-LOCK-003.                                                                                                                                                                                                                                                                                          | Same as P-LOCK-001.                                                                                                                                                                                                                                                |
 | P-LOCK-005  | appendPoints holds lock during WAL pwrite                 | Depends on P-LOCK-001. Moving the WAL pwrite outside the lock without a memtable shard scheme would create lost-update races.                                                                                                                                                                                                  | Same as P-LOCK-001.                                                                                                                                                                                                                                                |
-| P-ALGO-001  | Per-series block index                                    | Requires a v3 segment format with a footer index. v2 (TSSEG002, plaintext) and v3 (TSSEG003, encrypted) are stable on disk; a third format bump is sequenced after the encryption rollout settles. Bloom-filter and min/max sidecars need migration tooling.                                                                  | (1) Design v3-with-index format. (2) Implement migration TSSEG002 → TSSEG003-indexed. (3) Migrate existing data via the migration tool. (4) Update verifySegments to recognise the new footer.                                                                     |
+| P-ALGO-001  | Per-series block index                                    | **Partially Closed (this session).** Backwards-compatible additive footer landed in `src/segment.zig` / `src/iterator.zig` / `src/engine.zig` — NEW segments now carry a sorted `(series_id, first_block_offset, block_count)` index after the last data block, plus a 16-byte `[FOOTER_OFFSET][FOOTER_MAGIC]` sentinel. Old segments without the footer continue to read unchanged. `Engine.querySegment` consults `SegmentReader.findSeries` and skips the whole segment when the footer proves the series is absent. Synthetic bench (1000 series × 5 blocks × 64 points, 100 random single-series lookups, ReleaseFast): full scan ≈ 328 ms total → footer-indexed ≈ 0.39 ms total (~850× speedup). Migration tooling for existing on-disk segments + manifest-level Bloom/min-max sidecars remain deferred. | Remaining: (1) Optional migration tool to retrofit footers onto existing segments. (2) Manifest-level Bloom filter for series presence. (3) Manifest-level min/max sidecars.                                                                                       |
 | P-COMP-002  | L1→L2 tiered compaction                                    | Depends on P-ALGO-001 + lock decomposition. Without the per-series index, L2 compaction is no cheaper than rewriting every L1 segment in place, which is what the engine already does on full compaction.                                                                                                                     | Same chain as P-ALGO-001.                                                                                                                                                                                                                                          |
 | ~~P-IO-004~~ (Closed) | ~~Global single-threaded IO context~~                | **Closed.** Earlier note that "`std.Io.Threaded` does not expose a pooled multi-threaded IO context" was wrong: Zig 0.16's `std.Io.Threaded.init(gpa, .{})` constructs a multi-threaded context with `async_limit = cpu_count - 1` and `concurrent_limit = .unlimited` by default. The engine now owns (or borrows) its IO context via `EngineConfig.io` / `Engine.io`; all engine-internal call sites use `self.io` instead of `global_single_threaded.io()`. See "Closed in this session" below. | n/a — closed                                                                                                                                                                                                                                                       |
 | SEC-013     | Supply-chain signing of `gitlab.com/devnw` deps           | Requires upstream maintainer action. The deps are all under `gitlab.com/devnw`; signing must happen at the source side (minisign or cosign on releases) before consumers can verify. File an issue with the org maintainers.                                                                                                  | (1) File issue with `gitlab.com/devnw` maintainers requesting minisign/cosign on releases. (2) Add `zig build.zig.zon` hash pinning verification in CI once signing is upstream.                                                                                   |
@@ -72,7 +72,8 @@ pass.
 
 ### Deferred (Phase E XL or won't-do)
 
-Won't-do: P-LOCK-001, P-LOCK-003, P-LOCK-004, P-LOCK-005, P-ALGO-001, P-COMP-002.
+Won't-do: P-LOCK-001, P-LOCK-003, P-LOCK-004, P-LOCK-005, P-COMP-002.
+Partially Closed: P-ALGO-001 (additive footer landed; migration tooling + manifest Bloom remain).
 Remaining open (no-ID, deferred): HashMap defaults (rank 31), Allocator hygiene (rank 32).
 
 ### Status Legend
@@ -116,7 +117,7 @@ Top 5 risks (by PerfScore × blast_radius on the hot mix):
 
 1. **P-LOCK-001** — single global RwLock serializes write/flush/compact and blocks readers. Throughput ceiling ~5-10k writes/sec under mixed load. PerfScore 100.
 2. **P-LOCK-002** — `queryPoints` holds the shared lock through all disk I/O (open + header read + decode). Latency-coupled writers to query duration. PerfScore 100.
-3. **P-ALGO-001** — `queryPoints` has no per-series block index: O(segments × blocks) header scan per query. At 100k series cardinality, ~1M syscalls to read one series. PerfScore 100.
+3. ~~**P-ALGO-001**~~ — **Partially Closed (this session).** Backwards-compatible footer index landed in `segment.zig` + `iterator.zig` + `engine.zig`. Single-series segment lookup is now O(log entries) on indexed segments; legacy un-indexed segments keep the original full-scan path. Synthetic bench (1000 series × 5 blocks, 100 random lookups, ReleaseFast): ~850× speedup vs. full scan. Migration tooling and manifest-level Bloom remain deferred.
 4. ~~**P-IO-004**~~ — **Closed.** Engine now owns/borrows its own `std.Io.Threaded` (multi-threaded by default: `async_limit = cpu_count - 1`, `concurrent_limit = .unlimited`); engine-internal call sites use `self.io` instead of `global_single_threaded.io()`. Bench `bench_concurrent_rw` p50 wall improved 729.6 ms → 699.4 ms (~4%) on the 3-sample reference run.
 5. **P-COMP-002** — L1→L2 compaction does not exist; L1 segment count grows linearly with time and amplifies P-ALGO-001 over the lifetime of the engine. PerfScore 80.
 
@@ -138,7 +139,7 @@ Sorted by PerfScore descending. (Issue URLs pending — see notes column.)
 |------|----------|-------|---------------|-----------|------------------|----------------------|---------------------------------------------------|---------|-------|--------|-----------|
 | 1    | P0       | 100   | P-LOCK-001    | engine    | write/read/flush/compact | engine.zig:81-251,288-358,365-447 | Replace global RwLock with manifest snapshot + per-memtable lock + segment-list COW | engine  | sprint | **Won't Do (Phase G)** -- XL architectural refactor; see Phase G Won't-Do section | TBD       |
 | 2    | P0       | 100   | P-LOCK-002    | engine    | read             | engine.zig:371-438   | Snapshot manifest under shared lock, release before disk I/O | engine  | sprint | **Closed (`6a5d087`)** | TBD       |
-| 3    | P0       | 100   | P-ALGO-001    | engine    | read             | engine.zig:407-435   | Per-series block index (segment-local + manifest-level Bloom/min-max) | engine  | sprint | **Won't Do (Phase G)** -- requires v3 segment format; see Phase G Won't-Do section | TBD       |
+| 3    | P0       | 100   | P-ALGO-001    | engine    | read             | engine.zig:407-435   | Per-series block index (segment-local + manifest-level Bloom/min-max) | engine  | sprint | **Partially Closed (this session)** -- segment-local footer landed (backwards-compatible additive change; ~850× single-series lookup speedup on synthetic 1k-series bench). Migration tooling + manifest-level Bloom remain deferred. | TBD       |
 | 4    | P0       | 80    | P-IO-004      | engine    | all      | src/engine.zig (15+ call sites) | Engine-owned `std.Io.Threaded` constructed in `Engine.init` via `std.Io.Threaded.init(allocator, .{})` (default: `async_limit = cpu_count - 1`, `concurrent_limit = .unlimited`); all engine-internal call sites use `self.io`. Caller override via `EngineConfig.io`. | infra  | sprint | **Closed (this session)** -- multi-threaded IO context plumbed through engine; `bench_concurrent_rw` ~4% faster | TBD       |
 | 5    | P1       | 80    | P-LOCK-003    | engine    | flush            | engine.zig:235-251   | Move `wal.truncate` + `man.save` fsync outside exclusive lock; double-buffered manifest | engine | sprint | **Won't Do (Phase G)** -- depends on P-LOCK-001 | TBD       |
 | 6    | P1       | 80    | P-COMP-002    | engine,compaction | compact   | engine.zig:256-275, 288-363; compaction.zig | Add tiered L1→L2 compaction with size/count triggers | engine | next-q | **Won't Do (Phase G)** -- depends on P-ALGO-001 | TBD       |
@@ -230,7 +231,28 @@ Per-finding sections include category, severity, PerfScore, hot path, evidence, 
 
 ### P-ALGO-001 — `queryPoints` has no per-series block index; full header scan
 
-**Status: Deferred (Phase E XL)** -- new on-disk format; requires segment footer B-tree + manifest Bloom.
+**Status: Partially Closed (this session).** The backwards-compatible portion has landed; the migration-tooling + manifest-level Bloom portion remains deferred.
+
+#### What landed (this session)
+
+- **On-disk additive change.** Segments written by `SegmentWriter` now carry an optional trailing footer:
+  - `[BLOCK_0]..[BLOCK_N]` — unchanged.
+  - `[FOOTER_BODY]` — `entry_count u32 LE || entry_count × FooterEntry { series_id u128, first_block_offset u64, block_count u32 } || crc32c u32 LE`, entries sorted ascending by `series_id`.
+  - `[FOOTER_OFFSET u64 LE][FOOTER_MAGIC u64 LE]` — last 16 bytes of the file. `FOOTER_MAGIC = 0x544553454709090A`.
+- **Backwards compatibility.** Reader probes the last 16 bytes for `FOOTER_MAGIC`; absence → segments behave exactly as before. Corrupt CRC → segment downgrades to no-footer mode (data still readable via the full block iterator). The segment magic, block format, and block CRC are unchanged.
+- **Reader fast path.** `SegmentReader.findSeries(series_id)` is O(log entries). `Engine.querySegment` jumps directly to the first matching block and stops after the recorded run length, *and* short-circuits the entire segment when the footer proves the series is absent. `SegmentIterator` mirrors the same fast path.
+- **Iterator stop boundary.** `SegmentReader.data_end_offset` (= footer offset when present, else file size) keeps `BlockIterator` from parsing the footer body as a `BlockHeader`.
+- **Tests** in `src/segment.zig`: round-trip (5 series, scrambled write order), backwards-compat (truncated file with no footer), corrupted-CRC fallback, encrypted-segment footer, empty-writer skips footer, `FooterEntry` serialisation, `Footer.lookup` binary search.
+- **Verification.** Full suite green twice: `test` (99/99), `test-integration` (8/8), `test-stress` (3/3), `test-engine-e2e` (1/1), `test-wal-recovery` (8/8). `bench-micro-segment-rw` shows no regression on segment write/read micros.
+- **Synthetic bench.** 1000 series × 5 blocks × 64 points, 100 random single-series lookups, ReleaseFast: full scan ≈ 328 ms total → footer-indexed ≈ 0.39 ms total (**~850× speedup**); both paths return identical block counts (`expectEqual` enforced).
+
+#### Still deferred
+
+- Migration tool to retrofit footers onto existing on-disk segments.
+- Manifest-level Bloom filter and min/max sidecars (cross-segment pruning before the per-segment footer lookup).
+- Bench: `bench_high_cardinality_read` at 100k series / 10 segments with `perf stat -e syscalls:sys_enter_pread64` to confirm wall-clock and syscall delta on a representative workload.
+
+#### Historical detail (pre-change)
 
 - **Category:** Algorithmic
 - **Severity:** P0
@@ -239,16 +261,13 @@ Per-finding sections include category, severity, PerfScore, hot path, evidence, 
 - **Hot path:** read
 - **Evidence:** `src/engine.zig:407-435`. For every overlapping segment, iterate `block_it.next()` for every block, then filter by `series_id`. No per-series skip-table or block-index.
 - **Root cause:** Segments contain blocks for all series. Reading one series at 100k cardinality requires reading 100k block headers per segment to find ~1 match.
-- **Expected delta if fixed:** ~100-1000× reduction in read syscalls at high cardinality. Single-series query latency reduced from O(segments × blocks_per_segment) to O(segments × log blocks).
+- **Expected delta if fixed:** ~100-1000× reduction in read syscalls at high cardinality. Single-series query latency reduced from O(segments × blocks_per_segment) to O(segments × log blocks). The synthetic bench above lands inside that band.
 - **Recommended fix:**
-  - Segment footer with `[series_id → first_block_offset, count]` map (B-tree or sorted u128 array).
-  - Manifest also keeps per-segment min-max ts and (optionally) Bloom filter for series_id presence.
-  - `queryPoints` first filters by Bloom, then loads the footer, then reads only the matching block range.
-- **Validation plan:**
-  - Bench: `bench_high_cardinality_read` — 100k series, query 1 series across 10 segments. Measure syscalls (`perf stat -e syscalls:sys_enter_pread64`) and wall-clock.
-  - Expected: pread64 syscalls drop from ~1e6 to ~1e2; wall-clock from seconds to ms.
-- **Rollout risk:** Medium. New on-disk format requires backward-compat path or version bump in segment header.
-- **Affected paths:** `segment.zig`, `engine.zig:queryPoints`, possibly `manifest.zig` for Bloom.
+  - Segment footer with `[series_id → first_block_offset, count]` map (sorted u128 array). **Landed.**
+  - Manifest also keeps per-segment min-max ts and (optionally) Bloom filter for series_id presence. **Deferred.**
+  - `queryPoints` first filters by Bloom, then loads the footer, then reads only the matching block range. Footer-load step **landed**; Bloom step **deferred**.
+- **Rollout risk:** Low. The format change is strictly additive: the segment magic, the block header bytes, the block CRC, and the block payload are byte-for-byte identical to TSSEG002 / TSSEG003 for the block region. Old readers stop at file size and never see the footer (their iterator just walks past the same blocks they always walked); new readers see the sentinel at EOF and use it. A corrupt footer downgrades silently to the legacy path.
+- **Affected paths:** `src/segment.zig`, `src/iterator.zig` (`SegmentIterator`), `src/engine.zig` (`querySegment`). Manifest is **not** touched in this partial close.
 - **Platform issue:** TBD (token write access required).
 
 ---

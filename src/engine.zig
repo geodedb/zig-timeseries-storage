@@ -2522,8 +2522,32 @@ pub const Engine = struct {
         };
         defer self.reader_cache.release(io, seg.id);
 
+        // P-ALGO-001 (partial): consult the segment's optional footer
+        // index first. When present + the series has an entry, jump
+        // directly to the first matching block and cap the scan at
+        // the recorded block_count. When absent (legacy segment) or
+        // the series is not present (also a fast O(log series) NO),
+        // fall back to the existing full-scan loop unchanged.
         var block_it = reader_ptr.iterator();
-        while (try block_it.next()) |block| {
+        var remaining_blocks: ?u32 = null;
+        if (reader_ptr.findSeries(series_id)) |hit| {
+            block_it.offset = hit.offset;
+            remaining_blocks = hit.count;
+        } else if (reader_ptr.footer != null) {
+            // Footer present and the series is not indexed -> the
+            // segment provably has no blocks for `series_id`. Skip
+            // the entire segment without a single header read.
+            return;
+        }
+
+        while (true) {
+            if (remaining_blocks) |rem| {
+                if (rem == 0) break;
+            }
+            const maybe_block = try block_it.next();
+            const block = maybe_block orelse break;
+            if (remaining_blocks) |rem| remaining_blocks = rem - 1;
+
             if (block.header.series_id != series_id) continue;
             if (block.header.stats.max_ts < start_ts) continue;
             if (block.header.stats.min_ts > end_ts) continue;

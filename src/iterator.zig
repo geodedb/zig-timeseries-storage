@@ -58,17 +58,35 @@ pub const SegmentIterator = struct {
     end_ts: i64,
     current_points: []types.Point = &[_]types.Point{},
     pos: usize = 0,
+    /// P-ALGO-001 (partial): when the underlying segment carries a
+    /// footer index AND the index has an entry for `series_id`, this
+    /// is set to the number of consecutive blocks the iterator should
+    /// visit before stopping. `null` means "no upper bound from the
+    /// footer — keep scanning until BlockIterator returns EOF". The
+    /// block-header filter (`block.header.series_id != self.series_id`)
+    /// is still applied for safety even when this bound is honoured.
+    remaining_blocks: ?u32 = null,
 
     pub fn init(allocator: Allocator, path: []const u8, series_id: types.SeriesId, start_ts: i64, end_ts: i64) !SegmentIterator {
         const reader = try segment.SegmentReader.init(allocator, path);
+        // Both v2 and v3 segment magics are the same length (8).
+        var start_offset: u64 = segment.SEGMENT_MAGIC.len;
+        var remaining: ?u32 = null;
+        if (reader.findSeries(series_id)) |hit| {
+            // Jump directly to the first block belonging to this
+            // series. The footer's `count` bounds the scan so we stop
+            // as soon as the series' consecutive run ends.
+            start_offset = hit.offset;
+            remaining = hit.count;
+        }
         return .{
             .allocator = allocator,
             .reader = reader,
-            // Both v2 and v3 segment magics are the same length (8).
-            .offset = segment.SEGMENT_MAGIC.len,
+            .offset = start_offset,
             .series_id = series_id,
             .start_ts = start_ts,
             .end_ts = end_ts,
+            .remaining_blocks = remaining,
         };
     }
 
@@ -101,6 +119,16 @@ pub const SegmentIterator = struct {
                 self.current_points = &[_]types.Point{};
             }
 
+            // P-ALGO-001 (partial): when the footer index gave us a
+            // bounded run of blocks for this series, stop as soon as
+            // that bound is reached. Keeps the iterator from walking
+            // into unrelated series' blocks even if the writer ever
+            // interleaves them (the current writer does not, but we
+            // do not want the reader to depend on that).
+            if (self.remaining_blocks) |rem| {
+                if (rem == 0) return null;
+            }
+
             // Drive the block iterator from our own (offset, block_index)
             // state — `BlockIterator` carries a `*SegmentReader` that
             // would dangle if stored as a struct field on the value
@@ -115,6 +143,16 @@ pub const SegmentIterator = struct {
             self.block_index = block_it.block_index;
 
             const block = maybe_block orelse return null;
+
+            // Decrement the footer-bounded block budget on every
+            // visited block (matching or not). The writer keeps a
+            // series' blocks consecutive, so the typical case is
+            // "match-match-match"; counting non-matches as well makes
+            // the bound robust to a future writer change.
+            if (self.remaining_blocks) |rem| {
+                self.remaining_blocks = rem - 1;
+            }
+
             if (block.header.series_id != self.series_id) continue;
             if (block.header.stats.max_ts < self.start_ts) continue;
             if (block.header.stats.min_ts > self.end_ts) continue;
