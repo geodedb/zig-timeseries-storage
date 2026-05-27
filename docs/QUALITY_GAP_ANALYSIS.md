@@ -8,8 +8,8 @@
 ## Gap-Closure Session Summary (2026-05-26)
 
 - **Session:** 32 commits; 76 quality/security/perf items addressed across all tracking docs.
-- **Quality findings closed (full):** 44 of 46
-- **Quality findings remaining open:** 2 (Q-CPLX-005, Q-CI-005)
+- **Quality findings closed (full):** 46 of 46
+- **Quality findings remaining open:** 0
 - **Platform issues:** token write access unavailable; all GitLab actions deferred.
 
 ### Status Legend
@@ -99,10 +99,10 @@
 | 34 | Medium | 36 | reliability | Q-REL-005 | engine | engine.zig:128 | Capture LSN into context for back-pressure / replay verification | S | **Closed** (`06a4328`) |
 | 35 | Medium | 36 | reliability | Q-REL-007 | engine | engine.zig:253 | Log compaction-trigger errors; emit metric | S | **Closed** (`06a4328`) |
 | 36 | Medium | 36 | cleanup | Q-DEAD-008 | zig-pkg | zig-pkg/thread_pool-0.2.0/, 0.2.4/ | Remove unused v0.2.0; verify lockfile pins v0.2.4 | S | **Closed** (`ac198e0`) |
-| 37 | Medium | 36 | ci-cd | Q-CI-005 | .gitlab-ci.yml | (no coverage, no TSan default) | Add `kcov`/`zig test --coverage` job; run TSan matrix on PRs | L | **Open (deferred)** -- CI/infra work |
+| 37 | Medium | 36 | ci-cd | Q-CI-005 | .gitlab-ci.yml | (no coverage, no TSan default) | Add `kcov`/`zig test --coverage` job; run TSan matrix on PRs | L | **Closed** (`f66d641`) |
 | 38 | Low | 24 | ci-cd | Q-CI-001 | .gitlab-ci.yml | .gitlab-ci.yml:53-56 | Drop benchmarks/ exclusion in `zig-format` | S | **Closed** (`fc037a8`) |
 | 39 | Low | 24 | ci-cd | Q-CI-003 | .gitlab-ci.yml | (no cache) | Add `~/.cache/zig` + `zig-cache/` cache per job | S | **Closed** (`9fdd6ca`) |
-| 40 | Low | 24 | maintainability | Q-CPLX-005 | benchmarks | benchmarks/framework.zig (613 lines) | Split scenarios/reporters/runners into smaller modules | M | **Open (deferred)** -- low priority |
+| 40 | Low | 24 | maintainability | Q-CPLX-005 | benchmarks | benchmarks/framework.zig (613 lines) | Split scenarios/reporters/runners into smaller modules | M | **Closed** (`44ad6eb`) |
 | 41 | Low | 24 | cleanup | Q-DEAD-003 | root.zig | root.zig:4-13 | Replace placeholder module doc-comment with real description | S | **Closed** (`2f9d7e0`) |
 | 42 | Low | 24 | cleanup | Q-DEAD-009 | types | types.zig:13-16 | Delete `PointF64` or document why it exists | S | **Closed** (`cf81051`) |
 | 43 | Low | 24 | readability | Q-API-009 | engine | engine.zig:53-65,108-115 | Replace manual LE byte juggling with `std.mem.writeInt` | S | **Closed** (`994e050`) |
@@ -641,8 +641,7 @@
 
 #### Q-CI-005 -- No coverage; no TSan default
 
-**Status: Open (deferred)** -- CI/infrastructure work; not addressed in this session.
-Unblock: add a `coverage:` stage with `kcov` and a nightly `tsan:` matrix job. Effort: L.
+**Status: Closed (`f66d641`)** -- `kcov` coverage stage and nightly TSan matrix added in CI.
 
 - **Category:** ci-cd / tests
 - **Severity:** Medium | **PriorityScore:** 36 (Impact 4 x Likelihood 2 x 4 + risk-weight) | **Confidence:** confirmed
@@ -700,8 +699,7 @@ Unblock: add a `coverage:` stage with `kcov` and a nightly `tsan:` matrix job. E
 
 #### Q-CPLX-005 -- `benchmarks/framework.zig` 613 lines
 
-**Status: Open (deferred)** -- low priority; not addressed in this session.
-Unblock: split into `runner.zig`, `reporter.zig`, `scenarios.zig`. Effort: M.
+**Status: Closed (`44ad6eb`)** -- split into `scenario.zig`, `runner.zig`, `reporter.zig` modules.
 
 - **Category:** maintainability
 - **Severity:** Low | **PriorityScore:** 24 (Impact 2 x Likelihood 3 x 4) | **Confidence:** confirmed
@@ -749,7 +747,7 @@ Unblock: split into `runner.zig`, `reporter.zig`, `scenarios.zig`. Effort: M.
 - **Q-API-006** -- align and document merge tie-breaker.
 - **Q-API-007** -- decompose `appendPoints`.
 - **Q-API-008** -- replace spin-waits with Condition/ResetEvent.
-- **Q-CPLX-001, -003, -004, -005** -- extract helpers / split files.
+- **Q-CPLX-001, -003, -004** -- extract helpers / split files. (**Q-CPLX-005 closed `44ad6eb`**)
 - **Q-DOC-001, -003, -005** -- rewrite README, doc public methods, doc core types.
 - **Q-DEAD-005, -006** -- real integration and stress tests.
 - **Q-CI-002** -- bench baseline + flip allow_failure (after Q-DEAD-007).
@@ -758,7 +756,7 @@ Unblock: split into `runner.zig`, `reporter.zig`, `scenarios.zig`. Effort: M.
 
 - **Q-DEAD-007** -- rewrite benchmark suite against Engine (blocks Q-CI-002).
 - **Q-API-005** -- declare named error sets across all public APIs (touches every module).
-- **Q-CI-005** -- coverage stage + nightly TSan matrix.
+- **Q-CI-005** -- coverage stage + nightly TSan matrix. **Closed (`f66d641`)**
 
 ---
 

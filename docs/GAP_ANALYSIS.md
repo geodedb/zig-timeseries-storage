@@ -10,15 +10,15 @@ GitLab serves as the authoritative system of record for all requirements and gap
 
 - **Date:** 2026-05-26 (initial audit; closures through Phase G)
 - **Audit phase:** full `/codepros:audit` (Phase 1 spec extraction, Phase 2 codebase mapping, Phase 3 gap detection)
-- **Open gaps:** 11 (GAP-0001 through GAP-0011); 9 closed full, 2 partial after Phase G
+- **Open gaps:** 11 (GAP-0001 through GAP-0011); 10 closed full, 1 partial (GAP-0002 only) after Phase G
 - **Verified-implemented spec items:** 3 (SPEC-NEW-2, SPEC-NEW-5, SPEC-NEW-6) -- see [GAP_ANALYSIS_RESOLVED.md](file:///home/benji/src/devnw/zig/timeseries-storage/docs/GAP_ANALYSIS_RESOLVED.md)
 
 ## Gap-Closure Session Summary
 
 - **Date:** 2026-05-26
 - **Session:** gap-closure run; 46+ commits merged across phases A-G
-- **Items closed (full):** GAP-0001, GAP-0003, GAP-0004, GAP-0005, GAP-0006, GAP-0007, GAP-0008, GAP-0010, GAP-0011 (9 of 11)
-- **Items partial:** GAP-0002 (seam + opaque derivation landed; persistent tenant catalog deferred), GAP-0009 (format version + migration tool landed; CLI subcommand still pending)
+- **Items closed (full):** GAP-0001, GAP-0003, GAP-0004, GAP-0005, GAP-0006, GAP-0007, GAP-0008, GAP-0009, GAP-0010, GAP-0011 (10 of 11)
+- **Items partial:** GAP-0002 (seam + opaque derivation landed; persistent tenant catalog deferred)
 - **GitLab issue updates:** token write access unavailable during this session; all issue closures marked "close manually after token restore"
 
 ### Phase G closure summary (this session)
@@ -100,39 +100,6 @@ something the engine itself does not need to know about (it stays
    engine's `access_controller` config slot.
 
 No further engine API changes are required.
-
----
-
-### GAP-0009: Missing v1 -> v2 Segment Format Migration Path
-
-- **GitLab issue:** TBD -- pending issue creation (token write access required)
-- **Category:** Feature
-- **Severity:** Medium
-- **Status:** Partial -- format version bumped to `TSSEG002` in commit `088b2f1`; migration tool still needed
-
-#### What was closed (commit `088b2f1`)
-
-The segment header format version has been bumped to `TSSEG002` and a per-block CRC32C integrity
-field was added. The new format is the sole written format going forward.
-
-#### What remains open
-
-- No `migrateSegments(from, to)` helper exists.
-- Engine startup does not detect a v1 (`TSSEG001`) segment and fail with a clear message.
-- No CLI `tsdb migrate` subcommand.
-- A v1-fixture unit test and migration round-trip test are still missing.
-
-#### Recommended next steps
-
-1. Add detection of `TSSEG001` magic on `SegmentReader.init`; return `error.SegmentVersionTooOld`.
-2. Implement `migrateSegments` helper: rewrite each v1 segment via temp + rename.
-3. Expose `zig build migrate` / `tsdb migrate <dir>` CLI subcommand.
-4. Add a unit test: write v1 fixture, run migration, reopen engine, assert all points readable.
-
-#### GitLab issue action
-
-Would be created as a new issue once token write access is restored. Assign label
-`feature`, `severity::medium`, `status::partial`.
 
 ---
 

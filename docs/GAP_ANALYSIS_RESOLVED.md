@@ -171,6 +171,25 @@ Evidence summaries suitable for the closing comment are included in each entry.
 
 ---
 
+### GAP-0009: Missing v1 -> v2 Segment Format Migration Path [CLOSED]
+
+- **GitLab issue:** TBD -- pending issue creation (token write access required; close once created)
+- **Category:** Feature | **Severity:** Medium
+- **Resolved date:** 2026-05-26
+- **Closing commits:** `088b2f1` (format bump + CRC32C), `4a4ee17` (migration tool), CLI wired in `src/main.zig`
+- **Resolution summary:** The segment header format version was bumped to `TSSEG002` with a per-block
+  CRC32C integrity field. `SegmentReader.init` now detects `TSSEG001` magic and returns
+  `error.SegmentVersionTooOld`. A `migrateSegments` helper rewrites each v1 segment via temp + rename.
+  A `tsdb migrate <dir>` CLI subcommand was added and wired into `src/main.zig`. A v1-fixture unit
+  test and migration round-trip test confirm all points are readable after migration.
+- **Evidence:**
+  - `src/segment.zig` -- `TSSEG002` format, CRC32C field, `error.SegmentVersionTooOld` detection.
+  - `src/engine.zig` -- `migrateSegments` helper.
+  - `src/main.zig` -- `migrate` CLI subcommand dispatch.
+  - Migration round-trip test: write v1 fixture, run migration, reopen engine, assert all points readable.
+
+---
+
 ### GAP-0011: Benchmark Harness Bodies Are Stubs (No Regression Gate) [CLOSED]
 
 - **GitLab issue:** TBD -- pending issue creation (token write access required; close once created)

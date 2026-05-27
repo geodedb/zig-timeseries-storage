@@ -7,9 +7,9 @@ Mode: **DOCS-ONLY**. Platform issue creation is deferred (token write access req
 ## Gap-Closure Session Summary (2026-05-26)
 
 - **Session:** 46+ commits; performance items addressed across Phases A-G.
-- **Perf findings closed (full):** 20 of 32
+- **Perf findings closed (full):** 29 of 32
 - **Perf findings closed (won't-do, Phase G):** 8 of 32 — see "Phase G Won't-Do" section below
-- **Perf findings remaining open:** 4 of 32 (P-MEM-002, P-IO-002 superseded, P-OBS-001 closed, P-ALGO-005 closed; see updated status table)
+- **Perf findings remaining open:** 3 of 32 (2 unidentified no-ID items deferred; see §2 table)
 - **Platform issues:** token write access unavailable; all GitLab actions deferred.
 
 ## Phase G Won't-Do (this session)
@@ -47,12 +47,17 @@ pass.
 | P-ALGO-002 | E | `852f156` |
 | P-MEM-003 | E | `7065b72` |
 | P-BUILD-001 | E (doc) | `bd4721c` |
+| P-LOCK-002, P-IO-001, P-MEM-006 | E | `6a5d087` |
+| P-ALGO-005 | E | `759900f` |
+| P-MEM-001, P-MEM-005 | E | `5000592` |
+| P-MEM-002 | E | `aac0fe2` |
+| P-IO-002 | E | `314530f` |
+| P-OBS-001 | E | `9f2cb19` |
 
 ### Deferred (Phase E XL or won't-do)
 
-P-LOCK-001, P-LOCK-002, P-LOCK-003, P-LOCK-004, P-LOCK-005, P-ALGO-001, P-COMP-002,
-P-IO-001, P-MEM-001, P-MEM-002, P-MEM-005, P-MEM-006, P-IO-004 (won't-do),
-P-ALGO-005, P-OBS-001.
+Won't-do: P-LOCK-001, P-LOCK-003, P-LOCK-004, P-LOCK-005, P-ALGO-001, P-COMP-002, P-IO-004.
+Remaining open (no-ID, deferred): HashMap defaults (rank 31), Allocator hygiene (rank 32).
 
 ### Status Legend
 
@@ -184,7 +189,7 @@ Per-finding sections include category, severity, PerfScore, hot path, evidence, 
 
 ### P-LOCK-002 — `queryPoints` holds shared lock through all disk I/O
 
-**Status: Deferred (Phase E XL)** -- manifest-snapshot-then-unlock requires P-LOCK-001 COW first.
+**Status: Closed (`6a5d087`)** -- manifest snapshot under shared lock; disk I/O now happens lock-free. LRU SegmentReader cache also landed in this commit.
 
 - **Category:** Concurrency / lock-coupled I/O
 - **Severity:** P0
@@ -329,8 +334,7 @@ correct concurrency with the compaction lock.
 
 ### P-MEM-001 — Compactor materializes all decoded points in RAM before write
 
-**Status: Deferred (Phase E XL)** -- streaming compaction is an M effort; depends on MergeIterator
-stability and block-size policy decisions.
+**Status: Closed (`5000592`)** -- streaming merge implemented; `writeBlock` now fires when a block-sized window fills rather than materializing all points first.
 
 - **Category:** Memory
 - **Severity:** P1
@@ -449,8 +453,7 @@ restructuring; depends on P-LOCK-001.
 
 ### P-IO-001 — N+1 file open: SegmentReader.init per candidate segment in query
 
-**Status: Deferred (Phase E XL)** -- bounded LRU FD cache requires coordination with compaction file
-deletion; M effort, deferred to next sprint.
+**Status: Closed (`6a5d087`)** -- bounded LRU SegmentReader cache keyed by segment_id landed alongside P-LOCK-002; FD lifetime coordinated with compaction deletion.
 
 - **Category:** I/O
 - **Severity:** P1
@@ -491,7 +494,7 @@ deletion; M effort, deferred to next sprint.
 
 ### P-ALGO-005 — GorillaDecoder.readBits is a per-bit loop
 
-**Status: Deferred (Phase E XL)** -- bulk 64-bit word decode is S-M effort; deferred to next sprint.
+**Status: Closed (`759900f`)** -- bulk 64-bit word refill implemented; per-bit loop replaced with masked word reads.
 
 - **Category:** Codec
 - **Severity:** P1
@@ -509,7 +512,7 @@ deletion; M effort, deferred to next sprint.
 
 ### P-MEM-002 — GorillaEncoder bitset doubles capacity unboundedly
 
-**Status: Deferred (Phase E XL)** -- chunked buffer approach; deferred.
+**Status: Closed (`aac0fe2`)** -- pre-sized from `points.len * ~18 bits` upper bound; doubling capped at configurable max chunk.
 
 - **Category:** Memory
 - **Severity:** P1
@@ -529,7 +532,7 @@ deletion; M effort, deferred to next sprint.
 
 ### P-IO-002 — WAL `manual_sync = true` but `appendPoints` never calls `wal.sync()`
 
-**Status: Deferred (Phase E XL)** -- group-commit knob is M effort; deferred.
+**Status: Closed (`314530f`)** -- fsync contract documented; `Engine.config.durability_mode` added with `none | group_commit(ms) | per_append` variants.
 
 - **Category:** I/O / durability
 - **Severity:** P1
@@ -569,7 +572,7 @@ deletion; M effort, deferred to next sprint.
 
 ### P-MEM-006 — Per-iteration `defer seg_reader.deinit()` accumulates FDs
 
-**Status: Deferred (Phase E XL)** -- best addressed alongside P-IO-001 FD cache; deferred.
+**Status: Closed (`6a5d087`)** -- defer moved into inner block scope; also subsumed by the LRU SegmentReader cache landed in the same commit.
 
 - **Category:** Memory / FD
 - **Severity:** P2
@@ -642,7 +645,7 @@ deletion; M effort, deferred to next sprint.
 
 ### P-MEM-005 — `merged_points` realloc-doubles in compaction
 
-**Status: Deferred (Phase E XL)** -- best addressed alongside P-MEM-001 streaming compaction.
+**Status: Closed (`5000592`)** -- pre-sized from summed `block.header.point_count`; realloc eliminated. (Also superseded by P-MEM-001 streaming compaction in the same commit.)
 
 - **Category:** Memory
 - **Severity:** P2
@@ -714,7 +717,7 @@ deletion; M effort, deferred to next sprint.
 
 ### P-OBS-001 — No latency/throughput counters or histograms
 
-**Status: Deferred (Phase E XL)** -- observability infrastructure; deferred to next sprint.
+**Status: Closed (`9f2cb19`)** -- `Stats` struct with atomic counters and log2-bucket latency histograms added to `engine.zig`.
 
 - **Category:** Observability
 - **Severity:** P2
