@@ -21,6 +21,20 @@ const wal_record = @import("wal_record.zig");
 /// compaction work over enough memtable flushes to matter.
 const kL0CompactionThreshold: usize = 4;
 
+/// Compute the per-series ArrayList capacity hint for a fresh
+/// memtable, given the engine's `max_memtable_points` budget and the
+/// expected number of distinct series. The hint floors at 64 so
+/// wide-cardinality workloads (`expected_series` >> max_memtable_points)
+/// don't end up with degenerate single-digit per-series buffers that
+/// must double on every batch.
+///
+/// ENT-002 / ENT-005. Returns 0 when `expected_series == 0` so the
+/// memtable falls back to the historical lazy-grow path.
+fn computePointsPerSeriesHint(max_memtable_points: usize, expected_series: usize) usize {
+    if (expected_series == 0) return 0;
+    return @max(64, max_memtable_points / expected_series);
+}
+
 /// Default capacity of the per-engine SegmentReader LRU cache.
 /// Each cache slot holds an open file descriptor + a small bookkeeping
 /// struct (~48 bytes). 64 entries is a comfortable default — large
@@ -813,7 +827,18 @@ pub const Engine = struct {
         });
         errdefer wal.deinit();
 
-        var mem = memtable.Memtable.init(allocator, config.max_memtable_points);
+        // ENT-002 / ENT-005: pre-size the memtable's `series` AutoHashMap
+        // and the per-series ArrayLists so the steady-state ingest path
+        // does not pay the first-touch hashmap/array growth allocation.
+        // The expected_series default comes from `limits.DEFAULT_EXPECTED_SERIES`;
+        // the per-series hint is `max_memtable_points / expected_series`
+        // floored at 64 to keep wide-cardinality workloads sane.
+        var mem = try memtable.Memtable.initCapacity(
+            allocator,
+            config.max_memtable_points,
+            limits.DEFAULT_EXPECTED_SERIES,
+            computePointsPerSeriesHint(config.max_memtable_points, limits.DEFAULT_EXPECTED_SERIES),
+        );
         errdefer mem.deinit();
 
         // P-OBS-001: counter accumulates WAL drops during replay.
@@ -1369,7 +1394,16 @@ pub const Engine = struct {
         if (!self.active_mem.shouldFlush()) return;
 
         self.flushing_mem = self.active_mem;
-        self.active_mem = memtable.Memtable.init(self.allocator, self.config.max_memtable_points);
+        // ENT-002 / ENT-005: rotation must produce a memtable with the
+        // same pre-sizing as `Engine.init` so the very next append
+        // does not eat the hashmap/array growth cost we just hoisted
+        // out of the previous memtable's lifetime.
+        self.active_mem = try memtable.Memtable.initCapacity(
+            self.allocator,
+            self.config.max_memtable_points,
+            limits.DEFAULT_EXPECTED_SERIES,
+            computePointsPerSeriesHint(self.config.max_memtable_points, limits.DEFAULT_EXPECTED_SERIES),
+        );
         _ = self.pool.submit(flushWorker, self, .{}) catch |err| {
             self.flushing_mem.?.deinit();
             self.flushing_mem = null;
@@ -1542,7 +1576,15 @@ pub const Engine = struct {
                 self.done_cv.waitUncancelable(io, &self.mu);
             }
             self.flushing_mem = self.active_mem;
-            self.active_mem = memtable.Memtable.init(self.allocator, self.config.max_memtable_points);
+            // ENT-002 / ENT-005: keep the manual `sync`-driven rotation
+            // path consistent with `maybeTriggerFlushLocked` — the new
+            // active memtable must start pre-sized.
+            self.active_mem = try memtable.Memtable.initCapacity(
+                self.allocator,
+                self.config.max_memtable_points,
+                limits.DEFAULT_EXPECTED_SERIES,
+                computePointsPerSeriesHint(self.config.max_memtable_points, limits.DEFAULT_EXPECTED_SERIES),
+            );
             target = self.flushes_completed + 1;
             _ = self.pool.submit(flushWorker, self, .{}) catch |err| {
                 self.flushing_mem.?.deinit();

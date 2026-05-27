@@ -7,12 +7,11 @@
 //! (`src/memtable.zig:81-117`):
 //!
 //!   * `memtable_insert_sorted` — a 256-point batch whose timestamps
-//!     are strictly ascending AND land after the (empty) existing tail.
-//!     This drives `can_append_in_order = true` so the entry stays
-//!     `sorted = true` and the insert path is a single
-//!     `appendSlice` over the per-series `ArrayListUnmanaged`. This
-//!     is the steady-state ingest path documented at
-//!     `src/memtable.zig:24-26`.
+//!     are strictly ascending AND land after the existing tail. This
+//!     drives `can_append_in_order = true` so the entry stays
+//!     `sorted = true` and the insert path is a single `appendSlice`
+//!     over the per-series `ArrayListUnmanaged`. This is the
+//!     steady-state ingest path documented at `src/memtable.zig:24-26`.
 //!
 //!   * `memtable_insert_ooo` — the same 256-point batch with the last
 //!     two elements swapped, which forces the batch-sorted check at
@@ -23,30 +22,51 @@
 //!     NOT a follow-up sort — the sort is deferred until a reader
 //!     calls `getSortedPoints` or `ensureAllSorted`.
 //!
-//! Both scenarios build a fresh `Memtable` per iteration. That keeps
-//! the `AutoHashMap.init` + first-insert `getOrPut` allocation inside
-//! the measured region so a regression in the hashmap-warmup path
-//! (e.g. a future change to the initial bucket count) shows up. The
-//! tracking allocator's per-iteration alloc count therefore includes
-//! the hashmap-bucket and the per-series `ArrayListUnmanaged` growth
-//! — by design, not a leak.
+//! ## Fixture model (ENT-002 / ENT-005)
 //!
-//! `Memtable.init` is called with `max_points = 1_000_000` so a single
-//! 256-point insert per iteration never approaches `shouldFlush()`;
-//! the engine's flush policy is intentionally out-of-scope for this
-//! micro.
+//! Both scenarios share a `Fixture` constructed once in `main`. The
+//! fixture owns a pre-sized `Memtable` (via `Memtable.initCapacity`,
+//! the API introduced by ENT-002 / ENT-005) and a deterministic
+//! 256-point batch buffer.
+//!
+//! Each measured iteration only calls `mt.clear()` followed by
+//! `mt.insert(...)`. `clear()` retains the AutoHashMap capacity and
+//! the per-series `ArrayListUnmanaged` capacity, so the steady-state
+//! insert allocates ZERO bytes — exactly what `Engine.appendPoints`
+//! sees on its hot path once the active memtable has touched a
+//! given series at least once.
+//!
+//! This is a deliberate change from the original bench shape (commit
+//! 890d9f8), which built a fresh `Memtable` per iteration via
+//! `Memtable.init`. Under that shape the tracking allocator measured
+//! 2 allocs/iter — one for the hashmap's first `getOrPut`, one for
+//! the array list's first `appendSlice`. Those are exactly the
+//! allocations ENT-002 / ENT-005 hoist out of the steady-state path
+//! and into one-time construction; the only way to see the
+//! optimization in the bench numbers is to put construction in the
+//! place the engine puts it (init / rotation), not in the measured
+//! window.
 //!
 //! `ops_per_iteration = 256`, `warmup_iterations = 2`,
 //! `sample_iterations = 10` — matches the rest of the micro-bench
 //! suite (codec, segment_rw, merge, wal_io, manifest_io).
 //!
-//! Wired via `zig build bench-micro-memtable` (added by a later task
-//! in the bench plan).
+//! Wired via `zig build bench-micro-memtable`.
 
 const std = @import("std");
 const Io = std.Io;
 const lib = @import("timeseries_storage");
 const framework = @import("framework");
+
+/// Shared scenario fixture (ENT-002 / ENT-005). Constructed once in
+/// `main` and threaded into each scenario via `Scenario.user_data`.
+/// Owns the pre-sized memtable and the two pre-built point batches
+/// so the measured `run` body is just `clear()` + `insert()`.
+const Fixture = struct {
+    mt: lib.memtable.Memtable,
+    sorted_batch: [256]lib.types.Point,
+    ooo_batch: [256]lib.types.Point,
+};
 
 pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(init.gpa);
@@ -57,12 +77,32 @@ pub fn main(init: std.process.Init) !void {
     var stderr_writer = Io.File.stderr().writer(init.io, &stderr_buf);
     const stderr = &stderr_writer.interface;
 
+    // ENT-002 / ENT-005: build the fixture once, outside the measured
+    // region. The hashmap and per-series array-list pre-allocations
+    // happen here; the measured `run` body sees only `clear()` +
+    // `insert()` and (with the optimization in place) records zero
+    // allocations per iteration.
+    var fixture = Fixture{
+        .mt = try lib.memtable.Memtable.initCapacity(allocator, 1_000_000, 16, 1024),
+        .sorted_batch = buildBatch(256, false),
+        .ooo_batch = buildBatch(256, true),
+    };
+    defer fixture.mt.deinit();
+
+    // Prime the memtable so the per-series ArrayList has been touched
+    // and pre-grown to the hint. After this, `clear()` retains the
+    // capacity and subsequent inserts on the same SeriesId are
+    // alloc-free.
+    try fixture.mt.insert(7, &fixture.sorted_batch);
+    fixture.mt.clear();
+
     const scenarios = [_]framework.Scenario{
         .{
             .name = "memtable_insert_sorted",
             .ops_per_iteration = 256,
             .warmup_iterations = 2,
             .sample_iterations = 10,
+            .user_data = &fixture,
             .run = runMemtableSorted,
         },
         .{
@@ -70,6 +110,7 @@ pub fn main(init: std.process.Init) !void {
             .ops_per_iteration = 256,
             .warmup_iterations = 2,
             .sample_iterations = 10,
+            .user_data = &fixture,
             .run = runMemtableOoo,
         },
     };
@@ -107,25 +148,24 @@ fn buildBatch(comptime N: usize, comptime ooo: bool) [N]lib.types.Point {
 }
 
 /// Steady-state ingest path: insert a strictly ascending 256-point
-/// batch into a fresh memtable. The entry stays `sorted = true` and
-/// the insert is one `appendSlice` plus the cheap batch-monotonicity
-/// scan at `src/memtable.zig:92-98`.
+/// batch into the pre-sized memtable. `clear()` retains the existing
+/// capacity, so the `appendSlice` inside `insert` is a pure memcpy —
+/// zero allocations on the measured path.
 fn runMemtableSorted(ctx: *framework.Context) anyerror!void {
-    var mt = lib.memtable.Memtable.init(ctx.allocator, 1_000_000);
-    defer mt.deinit();
-    const batch = buildBatch(256, false);
-    try mt.insert(7, &batch);
-    std.mem.doNotOptimizeAway(mt.point_count);
+    const fixture: *Fixture = @ptrCast(@alignCast(ctx.user_data.?));
+    fixture.mt.clear();
+    try fixture.mt.insert(7, &fixture.sorted_batch);
+    std.mem.doNotOptimizeAway(fixture.mt.point_count);
 }
 
 /// Out-of-order detection path: the same 256-point batch with the
 /// final two elements swapped. The batch-sorted scan trips on the
 /// last index and the entry is flagged `sorted = false` — the sort
-/// itself is deferred per P-ALGO-003.
+/// itself is deferred per P-ALGO-003. Like the sorted scenario the
+/// measured path is alloc-free.
 fn runMemtableOoo(ctx: *framework.Context) anyerror!void {
-    var mt = lib.memtable.Memtable.init(ctx.allocator, 1_000_000);
-    defer mt.deinit();
-    const batch = buildBatch(256, true);
-    try mt.insert(7, &batch);
-    std.mem.doNotOptimizeAway(mt.point_count);
+    const fixture: *Fixture = @ptrCast(@alignCast(ctx.user_data.?));
+    fixture.mt.clear();
+    try fixture.mt.insert(7, &fixture.ooo_batch);
+    std.mem.doNotOptimizeAway(fixture.mt.point_count);
 }

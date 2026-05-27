@@ -47,3 +47,14 @@ pub const MAX_SEGMENTS_PER_MANIFEST: u32 = 1_000_000;
 /// keep encoding forever and OOM the process. 65k points per block
 /// is well above the steady-state flush size (a few thousand).
 pub const MAX_POINTS_PER_BLOCK_ABSOLUTE: usize = 65_536;
+
+/// Default hint for the expected number of distinct series the active
+/// memtable will hold between flushes. Used by the engine to pre-size
+/// the `Memtable.series` AutoHashMap so the first ~10 hashmap growth
+/// rounds are hoisted out of the steady-state insert path.
+///
+/// Sized for realistic single-tenant workloads (a few hundred to a
+/// few thousand active series). Workloads that exceed this still
+/// grow correctly — they just pay the normal doubling cost past the
+/// hint. ENT-002 / ENT-005.
+pub const DEFAULT_EXPECTED_SERIES: usize = 1024;

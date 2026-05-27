@@ -47,6 +47,13 @@ pub const Memtable = struct {
     series: std.AutoHashMap(types.SeriesId, SeriesEntry),
     point_count: usize,
     max_points: usize,
+    /// Per-series ArrayList capacity hint. When non-zero, the first
+    /// time a series is touched in `insert` the entry's `points` list
+    /// is pre-grown to this many slots so the initial `appendSlice`
+    /// avoids the first growth allocation. Zero (the `init` default)
+    /// preserves the historical lazy-grow behaviour bit-for-bit.
+    /// ENT-002 / ENT-005.
+    points_per_series_hint: usize = 0,
 
     pub const SeriesEntry = struct {
         points: std.ArrayListUnmanaged(types.Point) = .empty,
@@ -59,6 +66,40 @@ pub const Memtable = struct {
             .series = std.AutoHashMap(types.SeriesId, SeriesEntry).init(allocator),
             .point_count = 0,
             .max_points = max_points,
+        };
+    }
+
+    /// Construct a Memtable pre-sized for the expected steady-state
+    /// cardinality. `expected_series` is a hint for the AutoHashMap
+    /// backing store; `expected_points_per_series` is a hint for each
+    /// per-series ArrayList. Both are best-effort: if the workload
+    /// exceeds the hint the structures still grow correctly, just with
+    /// the regular doubling cost.
+    ///
+    /// ENT-002 / ENT-005. The engine calls this from `Engine.init`
+    /// and from `maybeTriggerFlushLocked` / `sync` (rotation paths) so
+    /// the active memtable starts with enough capacity to avoid the
+    /// first-touch realloc on the steady-state ingest path. The
+    /// per-series ArrayList pre-sizing happens lazily on the first
+    /// `insert` for a given SeriesId — at construction time the set
+    /// of SeriesIds is not yet known.
+    pub fn initCapacity(
+        allocator: Allocator,
+        max_points: usize,
+        expected_series: usize,
+        expected_points_per_series: usize,
+    ) !Memtable {
+        var series = std.AutoHashMap(types.SeriesId, SeriesEntry).init(allocator);
+        errdefer series.deinit();
+        if (expected_series > 0) {
+            try series.ensureTotalCapacity(@intCast(expected_series));
+        }
+        return .{
+            .allocator = allocator,
+            .series = series,
+            .point_count = 0,
+            .max_points = max_points,
+            .points_per_series_hint = expected_points_per_series,
         };
     }
 
@@ -84,6 +125,15 @@ pub const Memtable = struct {
         const gop = try self.series.getOrPut(id);
         if (!gop.found_existing) {
             gop.value_ptr.* = .{};
+            // ENT-002 / ENT-005: when the engine constructed this
+            // memtable via `initCapacity` with a per-series hint,
+            // pre-grow the freshly-minted ArrayList so the
+            // `appendSlice` below stays a memcpy with no growth
+            // allocation. Hint == 0 (the `init` default) preserves
+            // the historical lazy-grow behaviour.
+            if (self.points_per_series_hint > 0) {
+                try gop.value_ptr.points.ensureTotalCapacity(self.allocator, self.points_per_series_hint);
+            }
         }
 
         const entry = gop.value_ptr;
@@ -267,6 +317,66 @@ test "Memtable: in-order appends keep sorted flag set" {
     const entry = mem.series.getPtr(id).?;
     try std.testing.expect(entry.sorted);
     try std.testing.expectEqual(@as(usize, 4), entry.points.items.len);
+}
+
+test "Memtable: initCapacity preserves insert semantics (ENT-002 / ENT-005)" {
+    // ENT-002 / ENT-005: this test exercises the pre-sized constructor
+    // and confirms it is a drop-in replacement for `init` on the
+    // semantic surface. The alloc-count drop is validated by the
+    // micro-bench (`benchmarks/micro/memtable.zig`); here we only
+    // verify behavioural equivalence — same insert semantics, same
+    // lazy-sort contract, no leaks under the testing allocator.
+    const allocator = std.testing.allocator;
+    var mem = try Memtable.initCapacity(allocator, 1_000_000, 16, 1024);
+    defer mem.deinit();
+
+    const id: types.SeriesId = 42;
+
+    // In-order insert keeps the entry sorted (steady-state ingest).
+    var ascending: [256]types.Point = undefined;
+    for (&ascending, 0..) |*p, i| p.* = .{ .ts = @intCast(i + 1000), .value = @intCast(i) };
+    try mem.insert(id, &ascending);
+
+    try std.testing.expectEqual(@as(usize, 256), mem.point_count);
+    {
+        const entry = mem.series.getPtr(id).?;
+        try std.testing.expect(entry.sorted);
+        try std.testing.expectEqual(@as(usize, 256), entry.points.items.len);
+        // The pre-sized ArrayList must already hold at least the hint.
+        try std.testing.expect(entry.points.capacity >= 1024);
+    }
+
+    // OoO insert flips sorted=false without sorting (P-ALGO-003 contract).
+    try mem.insert(id, &.{.{ .ts = 500, .value = -1 }});
+    {
+        const entry = mem.series.getPtr(id).?;
+        try std.testing.expect(!entry.sorted);
+        try std.testing.expectEqual(@as(i64, 500), entry.points.items[entry.points.items.len - 1].ts);
+    }
+
+    // Reader triggers the lazy sort.
+    const sorted = mem.getSortedPoints(id);
+    try std.testing.expectEqual(@as(i64, 500), sorted[0].ts);
+    try std.testing.expect(mem.series.getPtr(id).?.sorted);
+}
+
+test "Memtable: initCapacity with zero hints behaves like init" {
+    // Edge case: callers may pass (0, 0) when they only want the
+    // explicit-error API surface but not the pre-sizing. The result
+    // must be functionally identical to `init`.
+    const allocator = std.testing.allocator;
+    var mem = try Memtable.initCapacity(allocator, 1000, 0, 0);
+    defer mem.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), mem.points_per_series_hint);
+
+    const id: types.SeriesId = 9;
+    try mem.insert(id, &.{
+        .{ .ts = 10, .value = 1 },
+        .{ .ts = 20, .value = 2 },
+    });
+    try std.testing.expectEqual(@as(usize, 2), mem.point_count);
+    try std.testing.expect(mem.series.getPtr(id).?.sorted);
 }
 
 test "Memtable: clear resets sorted flag" {
