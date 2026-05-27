@@ -67,10 +67,37 @@ pub const ReplayFailure = struct {
 /// CRC32C checksum, hands the slice to the WAL library, and returns
 /// the LSN the WAL assigned. The LSN is monotonically increasing
 /// across all appends.
+///
+/// ## Concurrency (P-LOCK-005 partial)
+///
+/// State-mutating methods (`appendRecord`, `sync`, `truncate`) and the
+/// read accessors (`currentLsn`, `bytesSinceCompact`, `readFrom`,
+/// `forEachFrom*`) take `mu` internally. Today this is redundant —
+/// the engine already serialises every WAL touch through `Engine.mu`,
+/// so `mu` is uncontended in practice. The infrastructure exists so a
+/// future per-shard memtable change can drop `Engine.mu` around the
+/// `wal.appendRecord` + memtable insert pair without introducing a
+/// lost-update race on `current_lsn` or the underlying WAL file
+/// handle. See `docs/PERF_GAP_ANALYSIS.md` P-LOCK-001 / P-LOCK-005.
 pub const WalManager = struct {
     allocator: Allocator,
     inner: wal_lib.WriteAheadLog,
     current_lsn: u64,
+    /// Internal mutex serialising state-mutating ops (`appendRecord`,
+    /// `sync`, `truncate`) and read accessors. By itself this changes
+    /// nothing observable today — `Engine.mu` is held across every
+    /// WAL touch. It is the prerequisite for releasing `Engine.mu`
+    /// around the WAL+memtable phase in a future per-shard memtable
+    /// change without creating a lost-update race on `current_lsn`
+    /// or the WAL file handle.
+    ///
+    /// `std.Io.Mutex` to match the rest of the storage engine; the
+    /// `io` handle is fetched internally from
+    /// `std.Io.Threaded.global_single_threaded` so the public WAL
+    /// API stays unchanged. Recursion is avoided via the internal
+    /// `*Locked` helpers (e.g. `syncLocked`); public methods take
+    /// the lock and delegate.
+    mu: std.Io.Mutex = std.Io.Mutex.init,
 
     pub fn init(
         allocator: Allocator,
@@ -100,7 +127,21 @@ pub const WalManager = struct {
 
     const STACK_BUF_SIZE: usize = 16 * 1024;
 
+    /// Append a serialised record to the WAL and return its LSN.
+    ///
+    /// Concurrency: takes `self.mu`. Safe to call concurrently with
+    /// other `WalManager` methods.
     pub fn appendRecord(self: *WalManager, record: *WalRecord) !u64 {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        return self.appendRecordLocked(record);
+    }
+
+    /// Mutex-held variant of `appendRecord`. Caller MUST hold
+    /// `self.mu`. Exists so future intra-manager call sites can
+    /// chain without re-acquiring the lock.
+    fn appendRecordLocked(self: *WalManager, record: *WalRecord) !u64 {
         self.current_lsn += 1;
         record.lsn = self.current_lsn;
 
@@ -118,11 +159,27 @@ pub const WalManager = struct {
         }
     }
 
+    /// Force an fsync against the underlying WAL file.
+    ///
+    /// Concurrency: takes `self.mu`. Safe to call concurrently with
+    /// other `WalManager` methods.
     pub fn sync(self: *WalManager) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        try self.syncLocked();
+    }
+
+    /// Mutex-held variant of `sync`. Caller MUST hold `self.mu`.
+    fn syncLocked(self: *WalManager) !void {
         try self.inner.sync();
     }
 
     pub fn readFrom(self: *WalManager, start_lsn: u64, allocator: Allocator) ![]WalRecord {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+
         var all_records: std.ArrayList(WalRecord) = .empty;
         errdefer {
             for (all_records.items) |*r| r.deinit(allocator);
@@ -156,6 +213,14 @@ pub const WalManager = struct {
         ctx: anytype,
         comptime callback: fn (@TypeOf(ctx), *const WalRecord) anyerror!void,
     ) !void {
+        // The mutex is held across the whole iteration. In practice
+        // this is recovery-only (single-threaded), but a defensive
+        // lock here is cheap and prevents a concurrent appendRecord
+        // from mutating the WAL underneath the iterator.
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+
         const iter_from = if (start_lsn > 0) start_lsn - 1 else 0;
         var iter = try self.inner.iterator(iter_from);
         defer iter.deinit();
@@ -181,6 +246,10 @@ pub const WalManager = struct {
         ctx: anytype,
         comptime callback: fn (@TypeOf(ctx), *const WalRecord) anyerror!void,
     ) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+
         failure.* = null;
 
         const iter_from = if (start_lsn > 0) start_lsn - 1 else 0;
@@ -214,15 +283,38 @@ pub const WalManager = struct {
         }
     }
 
+    /// Compact the WAL up to and including `up_to_lsn`.
+    ///
+    /// Concurrency: takes `self.mu`. Safe to call concurrently with
+    /// other `WalManager` methods.
     pub fn truncate(self: *WalManager, up_to_lsn: u64) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        try self.truncateLocked(up_to_lsn);
+    }
+
+    /// Mutex-held variant of `truncate`. Caller MUST hold `self.mu`.
+    fn truncateLocked(self: *WalManager, up_to_lsn: u64) !void {
         try self.inner.compact(up_to_lsn);
     }
 
+    /// Returns a snapshot of the WAL's current LSN. The value can be
+    /// stale immediately on return if another thread is appending.
     pub fn currentLsn(self: *WalManager) u64 {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
         return self.inner.currentLsn();
     }
 
+    /// Returns a snapshot of the bytes appended since the last
+    /// compaction. The value can be stale immediately on return if
+    /// another thread is appending or truncating.
     pub fn bytesSinceCompact(self: *WalManager) u64 {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
         return self.inner.bytesSinceCompact();
     }
 };

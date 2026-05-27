@@ -587,11 +587,13 @@ pub const Config = EngineConfig;
 /// and `segment_integrity_failures`) that operators most often
 /// reach for when triaging.
 ///
-/// Every count and total is read while holding `Engine.mu`, so the
-/// snapshot is internally consistent — `*_total_ns / *_count` always
-/// yields the average latency for the same window. The snapshot is a
-/// value type; callers can hold onto it across engine ops without
-/// fear of mutation.
+/// Every count and total is read via `.load(.acquire)` on the
+/// matching atomic counter (P-LOCK-005 partial). The snapshot is
+/// per-field consistent but NOT a single atomic read across the
+/// struct — derived ratios (`*_total_ns / *_count`) can briefly
+/// disagree if a writer is mid-update during the snapshot. The
+/// snapshot is a value type; callers can hold onto it across
+/// engine ops without fear of mutation.
 ///
 /// All durations are in nanoseconds, sourced from the `.awake`
 /// monotonic clock (see `nowMonotonicNs`). The clock is cheap enough
@@ -645,6 +647,58 @@ pub const StatsSnapshot = struct {
     /// via the background error pipeline. Bumps on every recorded
     /// failure, NOT every read attempt.
     segment_integrity_failures: u64,
+};
+
+/// Internal, lock-free counter storage for `Engine`. Each field
+/// mirrors the same-named field in `StatsSnapshot` but is held as
+/// `std.atomic.Value(u64)` so updates do NOT require the engine
+/// lock. Reads use `.load(.acquire)`; writes use
+/// `.fetchAdd(value, .release)`.
+///
+/// Partial P-LOCK-005: lifting the three append-path counter
+/// updates out from under `Engine.mu` shrinks the lock-hold window
+/// of `appendPoints`. The win is small per call (3 × ~1 ns) but
+/// removes a hard dependency on the engine lock and keeps the
+/// observability path independent from the writer lock.
+pub const EngineCounters = struct {
+    append_count: std.atomic.Value(u64) = .init(0),
+    append_points: std.atomic.Value(u64) = .init(0),
+    append_total_ns: std.atomic.Value(u64) = .init(0),
+
+    query_count: std.atomic.Value(u64) = .init(0),
+    query_total_ns: std.atomic.Value(u64) = .init(0),
+    query_points_returned: std.atomic.Value(u64) = .init(0),
+
+    flush_count: std.atomic.Value(u64) = .init(0),
+    flush_total_ns: std.atomic.Value(u64) = .init(0),
+
+    compaction_count: std.atomic.Value(u64) = .init(0),
+    compaction_total_ns: std.atomic.Value(u64) = .init(0),
+
+    wal_records_dropped: std.atomic.Value(u64) = .init(0),
+    segment_integrity_failures: std.atomic.Value(u64) = .init(0),
+
+    /// Snapshot every field into a plain-`u64` `StatsSnapshot`.
+    /// Each load is `.acquire`; the resulting snapshot is internally
+    /// consistent on a per-field basis but NOT a single atomic read
+    /// across fields. In practice this matches the previous lock-
+    /// based behaviour, which also returned a struct copy.
+    pub fn snapshot(self: *const EngineCounters) StatsSnapshot {
+        return .{
+            .append_count = self.append_count.load(.acquire),
+            .append_points = self.append_points.load(.acquire),
+            .append_total_ns = self.append_total_ns.load(.acquire),
+            .query_count = self.query_count.load(.acquire),
+            .query_total_ns = self.query_total_ns.load(.acquire),
+            .query_points_returned = self.query_points_returned.load(.acquire),
+            .flush_count = self.flush_count.load(.acquire),
+            .flush_total_ns = self.flush_total_ns.load(.acquire),
+            .compaction_count = self.compaction_count.load(.acquire),
+            .compaction_total_ns = self.compaction_total_ns.load(.acquire),
+            .wal_records_dropped = self.wal_records_dropped.load(.acquire),
+            .segment_integrity_failures = self.segment_integrity_failures.load(.acquire),
+        };
+    }
 };
 
 /// LSM-style time-series storage engine.
@@ -751,23 +805,14 @@ pub const Engine = struct {
     /// `appendPoints`, so no additional synchronisation is needed.
     series_watermarks: std.AutoHashMapUnmanaged(types.SeriesId, i64) = .{},
 
-    /// Engine-wide latency / throughput counters. Updated under
-    /// `self.mu` by every hot path (append, query, flush, compaction).
-    /// Read out via `stats()`. Closes P-OBS-001.
-    counters: StatsSnapshot = .{
-        .append_count = 0,
-        .append_points = 0,
-        .append_total_ns = 0,
-        .query_count = 0,
-        .query_total_ns = 0,
-        .query_points_returned = 0,
-        .flush_count = 0,
-        .flush_total_ns = 0,
-        .compaction_count = 0,
-        .compaction_total_ns = 0,
-        .wal_records_dropped = 0,
-        .segment_integrity_failures = 0,
-    },
+    /// Engine-wide latency / throughput counters. Each field is a
+    /// `std.atomic.Value(u64)` updated lock-free by every hot path
+    /// (append, query, flush, compaction). Reads (`stats()`) snapshot
+    /// the full struct via `.load(.acquire)` on each field; writes use
+    /// `.fetchAdd(value, .release)`. Closes P-OBS-001; the lock-free
+    /// storage closes the counter-update slice of the partial
+    /// P-LOCK-005 work.
+    counters: EngineCounters = .{},
 
     /// Open (or create) an engine over `config.data_dir`.
     ///
@@ -862,18 +907,8 @@ pub const Engine = struct {
             .pool = pool,
             .reader_cache = SegmentReaderCache.init(allocator, DEFAULT_SEGMENT_READER_CACHE_CAPACITY),
             .counters = .{
-                .append_count = 0,
-                .append_points = 0,
-                .append_total_ns = 0,
-                .query_count = 0,
-                .query_total_ns = 0,
-                .query_points_returned = 0,
-                .flush_count = 0,
-                .flush_total_ns = 0,
-                .compaction_count = 0,
-                .compaction_total_ns = 0,
-                .wal_records_dropped = wal_drops,
-                .segment_integrity_failures = integrity_failures,
+                .wal_records_dropped = .init(wal_drops),
+                .segment_integrity_failures = .init(integrity_failures),
             },
         };
     }
@@ -1264,11 +1299,16 @@ pub const Engine = struct {
         }
 
         // Counters are bumped only on a clean return; failed calls
-        // do not pollute the latency average. We are still under the
-        // engine lock here.
-        self.counters.append_count += 1;
-        self.counters.append_points += @intCast(points.len);
-        self.counters.append_total_ns += nowMonotonicNs() - t_start;
+        // do not pollute the latency average. The counters are
+        // atomics (P-LOCK-005 partial) so these three writes do NOT
+        // depend on `self.mu` — they would still be correct if the
+        // engine lock were released earlier in this function. We
+        // keep them inside the lock window today because the lock
+        // is already held; the point of the atomics is removing the
+        // hard dependency, not the local cycle count.
+        _ = self.counters.append_count.fetchAdd(1, .release);
+        _ = self.counters.append_points.fetchAdd(@intCast(points.len), .release);
+        _ = self.counters.append_total_ns.fetchAdd(nowMonotonicNs() - t_start, .release);
     }
 
     /// Strict-mode OoO check (GAP-0010). Verifies every point's
@@ -1425,8 +1465,8 @@ pub const Engine = struct {
             // for a flush that errored out. Counter likewise bumps —
             // operators want to see failed flushes in the rate too.
             self.flushes_completed += 1;
-            self.counters.flush_count += 1;
-            self.counters.flush_total_ns += nowMonotonicNs() - t_start;
+            _ = self.counters.flush_count.fetchAdd(1, .release);
+            _ = self.counters.flush_total_ns.fetchAdd(nowMonotonicNs() - t_start, .release);
             self.recordBackgroundErrorLocked(.flush, err);
             self.done_cv.broadcast(io);
             self.mu.unlock(io);
@@ -1451,7 +1491,9 @@ pub const Engine = struct {
             error.BlockCorrupted,
             error.InvalidMagic,
             error.InvalidFile,
-            => self.counters.segment_integrity_failures += 1,
+            => {
+                _ = self.counters.segment_integrity_failures.fetchAdd(1, .release);
+            },
             else => {},
         }
         if (self.config.error_callback) |cb| {
@@ -1494,23 +1536,21 @@ pub const Engine = struct {
         };
     }
 
-    /// Atomic snapshot of the engine's observability counters
-    /// (P-OBS-001). All sub-counters are read together under
-    /// `self.mu`, so derived ratios (`*_total_ns / *_count`) are
-    /// computed against the same window.
+    /// Snapshot of the engine's observability counters (P-OBS-001).
+    /// Each sub-counter is read with `.load(.acquire)`; the result is
+    /// per-field consistent but NOT a single atomic read across the
+    /// struct. In practice this matches the previous lock-based
+    /// behaviour, which also returned a struct copy.
     ///
     /// Counter semantics are documented on `StatsSnapshot` itself.
     /// Returning a value type avoids any aliasing or post-snapshot
-    /// mutation: callers can stash, diff, or transport the result
-    /// without re-acquiring the lock.
+    /// mutation: callers can stash, diff, or transport the result.
     ///
-    /// Threading: takes the engine's lock; safe to call concurrently
-    /// with other engine methods. Overhead is negligible (a struct copy).
+    /// Threading: lock-free (P-LOCK-005 partial); safe to call
+    /// concurrently with any other engine method including the hot
+    /// `appendPoints` path.
     pub fn stats(self: *Engine) StatsSnapshot {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        self.mu.lockUncancelable(io);
-        defer self.mu.unlock(io);
-        return self.counters;
+        return self.counters.snapshot();
     }
 
     /// Drain and return the most recent background-worker error
@@ -1622,8 +1662,8 @@ pub const Engine = struct {
             mem.deinit();
             self.flushing_mem = null;
             self.flushes_completed += 1;
-            self.counters.flush_count += 1;
-            self.counters.flush_total_ns += nowMonotonicNs() - t_start;
+            _ = self.counters.flush_count.fetchAdd(1, .release);
+            _ = self.counters.flush_total_ns.fetchAdd(nowMonotonicNs() - t_start, .release);
             self.done_cv.broadcast(io);
             self.mu.unlock(io);
             return;
@@ -1691,8 +1731,8 @@ pub const Engine = struct {
             mem.deinit();
             self.flushing_mem = null;
             self.flushes_completed += 1;
-            self.counters.flush_count += 1;
-            self.counters.flush_total_ns += nowMonotonicNs() - t_start;
+            _ = self.counters.flush_count.fetchAdd(1, .release);
+            _ = self.counters.flush_total_ns.fetchAdd(nowMonotonicNs() - t_start, .release);
             self.done_cv.broadcast(io);
         }
 
@@ -1768,8 +1808,8 @@ pub const Engine = struct {
 
         defer {
             self.mu.lockUncancelable(io);
-            self.counters.compaction_count += 1;
-            self.counters.compaction_total_ns += nowMonotonicNs() - t_start;
+            _ = self.counters.compaction_count.fetchAdd(1, .release);
+            _ = self.counters.compaction_total_ns.fetchAdd(nowMonotonicNs() - t_start, .release);
             self.compaction_running = false;
             self.done_cv.broadcast(io);
             self.mu.unlock(io);
@@ -1817,8 +1857,8 @@ pub const Engine = struct {
         }
         // Always count completed compactions — success or failure —
         // so the rate reflects work attempted, not just successful work.
-        self.counters.compaction_count += 1;
-        self.counters.compaction_total_ns += nowMonotonicNs() - t_start;
+        _ = self.counters.compaction_count.fetchAdd(1, .release);
+        _ = self.counters.compaction_total_ns.fetchAdd(nowMonotonicNs() - t_start, .release);
         self.compaction_running = false;
         self.done_cv.broadcast(io);
         self.mu.unlock(io);
@@ -2199,13 +2239,10 @@ pub const Engine = struct {
             try self.querySegment(arena, io, seg, series_id, start_ts, end_ts, merge_it, &points_added);
         }
 
-        // Counters bump under the engine lock to stay consistent
-        // with the snapshot pattern used by stats().
-        self.mu.lockUncancelable(io);
-        self.counters.query_count += 1;
-        self.counters.query_points_returned += points_added;
-        self.counters.query_total_ns += nowMonotonicNs() - t_start;
-        self.mu.unlock(io);
+        // Counters are atomic (P-LOCK-005 partial); no lock needed.
+        _ = self.counters.query_count.fetchAdd(1, .release);
+        _ = self.counters.query_points_returned.fetchAdd(points_added, .release);
+        _ = self.counters.query_total_ns.fetchAdd(nowMonotonicNs() - t_start, .release);
         return merge_it;
     }
 
