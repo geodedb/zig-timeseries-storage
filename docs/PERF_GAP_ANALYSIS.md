@@ -12,6 +12,21 @@ Mode: **DOCS-ONLY**. Platform issue creation is deferred (token write access req
 - **Perf findings remaining open:** 3 of 32 (2 unidentified no-ID items deferred; see §2 table)
 - **Platform issues:** token write access unavailable; all GitLab actions deferred.
 
+## Phase H — Bench-driven enterprise-readiness pass (2026-05-27)
+
+Closed in this session by the bench-driven sweep documented in
+`docs/performance/2026-05-27-codec-micro-mixed-rw/ENTERPRISE_READINESS.md`:
+
+| Tag | Title | Commit | Outcome |
+|---|---|---|---|
+| ENT-001 / ENT-004 | `MergeIterator.initCapacity` + compactor caller | `9247206` | `merge_iter_k64` allocs 71 → 66 |
+| ENT-002 / ENT-005 | Memtable `initCapacity` + engine call-site updates | `ad415a6` | `memtable_insert_sorted/ooo` allocs 2 → 0; wall ~halved |
+| ENT-003 | `GorillaEncoder.reset` + `SegmentWriter` encoder pool | `dc50428` | `compaction_cost` allocs 107 → 100 |
+| ENT-006 (partial P-LOCK-005) | Atomic counters + WAL internal mutex | `4b40592` | `bench_concurrent_append` +7.5% throughput |
+
+P-LOCK-005 status updated from "Won't-Do" to "Partially Closed" — see
+its detail section below.
+
 ## Phase G Won't-Do (this session)
 
 The following items are **formally closed as Won't Do (this
@@ -356,8 +371,7 @@ correct concurrency with the compaction lock.
 
 ### P-LOCK-005 — `appendPoints` holds writer lock during WAL pwrite
 
-**Status: Deferred (Phase E XL)** -- per-shard memtable + per-WAL lock requires significant
-restructuring; depends on P-LOCK-001.
+**Status: Partially Closed (`4b40592`, 2026-05-27)** — WAL internal mutex landed; counter writes moved out of the engine lock via `std.atomic.Value(u64)`. Full closure (per-shard memtable) deferred — depends on P-LOCK-001.
 
 - **Category:** Concurrency
 - **Severity:** P1
@@ -367,12 +381,16 @@ restructuring; depends on P-LOCK-001.
 - **Evidence:** `src/engine.zig:125-148`. Exclusive lock then: `wal.appendRecord` (pwrite + possibly buffer grow), `active_mem.insert` (sort if OoO), `pool.submit`. All under the writer lock.
 - **Root cause:** WAL append is the slowest part of the write path but doesn't need the engine lock (WAL has its own state). Memtable insert needs *a* lock but not the global one.
 - **Expected delta if fixed:** 2-3× write throughput when several writers append concurrently to different series.
-- **Recommended fix:**
-  - Per-WAL mutex (or lock-free ring buffer + writer thread).
-  - Per-shard memtable mutex keyed by `series_id`.
-  - Group-commit on WAL fsync.
+- **Partial closure (`4b40592`):**
+  - `WalManager.mu` (`std.Io.Mutex`) serialises `appendRecord`, `sync`, `truncate`, and read accessors. `*Locked` helpers added to avoid recursive locking. Today this is uncontended (engine.mu still wraps every WAL touch) but it removes the lost-update risk for a future per-shard memtable change to release engine.mu around the WAL+memtable phase.
+  - `EngineCounters` uses `std.atomic.Value(u64)` for all 12 counter fields. The three appendPoints counter writes no longer depend on engine.mu. `stats()` is now lock-free.
+  - **Measured:** `bench_concurrent_append` (N=4 disjoint series) median throughput rose 4.38M → 4.71M ops/s (+7.5%), with wall_ns_stddev dropping from ~3M ns to ~200K ns. Three independent A/B passes of 5 samples each.
+- **Remaining (full closure unblock criteria):**
+  - Per-shard memtable mutex keyed by `series_id` (the value-copy rotation pattern in Memtable must be restructured first — see P-LOCK-001 unblock criteria).
+  - Group-commit on WAL fsync (orthogonal; P-IO-002 closed previously).
+  - Engine.mu released around the WAL+memtable insert phase once per-shard locks exist.
 - **Validation plan:**
-  - Bench: `bench_concurrent_append` — 8 writer threads, distinct series. Measure aggregate ops/s and p99.
+  - Already in CI: `bench_concurrent_append` (4 writer threads, distinct series). Target: ≥3× aggregate throughput vs single-threaded `append_single_series`.
 - **Rollout risk:** Medium. WAL internal state and replay path must be reviewed for concurrency.
 - **Affected paths:** `engine.zig:appendPoints`, `wal_manager.zig`.
 - **Platform issue:** TBD (token write access required).
