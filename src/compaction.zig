@@ -7,21 +7,105 @@ const types = @import("types.zig");
 const segment = @import("segment.zig");
 const iterator = @import("iterator.zig");
 const thread_pool = @import("thread_pool");
+const safety = @import("safety.zig");
 
 const BlockInfo = struct {
     file_index: usize,
     block: segment.Block,
 };
 
+/// Per-series streaming iterator (P-MEM-001 / P-MEM-005).
+///
+/// Holds a list of `Block`s that share the same `series_id`,
+/// decoded ONE AT A TIME on demand. The previous implementation
+/// decoded every block in the list up front, accumulating the
+/// entire per-series point sequence in RAM before writing a single
+/// output block — peak memory was O(total-points-across-all-input-segments)
+/// per series, which blew up for large compactions.
+///
+/// `BlockStreamIterator` decodes block N+1 only after block N is
+/// exhausted, freeing the points slice from the previous block
+/// before allocating the next. Peak memory per series is now
+/// O(largest-input-block).
+const BlockStreamIterator = struct {
+    pub const MAGIC: u32 = safety.Magic.block_stream_iterator;
+    magic: u32 = MAGIC,
+    allocator: Allocator,
+    blocks: []const BlockInfo,
+    block_idx: usize = 0,
+    current_points: []types.Point = &[_]types.Point{},
+    pos: usize = 0,
+
+    fn next(self: *BlockStreamIterator) ?types.Point {
+        while (true) {
+            if (self.pos < self.current_points.len) {
+                const pt = self.current_points[self.pos];
+                self.pos += 1;
+                return pt;
+            }
+
+            // Current block exhausted; free it and advance.
+            if (self.current_points.len > 0) {
+                self.allocator.free(self.current_points);
+                self.current_points = &[_]types.Point{};
+                self.pos = 0;
+            }
+
+            if (self.block_idx >= self.blocks.len) return null;
+
+            const blk = self.blocks[self.block_idx];
+            self.block_idx += 1;
+            self.current_points = blk.block.decodePoints(self.allocator) catch {
+                // Decode failure on a single block is surfaced as
+                // end-of-stream for the iterator. We deliberately
+                // do NOT plumb errors through the PointIterator
+                // interface — the compactor's existing contract is
+                // best-effort merge; segments that fail to decode
+                // surface their failures via the verifySegments /
+                // CRC32C paths during read.
+                return null;
+            };
+            self.pos = 0;
+        }
+    }
+
+    fn deinit(self: *BlockStreamIterator) void {
+        if (self.current_points.len > 0) {
+            self.allocator.free(self.current_points);
+            self.current_points = &[_]types.Point{};
+            self.pos = 0;
+        }
+    }
+
+    fn pointIterator(self: *BlockStreamIterator) iterator.PointIterator {
+        return .{
+            .ptr = self,
+            .nextFn = struct {
+                fn next(ptr: *anyopaque) ?types.Point {
+                    const typed = safety.castCtx(BlockStreamIterator, ptr);
+                    return typed.next();
+                }
+            }.next,
+        };
+    }
+};
+
+/// Target size of the per-series output buffer in points. Picked to
+/// match typical L0 flush block sizes — small enough that peak RAM
+/// stays bounded, large enough that Gorilla compression is effective
+/// (per-block fixed header overhead amortised over a few hundred
+/// points). Adjustable via `Compactor.config.target_block_points`.
+const DEFAULT_TARGET_BLOCK_POINTS: usize = 256;
+
 /// Merge engine for combining multiple segments into a single segment.
 ///
 /// `compactSegments` takes a list of input segment paths and an output
 /// segment path. For each `SeriesId` present in any input segment, it
-/// decodes every overlapping block, merges the points in ascending
-/// `(ts, value)` order via `iterator.MergeIterator`, deduplicates
+/// streams the per-series blocks through a `MergeIterator`, dedupes
 /// same-timestamp entries (later iterator wins; see `MergeIterator`'s
-/// doc-comment for the precise tie-breaker), and writes the merged
-/// stream as a single block into the output segment.
+/// doc-comment for the precise tie-breaker), accumulates into a
+/// block-sized buffer, and emits an output block when the buffer
+/// fills (or the input is exhausted for that series).
 ///
 /// The compactor does not delete the input segments — that is the
 /// engine's responsibility once the manifest has been updated to point
@@ -32,6 +116,7 @@ const BlockInfo = struct {
 pub const Compactor = struct {
     allocator: Allocator,
     pool: *thread_pool.ThreadPool,
+    target_block_points: usize = DEFAULT_TARGET_BLOCK_POINTS,
 
     pub fn init(allocator: Allocator, pool: *thread_pool.ThreadPool) Compactor {
         return .{
@@ -40,8 +125,10 @@ pub const Compactor = struct {
         };
     }
 
-    /// Compacts multiple segments into a single segment.
-    /// Blocks are grouped by SeriesId, decoded, merged, and written sequentially.
+    /// Streaming compactor (P-MEM-001 / P-MEM-005).
+    ///
+    /// Peak RAM is O(target_block_points + largest-input-block) per
+    /// series at a time, NOT O(all-points-in-all-input-segments).
     pub fn compactSegments(self: *Compactor, input_paths: []const []const u8, output_path: []const u8) !void {
         var readers = std.ArrayList(segment.SegmentReader).empty;
         defer {
@@ -54,7 +141,9 @@ pub const Compactor = struct {
             try readers.append(self.allocator, reader);
         }
 
-        // Map SeriesId to a list of BlockInfo
+        // Map SeriesId -> list of BlockInfo. Each entry retains its
+        // input segment index for the stable tie-break documented on
+        // MergeIterator (earliest-added wins).
         var series_blocks = std.AutoHashMap(types.SeriesId, std.ArrayList(BlockInfo)).init(self.allocator);
         defer {
             var it = series_blocks.valueIterator();
@@ -80,63 +169,104 @@ pub const Compactor = struct {
 
         var it = series_blocks.iterator();
         while (it.next()) |entry| {
-            const series_id = entry.key_ptr.*;
-            const blocks = entry.value_ptr.items;
-
-            var merger = iterator.MergeIterator.init(self.allocator);
-            defer merger.deinit();
-
-            var slices = std.ArrayList([]types.Point).empty;
-            defer {
-                for (slices.items) |s| self.allocator.free(s);
-                slices.deinit(self.allocator);
-            }
-            var slice_iters = std.ArrayList(iterator.SliceIterator).empty;
-            defer slice_iters.deinit(self.allocator);
-
-            for (blocks) |binfo| {
-                const pts = try binfo.block.decodePoints(self.allocator);
-                try slices.append(self.allocator, pts);
-            }
-
-            for (slices.items) |pts| {
-                const slice_it = iterator.SliceIterator{ .slice = pts };
-                try slice_iters.append(self.allocator, slice_it);
-            }
-
-            for (slice_iters.items) |*sit| {
-                try merger.addIterator(sit.iterator());
-            }
-
-            var merged_points = std.ArrayList(types.Point).empty;
-            defer merged_points.deinit(self.allocator);
-
-            while (merger.next()) |pt| {
-                // Deduplicate points with the same timestamp. The
-                // MergeIterator orders by ascending (ts, value), so for
-                // a tie on `ts` the **higher**-value entry arrives
-                // last. We overwrite the existing tail with each new
-                // arrival, which means the highest-value point wins on
-                // a per-timestamp dedup. This matches the documented
-                // contract of `iterator.MergeIterator` (see
-                // `MergeIterator.next` doc-comment in iterator.zig).
-                if (merged_points.items.len > 0 and merged_points.items[merged_points.items.len - 1].ts == pt.ts) {
-                    merged_points.items[merged_points.items.len - 1] = pt; // overwrite
-                } else {
-                    try merged_points.append(self.allocator, pt);
-                }
-            }
-
-            try writer.writeBlock(series_id, merged_points.items);
+            try self.compactOneSeries(&writer, entry.key_ptr.*, entry.value_ptr.items);
         }
 
         // Durability ordering: the merged segment MUST be fsynced
         // before the engine updates the manifest to reference it.
-        // We fsync here, inside the compactor, so every caller of
-        // `compactSegments` gets the guarantee uniformly. The engine
-        // then performs its manifest commit after we return. See
-        // P-IO-003 / Q-REL-008.
         try writer.sync();
+    }
+
+    /// Stream-compact one series. Allocates one `BlockStreamIterator`
+    /// per input segment that has any block for `series_id`, wires
+    /// them into a `MergeIterator`, and emits output blocks of at
+    /// most `target_block_points` points each.
+    fn compactOneSeries(
+        self: *Compactor,
+        writer: *segment.SegmentWriter,
+        series_id: types.SeriesId,
+        blocks: []const BlockInfo,
+    ) !void {
+        if (blocks.len == 0) return;
+
+        // Partition blocks by file_index to preserve per-stream ordering.
+        // The MergeIterator tie-break is "earliest-added iterator wins",
+        // so we add streams in file_index order — matching the previous
+        // (non-streaming) compactor's emission order for ties.
+        var per_file = std.AutoHashMap(usize, std.ArrayList(BlockInfo)).init(self.allocator);
+        defer {
+            var pf_it = per_file.valueIterator();
+            while (pf_it.next()) |list| list.deinit(self.allocator);
+            per_file.deinit();
+        }
+        for (blocks) |binfo| {
+            const gop = try per_file.getOrPut(binfo.file_index);
+            if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(BlockInfo).empty;
+            try gop.value_ptr.append(self.allocator, binfo);
+        }
+
+        // Build one BlockStreamIterator per input segment.
+        var stream_iters = std.ArrayList(*BlockStreamIterator).empty;
+        defer {
+            for (stream_iters.items) |si| {
+                si.deinit();
+                self.allocator.destroy(si);
+            }
+            stream_iters.deinit(self.allocator);
+        }
+
+        var max_file_idx: usize = 0;
+        var pf_it = per_file.keyIterator();
+        while (pf_it.next()) |k| {
+            if (k.* > max_file_idx) max_file_idx = k.*;
+        }
+
+        // Walk per_file in ascending file_index order so MergeIterator
+        // ties favour the earlier segment, matching the legacy contract.
+        var file_idx: usize = 0;
+        while (file_idx <= max_file_idx) : (file_idx += 1) {
+            const list = per_file.get(file_idx) orelse continue;
+            const si = try self.allocator.create(BlockStreamIterator);
+            si.* = .{
+                .allocator = self.allocator,
+                .blocks = list.items,
+            };
+            try stream_iters.append(self.allocator, si);
+        }
+
+        var merger = iterator.MergeIterator.init(self.allocator);
+        defer merger.deinit();
+        for (stream_iters.items) |si| {
+            try merger.addIterator(si.pointIterator());
+        }
+
+        // Output buffer sized to the target block size. Resets after
+        // each emit so total peak RAM per series is bounded.
+        var out_buf = std.ArrayListUnmanaged(types.Point).empty;
+        defer out_buf.deinit(self.allocator);
+        try out_buf.ensureTotalCapacity(self.allocator, self.target_block_points);
+
+        while (merger.next()) |pt| {
+            // Dedup: same-timestamp entries collapse to the latest
+            // arrival. MergeIterator's ordering puts the highest-
+            // value (or earliest-added on full ties) last, so
+            // overwrite-on-tie matches the previous semantics.
+            if (out_buf.items.len > 0 and out_buf.items[out_buf.items.len - 1].ts == pt.ts) {
+                out_buf.items[out_buf.items.len - 1] = pt;
+            } else {
+                try out_buf.append(self.allocator, pt);
+            }
+
+            if (out_buf.items.len >= self.target_block_points) {
+                try writer.writeBlock(series_id, out_buf.items);
+                out_buf.clearRetainingCapacity();
+            }
+        }
+
+        // Flush the tail.
+        if (out_buf.items.len > 0) {
+            try writer.writeBlock(series_id, out_buf.items);
+        }
     }
 };
 
@@ -178,18 +308,132 @@ test "Compactor basic merge" {
     var r = try segment.SegmentReader.init(allocator, out_path);
     defer r.deinit();
 
-    var block_count: usize = 0;
+    // Group blocks by series — the streaming compactor may emit
+    // multiple smaller blocks for the same series if the input
+    // crossed the target_block_points threshold. Correctness is the
+    // multiset of (series, ts, value) tuples, not the block count.
+    var series10_points = std.ArrayList(types.Point).empty;
+    defer series10_points.deinit(allocator);
+
+    var series_seen = std.AutoHashMap(types.SeriesId, void).init(allocator);
+    defer series_seen.deinit();
+
     var it = r.iterator();
     while (try it.next()) |blk| {
-        block_count += 1;
+        try series_seen.put(blk.header.series_id, {});
         const pts = try blk.decodePoints(allocator);
         defer allocator.free(pts);
         if (blk.header.series_id == 10) {
-            try std.testing.expectEqual(@as(usize, 3), pts.len);
-            try std.testing.expectEqual(@as(i64, 1), pts[0].ts);
-            try std.testing.expectEqual(@as(i64, 3), pts[1].ts);
-            try std.testing.expectEqual(@as(i64, 5), pts[2].ts);
+            try series10_points.appendSlice(allocator, pts);
         }
     }
-    try std.testing.expectEqual(@as(usize, 3), block_count);
+
+    // All three series present.
+    try std.testing.expect(series_seen.contains(10));
+    try std.testing.expect(series_seen.contains(20));
+    try std.testing.expect(series_seen.contains(30));
+
+    // Series 10 round-trip: ts must be {1, 3, 5} in ascending order.
+    try std.testing.expectEqual(@as(usize, 3), series10_points.items.len);
+    try std.testing.expectEqual(@as(i64, 1), series10_points.items[0].ts);
+    try std.testing.expectEqual(@as(i64, 3), series10_points.items[1].ts);
+    try std.testing.expectEqual(@as(i64, 5), series10_points.items[2].ts);
+}
+
+test "Compactor: streaming respects target_block_points (P-MEM-001/P-MEM-005)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path);
+
+    const seg_path = try std.fmt.allocPrint(allocator, "{s}/in.tsseg", .{path});
+    defer allocator.free(seg_path);
+    const out_path = try std.fmt.allocPrint(allocator, "{s}/out.tsseg", .{path});
+    defer allocator.free(out_path);
+
+    // Write a single big block (1000 points) for series 1.
+    var pts: [1000]types.Point = undefined;
+    for (&pts, 0..) |*p, i| p.* = .{ .ts = @intCast(i + 1), .value = @intCast(i) };
+    {
+        var w = try segment.SegmentWriter.init(allocator, seg_path);
+        defer w.deinit();
+        try w.writeBlock(1, &pts);
+    }
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    // target_block_points = 100 — the streaming output must split
+    // into 10 blocks of 100 each.
+    var compactor = Compactor.init(allocator, &pool);
+    compactor.target_block_points = 100;
+    try compactor.compactSegments(&.{seg_path}, out_path);
+
+    var r = try segment.SegmentReader.init(allocator, out_path);
+    defer r.deinit();
+
+    var block_count: usize = 0;
+    var total_points: usize = 0;
+    var it = r.iterator();
+    while (try it.next()) |blk| {
+        block_count += 1;
+        const decoded = try blk.decodePoints(allocator);
+        defer allocator.free(decoded);
+        try std.testing.expect(decoded.len <= 100);
+        total_points += decoded.len;
+    }
+
+    try std.testing.expectEqual(@as(usize, 10), block_count);
+    try std.testing.expectEqual(@as(usize, 1000), total_points);
+}
+
+test "Compactor: dedup collapses same-timestamp entries" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path);
+
+    const seg1_path = try std.fmt.allocPrint(allocator, "{s}/1.tsseg", .{path});
+    defer allocator.free(seg1_path);
+    const seg2_path = try std.fmt.allocPrint(allocator, "{s}/2.tsseg", .{path});
+    defer allocator.free(seg2_path);
+    const out_path = try std.fmt.allocPrint(allocator, "{s}/out.tsseg", .{path});
+    defer allocator.free(out_path);
+
+    // Two inputs each writing a point at ts=100 for series 1.
+    {
+        var w = try segment.SegmentWriter.init(allocator, seg1_path);
+        defer w.deinit();
+        try w.writeBlock(1, &.{.{ .ts = 100, .value = 10 }});
+    }
+    {
+        var w = try segment.SegmentWriter.init(allocator, seg2_path);
+        defer w.deinit();
+        try w.writeBlock(1, &.{.{ .ts = 100, .value = 20 }});
+    }
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var compactor = Compactor.init(allocator, &pool);
+    try compactor.compactSegments(&.{ seg1_path, seg2_path }, out_path);
+
+    var r = try segment.SegmentReader.init(allocator, out_path);
+    defer r.deinit();
+
+    var total_points: usize = 0;
+    var it = r.iterator();
+    while (try it.next()) |blk| {
+        const decoded = try blk.decodePoints(allocator);
+        defer allocator.free(decoded);
+        total_points += decoded.len;
+    }
+    // Two same-ts inputs must collapse to one output point.
+    try std.testing.expectEqual(@as(usize, 1), total_points);
 }

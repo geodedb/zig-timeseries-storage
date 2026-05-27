@@ -46,6 +46,7 @@ pub const Magic = struct {
     pub const engine: u32 = 0xE0F1_C001; // "Engine context 0001"
     pub const slice_iterator: u32 = 0x5117_DEC0;
     pub const merge_iterator: u32 = 0x4E25_DEC1;
+    pub const block_stream_iterator: u32 = 0xB10C_5DEC;
 };
 
 /// Validate that `ctx` really points at a struct of type `T` by
@@ -90,4 +91,7 @@ test "castCtx: distinct types use distinct magics" {
     try std.testing.expect(Magic.engine != Magic.slice_iterator);
     try std.testing.expect(Magic.engine != Magic.merge_iterator);
     try std.testing.expect(Magic.slice_iterator != Magic.merge_iterator);
+    try std.testing.expect(Magic.block_stream_iterator != Magic.engine);
+    try std.testing.expect(Magic.block_stream_iterator != Magic.slice_iterator);
+    try std.testing.expect(Magic.block_stream_iterator != Magic.merge_iterator);
 }
