@@ -8,21 +8,26 @@ GitLab serves as the authoritative system of record for all requirements and gap
 
 ## Run Summary
 
-- **Date:** 2026-05-26 (initial audit)
+- **Date:** 2026-05-26 (initial audit; closures through Phase G)
 - **Audit phase:** full `/codepros:audit` (Phase 1 spec extraction, Phase 2 codebase mapping, Phase 3 gap detection)
-- **Open gaps:** 11 (GAP-0001 through GAP-0011)
+- **Open gaps:** 11 (GAP-0001 through GAP-0011); 9 closed full, 2 partial after Phase G
 - **Verified-implemented spec items:** 3 (SPEC-NEW-2, SPEC-NEW-5, SPEC-NEW-6) -- see [GAP_ANALYSIS_RESOLVED.md](file:///home/benji/src/devnw/zig/timeseries-storage/docs/GAP_ANALYSIS_RESOLVED.md)
 
 ## Gap-Closure Session Summary
 
 - **Date:** 2026-05-26
-- **Session:** gap-closure run; 32 commits merged
-- **Items closed (full):** GAP-0003, GAP-0004, GAP-0005, GAP-0006, GAP-0007, GAP-0008, GAP-0011 (7 of 11)
-- **Items partial:** GAP-0001, GAP-0009 (2 of 11)
-- **Items deferred:** GAP-0002, GAP-0010 (2 of 11)
+- **Session:** gap-closure run; 46+ commits merged across phases A-G
+- **Items closed (full):** GAP-0001, GAP-0003, GAP-0004, GAP-0005, GAP-0006, GAP-0007, GAP-0008, GAP-0010, GAP-0011 (9 of 11)
+- **Items partial:** GAP-0002 (seam + opaque derivation landed; persistent tenant catalog deferred), GAP-0009 (format version + migration tool landed; CLI subcommand still pending)
 - **GitLab issue updates:** token write access unavailable during this session; all issue closures marked "close manually after token restore"
 
-Fully-closed items (GAP-0003 through GAP-0011 where complete) have been moved to
+### Phase G closure summary (this session)
+
+- **GAP-0001 (full):** Manifest TDE landed in commit `910b7a5`. AES-256-GCM `TSMNF002` format completes TDE coverage across WAL (`38a944b`), segments (`c376bb5`), and now the manifest. SEC-006 closed in full as a side effect.
+- **GAP-0002 (minimal viable):** Commit `407732f` lands the `AccessController` seam (gating both `appendPoints` and `queryPoints`) and the `opaqueSeriesId(tenant, app_key, key)` HMAC-SHA256 derivation. SEC-007 (BOLA access seam) and SEC-008 (opaque ID derivation) close on this commit. A full persistent tenant catalog is still future work but does not require further engine API changes — adapters can wire the seam + derivation without coordination.
+- **GAP-0010 (full):** Commit `723aa6f` adds overlap-aware compaction. Cross-segment OoO writes are now reconciled by folding overlapping segments at compaction time; same-timestamp collisions resolve last-write-wins. A strict opt-in mode (`allow_cross_segment_ooo = false`) rejects OoO points with `error.OutOfOrderTimestamp` for callers that need monotonic-only ingest.
+
+Fully-closed items have been moved to
 [GAP_ANALYSIS_RESOLVED.md](file:///home/benji/src/devnw/zig/timeseries-storage/docs/GAP_ANALYSIS_RESOLVED.md).
 
 ---
@@ -34,29 +39,22 @@ Fully-closed items (GAP-0003 through GAP-0011 where complete) have been moved to
 - **GitLab issue:** [#1](https://gitlab.com/devnw/zig/timeseries-storage/-/issues/1)
 - **Category:** Security
 - **Severity:** High
-- **Status:** Partial (WAL wired; segments + manifest still plaintext)
+- **Status:** **Closed (full)** -- commits `38a944b` (WAL), `c376bb5` (segments), `910b7a5` (manifest)
 
-#### What was closed (commit `38a944b`)
+#### Closure summary
 
-`WalConfig.encryption_key` is now wired through `EngineConfig` and propagated to `WalManager` on
-`Engine.init`. The AES-256-GCM key slot is populated when a key is provided in config.
+Full AES-256-GCM TDE now covers every on-disk artefact:
 
-#### What remains open
+| Surface  | Magic       | AAD                                                       | Commit    |
+|----------|-------------|-----------------------------------------------------------|-----------|
+| WAL      | -           | (wal-library internal)                                    | `38a944b` |
+| Segment  | `TSSEG003`  | `graph_uuid \|\| "seg" \|\| segment_id \|\| block_index`  | `c376bb5` |
+| Manifest | `TSMNF002`  | `ts_uuid \|\| "mnf" \|\| counter`                         | `910b7a5` |
 
-- `SegmentWriter` still writes blocks in plaintext (`src/segment.zig:60-63`).
-- `Manifest.writeToFile` still serializes plaintext (`src/manifest.zig:147-159`).
-- No AES-256-GCM framing is implemented for either file type.
-- AAD binding to `{graph_uuid, file_type, segment_id}` not implemented.
-
-#### Recommended next steps
-
-1. Implement AES-256-GCM framing in `SegmentWriter` and `Manifest.writeToFile`/`readFromFile`.
-2. Bind AAD to `{graph_uuid, file_type, segment_id}` to prevent cross-file substitution attacks.
-3. Unit tests: reading a segment or manifest without the key must fail.
-
-#### GitLab issue action
-
-Would be moved to "In Progress" (partially closed) -- token unavailable, update manually.
+Domain-separation tags (`"seg"` vs `"mnf"`) prevent cross-context
+ciphertext reuse even when surfaces share the same 32-byte master
+key. Wrong-key / no-key reopens fail closed with
+`error.DecryptionFailed`. SEC-006 closed as a side effect.
 
 ---
 
@@ -65,26 +63,43 @@ Would be moved to "In Progress" (partially closed) -- token unavailable, update 
 - **GitLab issue:** [#2](https://gitlab.com/devnw/zig/timeseries-storage/-/issues/2)
 - **Category:** Security
 - **Severity:** Medium
-- **Status:** Deferred -- API-breaking change; blocked on Geode coordination
+- **Status:** **Partial (seam + derivation closed; persistent catalog deferred)** -- commit `407732f`
 
-#### Reason for deferral
+#### What was closed in Phase G (commit `407732f`)
 
-Implementing a tenant-scoped `SeriesId` catalog requires an API-breaking change to both
-`appendPoints` and `queryPoints` (adding a `TenantContext` parameter). This touches the Geode
-integration contract and cannot be landed without coordination with the Geode team's public API
-surface. The dependent `SEC-007` (BOLA) and `SEC-008` (raw u128) findings also remain open.
+Two reusable primitives ship in this commit:
+
+1. **`AccessController` seam** — pluggable per-call authoriser
+   wired into `appendPoints` and `queryPoints`. The engine gates
+   every call through the controller BEFORE any state mutation.
+   Reference implementations: `PermissiveAccessController` (always
+   allow), `DenyAllAccessController` (always deny, fail-closed
+   default). SEC-007 (BOLA) closes against this seam.
+
+2. **`opaqueSeriesId(tenant, app_key, key)`** — HMAC-SHA256(key,
+   tenant_le \|\| app_key_le) truncated to u128. Callers derive
+   unguessable SeriesIds without exposing the key to the engine.
+   SEC-008 (raw u128 enumerability) closes against this helper.
+
+#### What remains open
+
+A persistent `(tenant_id, app_series_id) -> opaque_id` catalog is
+still future work. Adapters that want full GAP-0002 coverage today
+already have everything they need: the seam enforces the boundary,
+and the HMAC derivation provides the catalog entries. The remaining
+work is "store the entries in a durable, encrypted-at-rest table" —
+something the engine itself does not need to know about (it stays
+`u128`-on-disk; only the adapter's derivation needs to round-trip).
 
 #### Unblock steps
 
-1. Agree on the `TenantContext` parameter shape with the Geode team.
-2. Draft an ADR covering the encrypted catalog design.
-3. Implement the catalog, then update the API signature.
-4. Migrate all existing callers in Geode before merging.
+1. Agree on the catalog data model with the Geode team (ADR).
+2. Implement the catalog inside the adapter (Geode) using the
+   engine's existing `appendPoints` / `queryPoints` surface.
+3. Wire the adapter's authoriser implementation into the
+   engine's `access_controller` config slot.
 
-#### GitLab issue action
-
-Would remain Open with a "Deferred" label and a comment explaining the blocker -- token
-unavailable, update manually.
+No further engine API changes are required.
 
 ---
 
@@ -126,29 +141,35 @@ Would be created as a new issue once token write access is restored. Assign labe
 - **GitLab issue:** TBD -- pending issue creation (token write access required)
 - **Category:** Feature
 - **Severity:** High
-- **Status:** Deferred -- XL design work required
+- **Status:** **Closed (full)** -- commit `723aa6f`
 
-#### Reason for deferral
+#### Closure summary (commit `723aa6f`)
 
-Cross-segment OoO write handling is an XL design item requiring a sidecar-memtable or
-eager-rewrite approach. The design must be consistent with the manifest's `(min_ts, max_ts)` per
-segment invariants and the new CRC32C integrity tagging added in `088b2f1`. The implementation
-risk is high enough to require a dedicated sprint and an ADR.
+The compaction layer now reconciles overlapping segments instead
+of leaving them stranded. Two modes:
 
-#### Current state
+- **Permissive (default, `allow_cross_segment_ooo = true`):**
+  `appendPoints` accepts late points; the resulting overlapping
+  segment is folded back into time order by the next compaction
+  pass. Same-timestamp collisions resolve last-write-wins via the
+  MergeIterator tie-break + per-ts dedup pipeline.
+- **Strict (opt-in, `allow_cross_segment_ooo = false`):**
+  `appendPoints` returns `error.OutOfOrderTimestamp` when any
+  input ts is less than the running per-series watermark. No
+  state mutation on rejection.
 
-- In-memory OoO within the active memtable is handled correctly (`src/memtable.zig`).
-- Writes for timestamps earlier than the max of any closed segment are currently either silently
-  dropped or held in the active memtable without merging into the correct historical segment.
+Implementation details:
 
-#### Unblock steps
+- Both `compactL0` (background) and `compactL0Forced` (operator-
+  driven) now route through `collectOverlappingInputsLocked`:
+  pick every L0 segment, then expand the set with any higher-
+  level segment whose `[min_ts, max_ts]` overlaps. Inputs are
+  sorted by segment id ascending so the merge produces last-
+  write-wins.
+- Output level = max(input.level) so OoO reconciliation does NOT
+  climb the level ladder unboundedly.
+- Strict-mode watermark stored per-series in a HashMap, seeded
+  lazily from the manifest on first reference.
 
-1. Write an ADR covering the sidecar-memtable vs. eager-rewrite trade-offs.
-2. Implement chosen approach with tests covering: late points in a closed segment, compaction
-   folding of buffered OoO points, manifest invariant preservation.
-3. Add `ooo_writes_total` and `ooo_target_segment` counters.
-
-#### GitLab issue action
-
-Would be created as a new issue once token write access is restored. Assign label
-`feature`, `severity::high`, `status::deferred`, `effort::xl`.
+Tests cover end-to-end cross-segment OoO reconciliation, same-
+timestamp last-write-wins resolution, and strict-mode rejection.

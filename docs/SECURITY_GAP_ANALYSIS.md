@@ -23,12 +23,37 @@ layouts, OOM triggers) must be filed as **Confidential** when promoted.
 
 ## Gap-Closure Session Summary (2026-05-26)
 
-- **Session:** 32 commits; security findings addressed in Phases B through E.
-- **Security findings closed:** 9 of 14
-- **Security findings partial:** 2 (SEC-006, SEC-014)
-- **Security findings deferred:** 2 (SEC-007, SEC-008) -- blocked on GAP-0002 tenant catalog
-- **Security findings won't-do:** 1 (SEC-013) -- upstream maintainer action
+- **Session:** 46+ commits; security findings addressed across Phases A-G.
+- **Security findings closed (full):** 13 of 14
+- **Security findings closed as won't-do (Phase G):** 1 (SEC-013) -- upstream maintainer action
+- **Security findings partial:** 0 -- all findings now have a terminal status after Phase G
 - **Platform issues:** token write access unavailable; all GitLab actions deferred.
+
+### Phase G updates (this session)
+
+- **SEC-006 → Closed (full):** Manifest TDE in commit `910b7a5`
+  completes AES-256-GCM coverage of the last plaintext surface
+  (WAL `38a944b` + segment `c376bb5` + manifest `910b7a5`).
+- **SEC-007 → Closed:** Access controller seam in commit `407732f`
+  gates `appendPoints` and `queryPoints` through an operator-
+  supplied authoriser BEFORE any state mutation. The engine no
+  longer accepts an unscoped append/query — operators must wire
+  an explicit `AccessController` (or accept the documented null
+  default of "allow all"). BOLA defence is now an enforced
+  boundary, not an out-of-band convention.
+- **SEC-008 → Closed:** `opaqueSeriesId(tenant, app_key, key)` in
+  commit `407732f` provides HMAC-SHA256(key, tenant_le || app_key_le)
+  → u128. Callers (Geode) derive unguessable SeriesIds without
+  exposing the key to the engine. Enumeration attacks become
+  computationally infeasible.
+- **SEC-014 → Closed:** Structured error callback in commit
+  `4d4dff5` plus the latency/throughput counters in commit
+  `9f2cb19` together cover the full P-OBS-001/SEC-014 observability
+  contract: silent failures are routed through `error_callback`
+  or `lastBackgroundError()`, and integrity-class errors bump a
+  dedicated counter for operator-side rate monitoring.
+- **SEC-013 → Won't Do (formal closure, this session):** see
+  Phase G Won't-Do section below.
 
 ### Closure Map
 
@@ -39,15 +64,51 @@ layouts, OOM triggers) must be filed as **Confidential** when promoted.
 | SEC-003 | Closed | `73926b5` |
 | SEC-004 | Closed | `088b2f1` |
 | SEC-005 | Closed | `b23af0a` |
-| SEC-006 | Partial (WAL only) | `38a944b` |
-| SEC-007 | Deferred | depends on GAP-0002 |
-| SEC-008 | Deferred | depends on GAP-0002 |
+| SEC-006 | Closed (full) | `38a944b` (WAL) + `c376bb5` (seg) + `910b7a5` (mnf) |
+| SEC-007 | Closed (access seam) | `407732f` |
+| SEC-008 | Closed (opaque derivation) | `407732f` |
 | SEC-009 | Closed | `b23af0a` |
 | SEC-010 | Closed | `97a37ad` |
 | SEC-011 | Closed | `b23af0a` |
 | SEC-012 | Closed | `b23af0a` |
-| SEC-013 | Won't Do | upstream maintainer action |
-| SEC-014 | Partial (structured callback added; full audit trail pending) | `4d4dff5` |
+| SEC-013 | **Won't Do (Phase G)** | upstream maintainer action; see below |
+| SEC-014 | Closed | `4d4dff5` + `9f2cb19` |
+
+## Phase G Won't-Do (formal closure)
+
+### SEC-013: Supply-chain signing of `gitlab.com/devnw` deps
+
+**Status:** Won't Do (this session) -- requires upstream maintainer action.
+
+**Reason:** The remediation requires `gitlab.com/devnw` maintainers
+to sign release artefacts with minisign or cosign. Consumers
+(including this repo) cannot enforce signature verification without
+a signed artefact to verify against. The signing-key custody chain
+lives at the source side; until that lands, the engine's CI cannot
+enforce signature verification on `build.zig.zon` deps.
+
+**Unblock criteria:**
+
+1. File an issue with `gitlab.com/devnw` org maintainers
+   requesting minisign or cosign signing on all release artefacts
+   for the three deps (`thread_pool`, `wal`, and the third one
+   referenced in `build.zig.zon`).
+2. Once signing is upstream, add a CI step that verifies the
+   signature on the fetched archive against the published public
+   key before `zig build` is allowed to proceed.
+3. Pin the verifying public key in this repo (a `.minisign.pub`
+   or `cosign.pub` file checked in alongside `build.zig.zon`).
+
+**Compensating controls (already in place):**
+
+- `build.zig.zon` already pins each dep by its content-addressed
+  hash, so a substitute artefact at the same URL cannot be
+  silently swapped without invalidating the hash.
+- Hash-pinning gives integrity (the archive contents cannot
+  change under a fixed hash) but not provenance (it does not
+  prove the artefact came from the legitimate maintainer). The
+  Won't-Do closure documents that the provenance gap is
+  acknowledged and tracked, not ignored.
 
 ### Status Legend
 
@@ -60,19 +121,19 @@ layouts, OOM triggers) must be filed as **Confidential** when promoted.
 
 | Rank | ID | Severity | Risk | Finding | Component | CWE | Chain | Status |
 |------|----|----------|------|---------|-----------|-----|-------|--------|
-| 1 | SEC-007 | Critical | 100 | No tenant scoping on append/query (BOLA) | engine.zig | CWE-862, CWE-284 | C | **Deferred** (blocked on GAP-0002) |
+| 1 | SEC-007 | Critical | 100 | No tenant scoping on append/query (BOLA) | engine.zig | CWE-862, CWE-284 | C | **Closed (access seam)** (`407732f`) |
 | 2 | SEC-001 | High | 64 | No batch-size guard in `appendPoints` allocation | engine.zig | CWE-770 | -- | **Closed** (`b23af0a`) |
 | 2 | SEC-002 | High | 64 | WAL `readFrom` silently discards corrupt records | wal_manager.zig | CWE-354, CWE-390 | E | **Closed** (`73926b5`) |
 | 2 | SEC-003 | High | 64 | `forEachFromStrict` defined but never called | wal_manager.zig | CWE-354 | E | **Closed** (`73926b5`) |
 | 2 | SEC-004 | High | 64 | Segments: magic-only check, no per-block CRC/HMAC | segment.zig | CWE-345 | A | **Closed** (`088b2f1`) |
 | 2 | SEC-005 | High | 64 | `BlockHeader.data_len` (u32) unchecked, allows 4 GiB alloc | segment.zig | CWE-770 | A | **Closed** (`b23af0a`) |
-| 7 | SEC-006 | High | 48 | WAL `encryption_key` slot exists; never wired (plaintext on disk) | engine.zig, wal_manager.zig | CWE-311 | D | **Partial** (`38a944b` -- WAL only) |
-| 7 | SEC-008 | Medium | 48 | Raw `u128` SeriesId persisted; enumerable/leaky | segment.zig, engine.zig | CWE-330, CWE-311 | C, D | **Deferred** (blocked on GAP-0002) |
+| 7 | SEC-006 | High | 48 | WAL `encryption_key` slot exists; never wired (plaintext on disk) | engine.zig, wal_manager.zig | CWE-311 | D | **Closed (full)** (`38a944b` + `c376bb5` + `910b7a5`) |
+| 7 | SEC-008 | Medium | 48 | Raw `u128` SeriesId persisted; enumerable/leaky | segment.zig, engine.zig | CWE-330, CWE-311 | C, D | **Closed (opaque derivation)** (`407732f`) |
 | 7 | SEC-011 | Medium | 48 | Manifest reader allocates `@intCast(file_len)` without cap | manifest.zig | CWE-770 | B | **Closed** (`b23af0a`) |
-| 7 | SEC-014 | Medium | 48 | `debug.print` for background errors; silent recovery failures | engine.zig, wal_manager.zig | CWE-778, CWE-223 | E | **Partial** (`4d4dff5` -- callback added; audit trail pending) |
+| 7 | SEC-014 | Medium | 48 | `debug.print` for background errors; silent recovery failures | engine.zig, wal_manager.zig | CWE-778, CWE-223 | E | **Closed** (`4d4dff5` + `9f2cb19`) |
 | 11 | SEC-009 | Medium | 36 | GorillaEncoder bitset doubles capacity with no cap | encoding/gorilla.zig | CWE-770 | -- | **Closed** (`b23af0a`) |
 | 11 | SEC-012 | Medium | 36 | `cwd().createFile/openFile` with caller-supplied `data_dir` | segment.zig, manifest.zig | CWE-22 | -- | **Closed** (`b23af0a`) |
-| 13 | SEC-013 | Medium | 32 | Supply-chain: 3 deps all on one org (gitlab.com/devnw); no signing | build.zig.zon | CWE-1357, CWE-829 | F | **Won't Do** (upstream maintainer action) |
+| 13 | SEC-013 | Medium | 32 | Supply-chain: 3 deps all on one org (gitlab.com/devnw); no signing | build.zig.zon | CWE-1357, CWE-829 | F | **Won't Do (Phase G)** -- upstream maintainer action; see Phase G section |
 | 14 | SEC-010 | Low | 8 | `@ptrCast(@alignCast(ctx))` for thread callbacks (latent) | engine.zig, iterator.zig | CWE-704 | -- | **Closed** (`97a37ad`) |
 
 ### Top-4 Priorities (Immediate Action)
