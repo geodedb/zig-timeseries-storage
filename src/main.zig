@@ -14,8 +14,7 @@
 //!   tsdb verify  --data-dir <dir>
 //!   tsdb backup  --data-dir <src>  --to   <dest>     (GAP-0003)
 //!   tsdb restore --from <src>      --to   <dest>     (GAP-0003)
-//!
-//! Retention (`prune`) lands in a follow-up commit (GAP-0004).
+//!   tsdb prune   --data-dir <dir>  [--max-age-ms N]  (GAP-0004)
 //!
 //! Every subcommand maps its own exit code:
 //!   0 — success
@@ -43,6 +42,7 @@ pub const Args = struct {
     end: ?i64 = null,
     to: ?[]const u8 = null,
     from: ?[]const u8 = null,
+    max_age_ms: ?i64 = null,
 
     /// Parse `argv[start_idx..]` into self. Returns `error.UsageError`
     /// on unknown flags or missing flag values. Unknown flags are
@@ -84,6 +84,10 @@ pub const Args = struct {
                 if (i + 1 >= argv.len) return error.UsageError;
                 out.from = argv[i + 1];
                 i += 1;
+            } else if (std.mem.eql(u8, a, "--max-age-ms")) {
+                if (i + 1 >= argv.len) return error.UsageError;
+                out.max_age_ms = std.fmt.parseInt(i64, argv[i + 1], 10) catch return error.UsageError;
+                i += 1;
             } else {
                 return error.UsageError;
             }
@@ -103,6 +107,7 @@ pub const SubCommand = enum {
     verify,
     backup,
     restore,
+    prune,
     help,
 
     pub fn parse(s: []const u8) ?SubCommand {
@@ -115,6 +120,7 @@ pub const SubCommand = enum {
             .{ "verify", SubCommand.verify },
             .{ "backup", SubCommand.backup },
             .{ "restore", SubCommand.restore },
+            .{ "prune", SubCommand.prune },
             .{ "help", SubCommand.help },
             .{ "-h", SubCommand.help },
             .{ "--help", SubCommand.help },
@@ -264,6 +270,26 @@ fn cmdRestore(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: Args) !void
     try out.print("restore OK: {s} -> {s}\n", .{ src, dest });
 }
 
+fn cmdPrune(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: Args) !void {
+    _ = io;
+    const data_dir = try requireDataDir(args);
+    // --max-age-ms is required: a CLI invocation with no retention
+    // configured would be a silent no-op, which is worse than a
+    // usage error.
+    const max_age = args.max_age_ms orelse return error.UsageError;
+
+    var pool = try thread_pool.ThreadPool.init(gpa, .{ .max_threads = 1 });
+    defer pool.deinit();
+    var eng = try lib.Engine.init(gpa, .{
+        .data_dir = data_dir,
+        .retention_max_age_ms = max_age,
+    }, &pool);
+    defer eng.deinit();
+
+    const removed = try eng.pruneExpired();
+    try out.print("pruned {d} segment(s); remaining={d}\n", .{ removed, eng.man.segments.items.len });
+}
+
 fn cmdHelp(out: *Io.Writer) !void {
     try out.writeAll(
         \\timeseries-storage CLI
@@ -287,6 +313,8 @@ fn cmdHelp(out: *Io.Writer) !void {
         \\           Quiesce the engine and copy data files to <dest>.
         \\  restore  --from <src> --to <dest>
         \\           Verify <src> and copy its files into <dest>.
+        \\  prune    --data-dir <dir> --max-age-ms <N>
+        \\           Remove segments whose max_ts is older than (now - N) ms.
         \\
         \\Exit codes: 0 = ok, 1 = usage error, 2 = engine error.
         \\
@@ -368,6 +396,7 @@ fn dispatch(
         .verify => try cmdVerify(gpa, io, out, args),
         .backup => try cmdBackup(gpa, io, out, args),
         .restore => try cmdRestore(gpa, io, out, args),
+        .prune => try cmdPrune(gpa, io, out, args),
         .help => try cmdHelp(out),
     }
 }
@@ -385,6 +414,7 @@ test "SubCommand.parse: every documented name resolves" {
     try std.testing.expectEqual(SubCommand.verify, SubCommand.parse("verify").?);
     try std.testing.expectEqual(SubCommand.backup, SubCommand.parse("backup").?);
     try std.testing.expectEqual(SubCommand.restore, SubCommand.parse("restore").?);
+    try std.testing.expectEqual(SubCommand.prune, SubCommand.parse("prune").?);
     try std.testing.expectEqual(SubCommand.help, SubCommand.parse("help").?);
     try std.testing.expectEqual(SubCommand.help, SubCommand.parse("--help").?);
     try std.testing.expectEqual(SubCommand.help, SubCommand.parse("-h").?);
@@ -450,6 +480,20 @@ test "Args.parse: backup --to / restore --from populate fields" {
     const a2 = try Args.parse(&argv2, 2);
     try std.testing.expectEqualStrings("/tmp/src", a2.from.?);
     try std.testing.expectEqualStrings("/tmp/dst", a2.to.?);
+}
+
+test "Args.parse: --max-age-ms populates max_age_ms" {
+    const argv = [_][]const u8{
+        "tsdb",
+        "prune",
+        "--data-dir",
+        "/tmp/p",
+        "--max-age-ms",
+        "60000",
+    };
+    const a = try Args.parse(&argv, 2);
+    try std.testing.expectEqualStrings("/tmp/p", a.data_dir.?);
+    try std.testing.expectEqual(@as(i64, 60_000), a.max_age_ms.?);
 }
 
 test "Args.parse: query flags populate start/end" {

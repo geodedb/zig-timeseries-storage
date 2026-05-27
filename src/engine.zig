@@ -104,6 +104,20 @@ pub const EngineConfig = struct {
     /// Opaque context handed to `error_callback`. Ignored when
     /// `error_callback` is null.
     error_callback_ctx: ?*anyopaque = null,
+    /// Age-based retention. When set, `Engine.pruneExpired` removes
+    /// any whole segment whose `max_ts < (now - retention_max_age_ms)`.
+    /// Treated as milliseconds because the spec's recommended ts
+    /// unit is "ms since the Unix epoch" (see `Point.ts`). Callers
+    /// using a different unit must scale accordingly.
+    ///
+    /// `null` disables retention; segments are kept until explicitly
+    /// removed. Closes GAP-0004 (age-based pruning).
+    retention_max_age_ms: ?i64 = null,
+    /// Override for the "current time" reference used by
+    /// `pruneExpired`. Defaults to `null`, meaning the engine reads
+    /// the system real-time clock at prune time. Exposed primarily
+    /// so tests can drive deterministic cutoffs without sleeping.
+    retention_now_override: ?i64 = null,
 };
 
 /// Backwards-compatible alias. New code should use `EngineConfig`.
@@ -990,6 +1004,91 @@ pub const Engine = struct {
         }
     }
 
+    /// Remove every segment whose `max_ts` is older than
+    /// `now - config.retention_max_age_ms`. Returns the number of
+    /// segments removed.
+    ///
+    /// Semantics:
+    ///
+    /// - Whole-segment only. A segment is removed iff its ENTIRE
+    ///   timestamp range is older than the cutoff. Segments
+    ///   straddling the cutoff (some points older, some newer) are
+    ///   left in place; rewriting them would require a per-block
+    ///   compaction pass that is out of scope for this entry point.
+    ///   Operators who need that can invoke `compactAll` first; a
+    ///   future commit may add a `pruneAndRewrite` helper.
+    /// - Idempotent. Calling twice in quick succession (no new data
+    ///   written) is safe; the second call removes nothing.
+    /// - Atomic at the manifest level. The new segment list is saved
+    ///   to the manifest BEFORE the segment files are unlinked, so a
+    ///   crash mid-prune leaves orphan files on disk but never a
+    ///   stale pointer in the manifest. The next prune (or operator
+    ///   cleanup) reclaims the orphans.
+    /// - No-op when `config.retention_max_age_ms == null`.
+    ///
+    /// Threading: takes the engine's lock for the manifest swap.
+    /// Concurrent appends, queries, and compactions are blocked
+    /// only briefly during the swap; the actual unlink loop runs
+    /// without the lock to avoid stalling other ops on slow disks.
+    pub fn pruneExpired(self: *Engine) !u32 {
+        const max_age = self.config.retention_max_age_ms orelse return 0;
+        const io = std.Io.Threaded.global_single_threaded.io();
+
+        const now = self.config.retention_now_override orelse blk: {
+            const ts_ns = std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds;
+            break :blk @divTrunc(ts_ns, std.time.ns_per_ms);
+        };
+        const cutoff = now - max_age;
+
+        var doomed_ids = std.ArrayList(u64).empty;
+        defer doomed_ids.deinit(self.allocator);
+
+        {
+            self.mu.lockUncancelable(io);
+            defer self.mu.unlock(io);
+
+            var kept = std.ArrayListUnmanaged(manifest.SegmentMeta).empty;
+            try kept.ensureTotalCapacity(self.allocator, self.man.segments.items.len);
+
+            for (self.man.segments.items) |seg| {
+                if (seg.max_ts < cutoff) {
+                    try doomed_ids.append(self.allocator, seg.id);
+                } else {
+                    kept.appendAssumeCapacity(seg);
+                }
+            }
+
+            if (doomed_ids.items.len == 0) {
+                kept.deinit(self.allocator);
+                return 0;
+            }
+
+            // Save the new manifest BEFORE we touch the files on
+            // disk: the manifest is the source of truth for which
+            // segments exist, so an orphan file is recoverable but
+            // a stale manifest entry would corrupt queries.
+            self.man.segments.deinit(self.allocator);
+            self.man.segments = kept;
+            try self.man.save();
+        }
+
+        // Best-effort unlink of the doomed files. A failure here
+        // leaves an orphan on disk but the manifest is already
+        // correct; surface the error via the background-error
+        // pipeline so operators can reclaim space later.
+        for (doomed_ids.items) |id| {
+            const p = try segment.segmentPath(self.allocator, self.config.data_dir, id);
+            defer self.allocator.free(p);
+            std.Io.Dir.cwd().deleteFile(io, p) catch |err| {
+                self.mu.lockUncancelable(io);
+                self.recordBackgroundErrorLocked(.compaction, err);
+                self.mu.unlock(io);
+            };
+        }
+
+        return @intCast(doomed_ids.items.len);
+    }
+
     /// Query all points in the inclusive timestamp range
     /// `[start_ts, end_ts]` for `series_id`, returning a `MergeIterator`
     /// that streams the points in ascending `(ts, value)` order.
@@ -1365,4 +1464,117 @@ test "Engine: error_callback fires when a background error is recorded" {
     try std.testing.expectEqual(@as(usize, 1), Trace.count);
     try std.testing.expectEqual(BgPhase.compaction, Trace.last_phase);
     try std.testing.expect(Trace.last_err == error.TestInjected);
+}
+
+test "Engine: pruneExpired returns 0 when retention disabled" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 10,
+    }, &pool);
+    defer engine.deinit();
+
+    const pts = [_]types.Point{.{ .ts = 1, .value = 1 }};
+    try engine.appendPoints(1, &pts);
+    try engine.flush();
+
+    // No retention configured: pruneExpired must be a no-op.
+    try std.testing.expectEqual(@as(u32, 0), try engine.pruneExpired());
+    try std.testing.expect(engine.man.segments.items.len >= 1);
+}
+
+test "Engine: pruneExpired removes segments older than the cutoff" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    // Use the deterministic "now" override so the test is hermetic.
+    // Retention: 1000 ms. Now = 10000. Anything with max_ts < 9000 is doomed.
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 10,
+        .retention_max_age_ms = 1000,
+        .retention_now_override = 10_000,
+    }, &pool);
+    defer engine.deinit();
+
+    // Produce two segments: one all-old, one all-new.
+    try engine.appendPoints(1, &.{ .{ .ts = 100, .value = 1 }, .{ .ts = 200, .value = 2 } });
+    try engine.flush();
+    try engine.appendPoints(1, &.{ .{ .ts = 9_500, .value = 3 }, .{ .ts = 9_700, .value = 4 } });
+    try engine.flush();
+
+    try std.testing.expectEqual(@as(usize, 2), engine.man.segments.items.len);
+
+    const removed = try engine.pruneExpired();
+    try std.testing.expectEqual(@as(u32, 1), removed);
+    try std.testing.expectEqual(@as(usize, 1), engine.man.segments.items.len);
+
+    // The surviving segment must be the one whose points are inside
+    // the retention window.
+    try std.testing.expect(engine.man.segments.items[0].max_ts >= 9_000);
+
+    // Query: only the recent points must come back.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var it = try engine.queryPoints(arena.allocator(), 1, 0, std.math.maxInt(i64));
+    var count: usize = 0;
+    while (it.next()) |pt| {
+        try std.testing.expect(pt.ts >= 9_000);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "Engine: pruneExpired keeps straddling segments untouched" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    // Cutoff = 10_000 - 1_000 = 9_000.
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 10,
+        .retention_max_age_ms = 1000,
+        .retention_now_override = 10_000,
+    }, &pool);
+    defer engine.deinit();
+
+    // Single segment with both old (ts=100) and new (ts=9_500) points.
+    try engine.appendPoints(1, &.{
+        .{ .ts = 100, .value = 1 },
+        .{ .ts = 9_500, .value = 2 },
+    });
+    try engine.flush();
+
+    try std.testing.expectEqual(@as(usize, 1), engine.man.segments.items.len);
+
+    // max_ts (9_500) > cutoff (9_000), so the segment is kept.
+    const removed = try engine.pruneExpired();
+    try std.testing.expectEqual(@as(u32, 0), removed);
+    try std.testing.expectEqual(@as(usize, 1), engine.man.segments.items.len);
 }
