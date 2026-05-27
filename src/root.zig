@@ -39,6 +39,7 @@ pub const memtable = @import("memtable.zig");
 pub const iterator = @import("iterator.zig");
 pub const compaction = @import("compaction.zig");
 pub const engine = @import("engine.zig");
+pub const backup = @import("backup.zig");
 
 // ============================================================================
 // Re-exports — primary public API.

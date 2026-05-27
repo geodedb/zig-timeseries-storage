@@ -12,10 +12,10 @@
 //!   tsdb flush   --data-dir <dir>
 //!   tsdb compact --data-dir <dir>
 //!   tsdb verify  --data-dir <dir>
+//!   tsdb backup  --data-dir <src>  --to   <dest>     (GAP-0003)
+//!   tsdb restore --from <src>      --to   <dest>     (GAP-0003)
 //!
-//! Backup/restore (`backup`, `restore`) and retention (`prune`) commands
-//! land in later commits (GAP-0003 / GAP-0004); the dispatcher accepts
-//! their names so it can route to the implementations once they exist.
+//! Retention (`prune`) lands in a follow-up commit (GAP-0004).
 //!
 //! Every subcommand maps its own exit code:
 //!   0 — success
@@ -101,6 +101,8 @@ pub const SubCommand = enum {
     flush,
     compact,
     verify,
+    backup,
+    restore,
     help,
 
     pub fn parse(s: []const u8) ?SubCommand {
@@ -111,6 +113,8 @@ pub const SubCommand = enum {
             .{ "flush", SubCommand.flush },
             .{ "compact", SubCommand.compact },
             .{ "verify", SubCommand.verify },
+            .{ "backup", SubCommand.backup },
+            .{ "restore", SubCommand.restore },
             .{ "help", SubCommand.help },
             .{ "-h", SubCommand.help },
             .{ "--help", SubCommand.help },
@@ -237,6 +241,29 @@ fn cmdVerify(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: Args) !void 
     });
 }
 
+fn cmdBackup(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: Args) !void {
+    _ = io;
+    const data_dir = try requireDataDir(args);
+    const dest = args.to orelse return error.UsageError;
+
+    var pool = try thread_pool.ThreadPool.init(gpa, .{ .max_threads = 1 });
+    defer pool.deinit();
+    var eng = try openEngine(gpa, data_dir, &pool);
+    defer eng.deinit();
+
+    try lib.backup.snapshot(gpa, &eng, dest);
+    try out.print("backup OK: {s} -> {s}\n", .{ data_dir, dest });
+}
+
+fn cmdRestore(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: Args) !void {
+    _ = io;
+    const src = args.from orelse return error.UsageError;
+    const dest = args.to orelse return error.UsageError;
+
+    try lib.backup.restore(gpa, src, dest);
+    try out.print("restore OK: {s} -> {s}\n", .{ src, dest });
+}
+
 fn cmdHelp(out: *Io.Writer) !void {
     try out.writeAll(
         \\timeseries-storage CLI
@@ -256,6 +283,10 @@ fn cmdHelp(out: *Io.Writer) !void {
         \\           Force compaction of L0 segments.
         \\  verify   --data-dir <dir>
         \\           Verify manifest + segment integrity (open in fail-closed mode).
+        \\  backup   --data-dir <src> --to <dest>
+        \\           Quiesce the engine and copy data files to <dest>.
+        \\  restore  --from <src> --to <dest>
+        \\           Verify <src> and copy its files into <dest>.
         \\
         \\Exit codes: 0 = ok, 1 = usage error, 2 = engine error.
         \\
@@ -335,6 +366,8 @@ fn dispatch(
         .flush => try cmdFlush(gpa, io, out, args),
         .compact => try cmdCompact(gpa, io, out, args),
         .verify => try cmdVerify(gpa, io, out, args),
+        .backup => try cmdBackup(gpa, io, out, args),
+        .restore => try cmdRestore(gpa, io, out, args),
         .help => try cmdHelp(out),
     }
 }
@@ -350,6 +383,8 @@ test "SubCommand.parse: every documented name resolves" {
     try std.testing.expectEqual(SubCommand.flush, SubCommand.parse("flush").?);
     try std.testing.expectEqual(SubCommand.compact, SubCommand.parse("compact").?);
     try std.testing.expectEqual(SubCommand.verify, SubCommand.parse("verify").?);
+    try std.testing.expectEqual(SubCommand.backup, SubCommand.parse("backup").?);
+    try std.testing.expectEqual(SubCommand.restore, SubCommand.parse("restore").?);
     try std.testing.expectEqual(SubCommand.help, SubCommand.parse("help").?);
     try std.testing.expectEqual(SubCommand.help, SubCommand.parse("--help").?);
     try std.testing.expectEqual(SubCommand.help, SubCommand.parse("-h").?);
