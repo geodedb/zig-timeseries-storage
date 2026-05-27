@@ -24,6 +24,36 @@ fn importedModule(
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
+
+    // ------------------------------------------------------------------
+    // Optimize-mode policy (P-BUILD-001).
+    //
+    // `standardOptimizeOption` defaults to `.Debug` and lets callers
+    // override via `-Doptimize=ReleaseFast` (etc.). We intentionally
+    // KEEP Debug as the default because:
+    //
+    //   * `zig build test` is the correctness gate. Debug enables
+    //     runtime bounds checks, unreachable-code traps, and panic
+    //     paths that surface UB the optimiser would silently fold
+    //     away. Tests run fast enough (well under 1s in unit; <10s
+    //     even with stress) that ReleaseFast offers no usability
+    //     win and would mask real bugs.
+    //   * `zig build` (library + CLI) honours the user override; CI
+    //     can ship ReleaseSafe / ReleaseFast as policy without code
+    //     changes.
+    //   * `zig build bench` / `zig build scale-bench` etc. FORCE
+    //     `.ReleaseFast` inside `benchModule` regardless of the
+    //     top-level `-Doptimize` choice — bench numbers must be
+    //     comparable across casual invocations.
+    //   * `zig build test-stress` overrides to ReleaseFast when TSan
+    //     is OFF (see below) — stress only proves throughput when
+    //     the optimiser is on. With `-Dtsan=true` we drop back to
+    //     Debug so the sanitizer can see real races instead of
+    //     having them optimised away.
+    //
+    // Callers can override the unit-test optimize mode via
+    // `zig build test -Doptimize=ReleaseSafe` if they want a faster
+    // run; the framework supports it and CI matrices use it.
     const optimize = b.standardOptimizeOption(.{});
     const tsan = b.option(bool, "tsan", "Enable ThreadSanitizer on test artifacts") orelse false;
     const no_cli = b.option(bool, "no-cli", "Skip building the CLI executable (library-only build)") orelse false;
