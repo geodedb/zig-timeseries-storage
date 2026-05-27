@@ -5,6 +5,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const segment = @import("segment.zig");
+const safety = @import("safety.zig");
 
 pub const PointIterator = struct {
     ptr: *anyopaque,
@@ -16,6 +17,9 @@ pub const PointIterator = struct {
 };
 
 pub const SliceIterator = struct {
+    /// Defence-in-depth tag for vtable ctx recovery (SEC-010).
+    pub const MAGIC: u32 = safety.Magic.slice_iterator;
+    magic: u32 = MAGIC,
     slice: []const types.Point,
     pos: usize = 0,
 
@@ -33,7 +37,7 @@ pub const SliceIterator = struct {
             .ptr = self,
             .nextFn = struct {
                 fn next(ptr: *anyopaque) ?types.Point {
-                    const typed_ptr: *SliceIterator = @ptrCast(@alignCast(ptr));
+                    const typed_ptr = safety.castCtx(SliceIterator, ptr);
                     return typed_ptr.next();
                 }
             }.next,
@@ -152,6 +156,9 @@ pub const SegmentIterator = struct {
 /// release the internal storage. Either ownership model is
 /// supported; do not mix them.
 pub const MergeIterator = struct {
+    /// Defence-in-depth tag for vtable ctx recovery (SEC-010).
+    pub const MAGIC: u32 = safety.Magic.merge_iterator;
+    magic: u32 = MAGIC,
     allocator: Allocator,
     iters: std.ArrayListUnmanaged(PointIterator),
     heap: HeapType,
@@ -174,6 +181,7 @@ pub const MergeIterator = struct {
 
     pub fn init(allocator: Allocator) MergeIterator {
         return .{
+            .magic = MAGIC,
             .allocator = allocator,
             .iters = .empty,
             .heap = HeapType.empty,
@@ -232,7 +240,7 @@ pub const MergeIterator = struct {
             .ptr = self,
             .nextFn = struct {
                 fn next(ptr: *anyopaque) ?types.Point {
-                    const typed_ptr: *MergeIterator = @ptrCast(@alignCast(ptr));
+                    const typed_ptr = safety.castCtx(MergeIterator, ptr);
                     return typed_ptr.next();
                 }
             }.next,

@@ -11,6 +11,7 @@ const memtable = @import("memtable.zig");
 const segment = @import("segment.zig");
 const iterator = @import("iterator.zig");
 const compaction = @import("compaction.zig");
+const safety = @import("safety.zig");
 const thread_pool = @import("thread_pool");
 const wal_record = @import("wal_record.zig");
 
@@ -153,6 +154,14 @@ pub const Config = EngineConfig;
 /// the user-supplied `thread_pool.ThreadPool`. `deinit` must not be
 /// called concurrently with any other operation.
 pub const Engine = struct {
+    /// Defence-in-depth tag for thread-pool ctx pointers (SEC-010).
+    /// Every type-erased recovery of `*Engine` from a thread callback
+    /// uses `safety.castCtx(Engine, ctx)`, which checks this magic
+    /// before touching any other field. The constant is stable across
+    /// process restarts; see `src/safety.zig` for the threat model and
+    /// limitations.
+    pub const MAGIC: u32 = safety.Magic.engine;
+    magic: u32 = MAGIC,
     /// Exclusive lock protecting every other field on the struct.
     /// Previously a `RwLock`, but the engine's shared-lock usages were
     /// all brief reads that the lock-then-cv wait pattern needs to be
@@ -603,7 +612,7 @@ pub const Engine = struct {
     }
 
     fn flushWorker(ctx: *anyopaque, _: *thread_pool.TaskContext) void {
-        var self: *Engine = @ptrCast(@alignCast(ctx));
+        var self = safety.castCtx(Engine, ctx);
         self.flushInternal() catch |err| {
             const io = std.Io.Threaded.global_single_threaded.io();
             self.mu.lockUncancelable(io);
@@ -954,7 +963,7 @@ pub const Engine = struct {
     }
 
     fn compactionWorker(ctx: *anyopaque, _: *thread_pool.TaskContext) void {
-        var self: *Engine = @ptrCast(@alignCast(ctx));
+        var self = safety.castCtx(Engine, ctx);
         const result = self.compactL0();
         const io = std.Io.Threaded.global_single_threaded.io();
         self.mu.lockUncancelable(io);

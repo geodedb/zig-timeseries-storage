@@ -40,6 +40,7 @@ pub const iterator = @import("iterator.zig");
 pub const compaction = @import("compaction.zig");
 pub const engine = @import("engine.zig");
 pub const backup = @import("backup.zig");
+pub const safety = @import("safety.zig");
 
 // ============================================================================
 // Re-exports — primary public API.
