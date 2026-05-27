@@ -50,5 +50,5 @@ fn run(ctx: *framework.Context) anyerror!void {
 
     const pts = [_]lib.types.Point{.{ .ts = 1000, .value = 42 }};
     try mt.insert(7, &pts);
-    std.mem.doNotOptimizeAway(mt.point_count);
+    std.mem.doNotOptimizeAway(mt.point_count.load(.acquire));
 }

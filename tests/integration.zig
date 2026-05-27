@@ -348,7 +348,7 @@ test "integration: crash recovery replays unflushed WAL records" {
         // No flush happened in phase 1, so no segments on disk; the
         // points must come from the recovered memtable.
         try std.testing.expectEqual(@as(usize, 0), eng.man.segments.items.len);
-        try std.testing.expectEqual(@as(usize, 3), eng.active_mem.point_count);
+        try std.testing.expectEqual(@as(usize, 3), eng.active_mem.load(.acquire).point_count.load(.acquire));
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();

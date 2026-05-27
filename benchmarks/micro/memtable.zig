@@ -20,7 +20,7 @@
 //!     without sorting (the lazy-sort contract from P-ALGO-003). This
 //!     scenario measures the cost of the OoO detection branch itself,
 //!     NOT a follow-up sort — the sort is deferred until a reader
-//!     calls `getSortedPoints` or `ensureAllSorted`.
+//!     calls `copySortedPoints` or `ensureAllSorted`.
 //!
 //! ## Fixture model (ENT-002 / ENT-005)
 //!
@@ -155,7 +155,7 @@ fn runMemtableSorted(ctx: *framework.Context) anyerror!void {
     const fixture: *Fixture = @ptrCast(@alignCast(ctx.user_data.?));
     fixture.mt.clear();
     try fixture.mt.insert(7, &fixture.sorted_batch);
-    std.mem.doNotOptimizeAway(fixture.mt.point_count);
+    std.mem.doNotOptimizeAway(fixture.mt.point_count.load(.acquire));
 }
 
 /// Out-of-order detection path: the same 256-point batch with the
@@ -167,5 +167,5 @@ fn runMemtableOoo(ctx: *framework.Context) anyerror!void {
     const fixture: *Fixture = @ptrCast(@alignCast(ctx.user_data.?));
     fixture.mt.clear();
     try fixture.mt.insert(7, &fixture.ooo_batch);
-    std.mem.doNotOptimizeAway(fixture.mt.point_count);
+    std.mem.doNotOptimizeAway(fixture.mt.point_count.load(.acquire));
 }

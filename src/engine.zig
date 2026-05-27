@@ -742,8 +742,25 @@ pub const Engine = struct {
     config: EngineConfig,
     wal: wal_manager.WalManager,
     man: manifest.Manifest,
-    active_mem: memtable.Memtable,
-    flushing_mem: ?memtable.Memtable = null,
+    /// Atomic pointer to the live active memtable (P-LOCK-005). Every
+    /// `appendPoints` snapshots this pointer (lock-free), bumps the
+    /// memtable's `pending_writers` barrier, and inserts WITHOUT
+    /// holding `engine.mu`. Rotation (`maybeTriggerFlushLocked`,
+    /// `flush`) is the only writer of this field and always runs
+    /// under `engine.mu`, so the swap is single-publisher /
+    /// multi-subscriber.
+    ///
+    /// Lifetime: the OLD pointer is moved to `flushing_mem` on
+    /// rotation. The flush worker waits on the rotated memtable's
+    /// `waitForQuiescence` before scanning, so a writer that
+    /// snapshotted the OLD pointer pre-rotation has fully drained
+    /// its `insert` before the flush worker begins reading.
+    active_mem: std.atomic.Value(*memtable.Memtable),
+    /// Memtable that is currently being flushed by a background
+    /// worker. `null` between flushes. Guarded by `engine.mu`.
+    /// Owned by the engine: the flush worker frees it after the
+    /// segment commits and clears this slot to `null`.
+    flushing_mem: ?*memtable.Memtable = null,
     pool: *thread_pool.ThreadPool,
     compaction_running: bool = false,
     /// Most recent error observed by a background flush or compaction
@@ -759,17 +776,15 @@ pub const Engine = struct {
     /// where flush() returned after "some" flush completed rather
     /// than "the flush I scheduled" (Q-REL-010).
     flushes_completed: u64 = 0,
-    /// Engine-owned scratch buffer reused by `appendPoints` to
-    /// serialise the WAL payload. Previously each call heap-allocated
-    /// a fresh buffer (16 + 16*N bytes) only to free it a few
-    /// microseconds later — pure allocator churn on the hot ingest
-    /// path. The buffer is sized on first use and grown in-place when
-    /// a larger batch arrives; it is only freed at `deinit`.
-    ///
-    /// Concurrency: every `appendPoints` call serialises through
-    /// `self.mu` (writer-exclusive), so the buffer has a single
-    /// writer at a time. No additional synchronisation is needed.
-    /// Other call sites MUST NOT touch this buffer. Closes P-MEM-003.
+    /// (Vestigial) — superseded by per-call allocation under
+    /// P-LOCK-005. The previous P-MEM-003 design reused a single
+    /// engine-owned scratch buffer to avoid the per-call allocation,
+    /// but the single-owner contract required `engine.mu` and that
+    /// contention is exactly what blocked concurrent writer scaling.
+    /// Kept as an unused field (no allocation) so external bench
+    /// reflection (e.g. the P-MEM-003 regression test that read
+    /// `append_payload_buf.capacity`) compiles unchanged; the field
+    /// reports capacity == 0 forever.
     append_payload_buf: std.ArrayListUnmanaged(u8) = .empty,
 
     /// Background WAL syncer thread (P-IO-002). `null` when
@@ -872,13 +887,21 @@ pub const Engine = struct {
         });
         errdefer wal.deinit();
 
-        // ENT-002 / ENT-005: pre-size the memtable's `series` AutoHashMap
-        // and the per-series ArrayLists so the steady-state ingest path
-        // does not pay the first-touch hashmap/array growth allocation.
-        // The expected_series default comes from `limits.DEFAULT_EXPECTED_SERIES`;
-        // the per-series hint is `max_memtable_points / expected_series`
-        // floored at 64 to keep wide-cardinality workloads sane.
-        var mem = try memtable.Memtable.initCapacity(
+        // ENT-002 / ENT-005: pre-size the memtable's per-shard
+        // AutoHashMaps and the per-series ArrayLists so the steady-state
+        // ingest path does not pay the first-touch hashmap/array
+        // growth allocation. The expected_series default comes from
+        // `limits.DEFAULT_EXPECTED_SERIES`; the per-series hint is
+        // `max_memtable_points / expected_series` floored at 64 to
+        // keep wide-cardinality workloads sane.
+        //
+        // P-LOCK-005: the memtable is heap-allocated so rotation can
+        // swap pointers atomically while the previous memtable
+        // outlives any in-flight writer that snapshotted it before
+        // the swap.
+        const mem = try allocator.create(memtable.Memtable);
+        errdefer allocator.destroy(mem);
+        mem.* = try memtable.Memtable.initCapacity(
             allocator,
             config.max_memtable_points,
             limits.DEFAULT_EXPECTED_SERIES,
@@ -896,14 +919,14 @@ pub const Engine = struct {
         // under GAP-0005 / SEC-002 / SEC-003 / Q-REL-001). Operators
         // who explicitly accept lossy recovery can opt in with
         // `wal_recovery = .salvage`.
-        try replayWalIntoMemtable(allocator, &wal, &mem, man.last_checkpoint_lsn + 1, config.wal_recovery, &wal_drops);
+        try replayWalIntoMemtable(allocator, &wal, mem, man.last_checkpoint_lsn + 1, config.wal_recovery, &wal_drops);
 
         return Engine{
             .allocator = allocator,
             .config = config,
             .wal = wal,
             .man = man,
-            .active_mem = mem,
+            .active_mem = std.atomic.Value(*memtable.Memtable).init(mem),
             .pool = pool,
             .reader_cache = SegmentReaderCache.init(allocator, DEFAULT_SEGMENT_READER_CACHE_CAPACITY),
             .counters = .{
@@ -1197,8 +1220,20 @@ pub const Engine = struct {
 
         self.wal.deinit();
         self.man.deinit();
-        self.active_mem.deinit();
-        if (self.flushing_mem) |*fm| fm.deinit();
+        // P-LOCK-005: heap-allocated active memtable. Tear down the
+        // value AND free the allocation. The flushing slot should
+        // have been drained by the loop above; defensively free it
+        // too if a worker left it behind on error.
+        {
+            const am = self.active_mem.load(.acquire);
+            am.deinit();
+            self.allocator.destroy(am);
+        }
+        if (self.flushing_mem) |fm| {
+            fm.deinit();
+            self.allocator.destroy(fm);
+            self.flushing_mem = null;
+        }
         self.append_payload_buf.deinit(self.allocator);
         self.series_watermarks.deinit(self.allocator);
         self.reader_cache.deinit();
@@ -1259,27 +1294,40 @@ pub const Engine = struct {
         // is ~30 ns on commodity hardware — negligible next to the
         // WAL fsync this call ultimately amortises into.
         const t_start = nowMonotonicNs();
-
         const io = std.Io.Threaded.global_single_threaded.io();
-        self.mu.lockUncancelable(io);
-        defer self.mu.unlock(io);
 
-        // GAP-0010: strict-mode OoO check. Runs under the writer
-        // lock so the watermark map cannot race with another
-        // appendPoints. The check is BEFORE the WAL write and
-        // memtable insert — a rejected batch leaves no on-disk or
-        // in-memory side effect.
+        // P-LOCK-005: take `engine.mu` ONLY for the strict-OoO check
+        // (which touches the per-series watermark map). The default
+        // permissive config skips this branch entirely and never
+        // takes the engine lock on the write path.
         if (!self.config.allow_cross_segment_ooo) {
+            self.mu.lockUncancelable(io);
+            defer self.mu.unlock(io);
             try self.checkOoOLocked(series_id, points);
         }
 
-        // P-MEM-003: reuse the engine-owned scratch buffer instead of
-        // heap-allocating a fresh payload per call. The writer lock is
-        // already held, so `append_payload_buf` has a single owner for
-        // the duration of this call.
-        const payload = try self.encodeAppendPointsPayloadLocked(series_id, points);
+        // P-LOCK-005: encode payload per-call. The previous
+        // `append_payload_buf` reuse trick (P-MEM-003) required
+        // `engine.mu` for single-owner access; that contention is
+        // exactly what blocked concurrent writer scaling. The cost
+        // here is one allocator round-trip per appendPoints (16 +
+        // 16*N bytes) — measurably cheaper than the WAL fsync and
+        // far cheaper than serialising all writers behind one lock.
+        const payload_size = 16 + (points.len * 16);
+        const payload = try self.allocator.alloc(u8, payload_size);
+        defer self.allocator.free(payload);
+        encodeAppendPointsPayload(payload, series_id, points);
 
-        _ = try self.appendToWalLocked(payload);
+        // WAL append: `WalManager` has its own internal mutex
+        // (ENT-006) so concurrent calls serialise inside the WAL
+        // layer without holding `engine.mu`.
+        var rec = wal_record.WalRecord{
+            .lsn = 0,
+            .record_type = .append_points,
+            .payload = payload,
+            .checksum = 0,
+        };
+        _ = try self.wal.appendRecord(&rec);
 
         // P-IO-002: in per_call durability mode every append fsyncs
         // before returning. In batch mode the background syncer
@@ -1288,24 +1336,44 @@ pub const Engine = struct {
             try self.wal.sync();
         }
 
-        try self.active_mem.insert(series_id, points);
-        try self.maybeTriggerFlushLocked(io);
+        // P-LOCK-005: snapshot the active memtable pointer atomically
+        // and bracket the insert with the pending-writers barrier so
+        // a concurrent rotation that moves THIS pointer into
+        // `flushing_mem` cannot let the flush worker begin scanning
+        // until our insert has fully landed.
+        //
+        // Race analysis: rotation publishes a NEW pointer via the
+        // atomic store (under `engine.mu`); any writer that loaded
+        // the OLD pointer BEFORE that store has already bumped
+        // `pending_writers` on the OLD memtable. The flush worker
+        // calls `waitForQuiescence` on the OLD memtable AFTER the
+        // rotation publishes, so it will spin until our `endAppend`
+        // fires. After the rotation publishes, all new writers load
+        // the NEW pointer and never touch the OLD one. The OLD
+        // memtable is therefore quiesced from any further insert
+        // before the flush worker reads it.
+        const target_mem = self.active_mem.load(.acquire);
+        target_mem.beginAppend();
+        const insert_result = target_mem.insert(series_id, points);
+        target_mem.endAppend();
+        try insert_result;
 
-        // GAP-0010 strict-mode bookkeeping: bump the watermark
-        // AFTER the insert so a partial-failure rollback leaves
-        // the watermark untouched. No-op in permissive mode.
-        if (!self.config.allow_cross_segment_ooo) {
-            try self.bumpWatermarkLocked(series_id, points);
+        // Re-enter `engine.mu` briefly to (a) potentially rotate the
+        // memtable if it tripped the flush threshold and (b) bump
+        // the strict-mode watermark. Both are short critical sections
+        // that touch engine-wide state.
+        {
+            self.mu.lockUncancelable(io);
+            defer self.mu.unlock(io);
+            try self.maybeTriggerFlushLocked(io);
+            if (!self.config.allow_cross_segment_ooo) {
+                try self.bumpWatermarkLocked(series_id, points);
+            }
         }
 
         // Counters are bumped only on a clean return; failed calls
-        // do not pollute the latency average. The counters are
-        // atomics (P-LOCK-005 partial) so these three writes do NOT
-        // depend on `self.mu` — they would still be correct if the
-        // engine lock were released earlier in this function. We
-        // keep them inside the lock window today because the lock
-        // is already held; the point of the atomics is removing the
-        // hard dependency, not the local cycle count.
+        // do not pollute the latency average. Atomic counters
+        // (P-LOCK-005) — no lock needed.
         _ = self.counters.append_count.fetchAdd(1, .release);
         _ = self.counters.append_points.fetchAdd(@intCast(points.len), .release);
         _ = self.counters.append_total_ns.fetchAdd(nowMonotonicNs() - t_start, .release);
@@ -1371,30 +1439,22 @@ pub const Engine = struct {
         }
     }
 
-    /// Serialise `(series_id, points)` into the engine-owned payload
-    /// buffer and return a slice over the live bytes. The slice is
-    /// only valid until the next `encodeAppendPointsPayloadLocked` /
-    /// `appendPoints` call; the WAL append must consume it before
-    /// releasing the writer lock.
-    ///
-    /// Layout matches `wal_record.WalRecord`:
+    /// Serialise `(series_id, points)` into `buf` (which must be
+    /// pre-sized to `16 + 16*points.len` bytes). Layout matches
+    /// `wal_record.WalRecord`:
     /// `series_id (u128 LE) || (i64 ts, i64 value)*`.
     ///
-    /// MUST be called with `self.mu` held — the buffer is shared
-    /// state and is not otherwise synchronised.
-    fn encodeAppendPointsPayloadLocked(
-        self: *Engine,
+    /// P-LOCK-005: lock-free helper — each `appendPoints` call
+    /// allocates its own payload buffer so multiple writers can
+    /// encode in parallel. The previous engine-owned scratch buffer
+    /// (P-MEM-003) was abandoned because the single-owner contract
+    /// it relied on required `engine.mu`, defeating the per-shard
+    /// memtable parallelism we wanted to expose.
+    fn encodeAppendPointsPayload(
+        buf: []u8,
         series_id: types.SeriesId,
         points: []const types.Point,
-    ) ![]const u8 {
-        const payload_size = 16 + (points.len * 16);
-
-        // Grow once if needed; subsequent calls reuse the capacity.
-        self.append_payload_buf.clearRetainingCapacity();
-        try self.append_payload_buf.ensureTotalCapacity(self.allocator, payload_size);
-        self.append_payload_buf.items.len = payload_size;
-        const buf = self.append_payload_buf.items;
-
+    ) void {
         std.mem.writeInt(u128, buf[0..16], series_id, .little);
         var pos: usize = 16;
         for (points) |pt| {
@@ -1403,49 +1463,57 @@ pub const Engine = struct {
             std.mem.writeInt(i64, buf[pos..][0..8], pt.value, .little);
             pos += 8;
         }
-        return buf;
-    }
-
-    /// Append an already-encoded payload to the WAL and return the
-    /// assigned LSN. Must be called with `self.mu` held — the WAL
-    /// library is not internally synchronised.
-    fn appendToWalLocked(self: *Engine, payload: []const u8) !u64 {
-        var rec = wal_record.WalRecord{
-            .lsn = 0,
-            .record_type = .append_points,
-            .payload = payload,
-            .checksum = 0,
-        };
-        // The returned LSN isn't surfaced through appendPoints today,
-        // but is captured here so a future "wait until durable" API
-        // can return it without reshaping the call site. See
-        // manifest.last_checkpoint_lsn for the related watermark.
-        return try self.wal.appendRecord(&rec);
     }
 
     /// If the active memtable has tripped its flush threshold,
     /// rotate it into the flushing slot and submit a flush worker.
     /// Honours back-pressure: parks on `done_cv` when a previous
     /// flush is still in flight. Must be called with `self.mu` held.
+    ///
+    /// P-LOCK-005: rotation moves the OLD `*Memtable` into
+    /// `flushing_mem` and publishes a NEW `*Memtable` into the
+    /// atomic `active_mem` slot. Writers that snapshotted the OLD
+    /// pointer pre-rotation finish their insert into the OLD
+    /// memtable; the flush worker calls `waitForQuiescence` on
+    /// `flushing_mem` before scanning it, so no in-flight insert is
+    /// lost.
     fn maybeTriggerFlushLocked(self: *Engine, io: std.Io) !void {
-        while (self.active_mem.shouldFlush() and self.flushing_mem != null) {
+        const current = self.active_mem.load(.acquire);
+        while (current.shouldFlush() and self.flushing_mem != null) {
             self.done_cv.waitUncancelable(io, &self.mu);
         }
-        if (!self.active_mem.shouldFlush()) return;
+        const cur2 = self.active_mem.load(.acquire);
+        if (!cur2.shouldFlush()) return;
 
-        self.flushing_mem = self.active_mem;
-        // ENT-002 / ENT-005: rotation must produce a memtable with the
-        // same pre-sizing as `Engine.init` so the very next append
-        // does not eat the hashmap/array growth cost we just hoisted
-        // out of the previous memtable's lifetime.
-        self.active_mem = try memtable.Memtable.initCapacity(
+        // ENT-002 / ENT-005 + P-LOCK-005: build a new pre-sized,
+        // heap-allocated memtable BEFORE we touch state so a mid-
+        // allocation OOM cannot leave the engine in a partially
+        // rotated condition.
+        const new_mem = try self.allocator.create(memtable.Memtable);
+        errdefer self.allocator.destroy(new_mem);
+        new_mem.* = try memtable.Memtable.initCapacity(
             self.allocator,
             self.config.max_memtable_points,
             limits.DEFAULT_EXPECTED_SERIES,
             computePointsPerSeriesHint(self.config.max_memtable_points, limits.DEFAULT_EXPECTED_SERIES),
         );
+        errdefer new_mem.deinit();
+
+        // Publish the swap. The previous active pointer is moved
+        // into `flushing_mem`; once `active_mem` reflects the new
+        // pointer, no NEW writer can observe the old one.
+        self.flushing_mem = cur2;
+        self.active_mem.store(new_mem, .release);
         _ = self.pool.submit(flushWorker, self, .{}) catch |err| {
-            self.flushing_mem.?.deinit();
+            // Roll back: the new memtable is the survivor, the old
+            // memtable is freed. We do NOT reinstate the old as
+            // active because writers may have already observed the
+            // new pointer between the store above and the failure
+            // here — reverting would split insertions across two
+            // live memtables.
+            const old = self.flushing_mem.?;
+            old.deinit();
+            self.allocator.destroy(old);
             self.flushing_mem = null;
             self.done_cv.broadcast(io);
             return err;
@@ -1458,7 +1526,10 @@ pub const Engine = struct {
         self.flushInternal() catch |err| {
             const io = std.Io.Threaded.global_single_threaded.io();
             self.mu.lockUncancelable(io);
-            if (self.flushing_mem) |*fm| fm.deinit();
+            if (self.flushing_mem) |fm| {
+                fm.deinit();
+                self.allocator.destroy(fm);
+            }
             self.flushing_mem = null;
             // A failed flush still counts as a completed scheduling
             // round so flush() callers are not stuck waiting forever
@@ -1610,24 +1681,34 @@ pub const Engine = struct {
         var target: u64 = self.flushes_completed;
         if (self.flushing_mem != null) target += 1;
 
-        if (self.active_mem.point_count > 0) {
+        const current_active = self.active_mem.load(.acquire);
+        if (current_active.point_count.load(.acquire) > 0) {
             // Wait for any in-flight flush to release the slot.
             while (self.flushing_mem != null) {
                 self.done_cv.waitUncancelable(io, &self.mu);
             }
-            self.flushing_mem = self.active_mem;
-            // ENT-002 / ENT-005: keep the manual `sync`-driven rotation
-            // path consistent with `maybeTriggerFlushLocked` — the new
-            // active memtable must start pre-sized.
-            self.active_mem = try memtable.Memtable.initCapacity(
+            // ENT-002 / ENT-005 + P-LOCK-005: build the new
+            // heap-allocated memtable BEFORE the pointer swap so a
+            // mid-allocation OOM does not leave the engine in a
+            // half-rotated state.
+            const new_mem = try self.allocator.create(memtable.Memtable);
+            errdefer self.allocator.destroy(new_mem);
+            new_mem.* = try memtable.Memtable.initCapacity(
                 self.allocator,
                 self.config.max_memtable_points,
                 limits.DEFAULT_EXPECTED_SERIES,
                 computePointsPerSeriesHint(self.config.max_memtable_points, limits.DEFAULT_EXPECTED_SERIES),
             );
+            errdefer new_mem.deinit();
+
+            const old_mem = self.active_mem.load(.acquire);
+            self.flushing_mem = old_mem;
+            self.active_mem.store(new_mem, .release);
             target = self.flushes_completed + 1;
             _ = self.pool.submit(flushWorker, self, .{}) catch |err| {
-                self.flushing_mem.?.deinit();
+                const old = self.flushing_mem.?;
+                old.deinit();
+                self.allocator.destroy(old);
                 self.flushing_mem = null;
                 self.done_cv.broadcast(io);
                 return err;
@@ -1654,12 +1735,24 @@ pub const Engine = struct {
         const t_start = nowMonotonicNs();
 
         self.mu.lockUncancelable(io);
-        var mem = self.flushing_mem orelse return;
+        const mem = self.flushing_mem orelse {
+            self.mu.unlock(io);
+            return;
+        };
         self.mu.unlock(io);
 
-        if (mem.point_count == 0) {
+        // P-LOCK-005 quiescence barrier: wait for any in-flight
+        // `appendPoints` that snapshotted this memtable BEFORE the
+        // rotation to finish its `insert`. After this point the
+        // memtable is observed-quiescent — no new writer can target
+        // it (the active pointer has already been swapped), and the
+        // last pre-rotation writer has decremented `pending_writers`.
+        mem.waitForQuiescence();
+
+        if (mem.point_count.load(.acquire) == 0) {
             self.mu.lockUncancelable(io);
             mem.deinit();
+            self.allocator.destroy(mem);
             self.flushing_mem = null;
             self.flushes_completed += 1;
             _ = self.counters.flush_count.fetchAdd(1, .release);
@@ -1671,21 +1764,23 @@ pub const Engine = struct {
 
         // Lazy-sort (P-ALGO-003): the memtable may contain per-series
         // entries whose `sorted` flag was flipped to false by an
-        // out-of-order append. We sort once here, just before flush,
-        // rather than paying the cost on every OoO insert under the
-        // writer lock.
+        // out-of-order append. We sort once here, just before flush.
         mem.ensureAllSorted();
 
-        var it = mem.series.iterator();
-        while (it.next()) |entry| {
-            const items = entry.value_ptr.points.items;
-            if (items.len > 0) {
+        // Compute [min_ts, max_ts] across every shard.
+        const BoundsCtx = struct {
+            min_ts: *i64,
+            max_ts: *i64,
+
+            fn visit(self_ctx: @This(), _: types.SeriesId, items: []const types.Point) anyerror!void {
+                if (items.len == 0) return;
                 const first_ts = items[0].ts;
                 const last_ts = items[items.len - 1].ts;
-                if (first_ts < min_ts) min_ts = first_ts;
-                if (last_ts > max_ts) max_ts = last_ts;
+                if (first_ts < self_ctx.min_ts.*) self_ctx.min_ts.* = first_ts;
+                if (last_ts > self_ctx.max_ts.*) self_ctx.max_ts.* = last_ts;
             }
-        }
+        };
+        try mem.forEachSeries(BoundsCtx{ .min_ts = &min_ts, .max_ts = &max_ts }, BoundsCtx.visit);
 
         self.mu.lockUncancelable(io);
         const seg_id = self.man.getNextSegmentId();
@@ -1701,10 +1796,18 @@ pub const Engine = struct {
         );
         defer writer.deinit();
 
-        it = mem.series.iterator();
-        while (it.next()) |entry| {
-            try writer.writeBlock(entry.key_ptr.*, entry.value_ptr.points.items);
-        }
+        // Emit one block per (series_id, points) pair across every
+        // shard. `forEachSeries` holds the shard mutex during each
+        // visit so the slice the writer reads is stable.
+        const WriteCtx = struct {
+            writer: *segment.SegmentWriter,
+
+            fn visit(self_ctx: @This(), id: types.SeriesId, items: []const types.Point) anyerror!void {
+                if (items.len == 0) return;
+                try self_ctx.writer.writeBlock(id, items);
+            }
+        };
+        try mem.forEachSeries(WriteCtx{ .writer = &writer }, WriteCtx.visit);
 
         // Durability ordering: fsync the segment file BEFORE adding
         // it to the manifest. A crash between manifest commit and the
@@ -1729,6 +1832,7 @@ pub const Engine = struct {
             try self.man.save();
 
             mem.deinit();
+            self.allocator.destroy(mem);
             self.flushing_mem = null;
             self.flushes_completed += 1;
             _ = self.counters.flush_count.fetchAdd(1, .release);
@@ -2215,13 +2319,18 @@ pub const Engine = struct {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
 
-            // Memtables are touched under the lock — they can mutate
-            // concurrently with appendPoints. The points are copied
-            // into arena-owned slices inside queryMemtable so they
-            // outlive the lock release.
-            try queryMemtable(arena, &self.active_mem, series_id, start_ts, end_ts, merge_it, &points_added);
-            if (self.flushing_mem) |*mem| {
-                try queryMemtable(arena, mem, series_id, start_ts, end_ts, merge_it, &points_added);
+            // Memtables are drained under `engine.mu` so the
+            // flushing memtable cannot be freed by the flush worker
+            // (which also takes `engine.mu` for the final destroy)
+            // mid-scan. The per-shard mutex inside each memtable
+            // still serialises against concurrent `appendPoints` —
+            // we hold `engine.mu` only to guarantee POINTER lifetime
+            // here, not to exclude writers. Concurrent writes
+            // remain lock-free against engine.mu and contend only
+            // on the per-shard mutex they touch.
+            try queryMemtable(arena, self.active_mem.load(.acquire), series_id, start_ts, end_ts, merge_it, &points_added);
+            if (self.flushing_mem) |fm| {
+                try queryMemtable(arena, fm, series_id, start_ts, end_ts, merge_it, &points_added);
             }
 
             try segments_snapshot.ensureTotalCapacity(arena, self.man.segments.items.len);
@@ -2250,10 +2359,12 @@ pub const Engine = struct {
     /// memtable into `merge_it`. Allocates the filtered slice on the
     /// supplied arena.
     ///
-    /// Mutable receiver: `getSortedPoints` lazy-sorts the per-series
-    /// list on demand (see P-ALGO-003). The engine's writer lock is
-    /// held by `queryPoints` for the duration of this call, so the
-    /// mutation is race-free.
+    /// P-LOCK-005: the memtable's `copySortedPoints` takes the
+    /// relevant shard mutex internally, lazy-sorts the per-series
+    /// list on demand (P-ALGO-003), and copies the snapshot into
+    /// caller-supplied arena memory. The shard mutex serialises
+    /// against concurrent `appendPoints` targeting the same shard;
+    /// inserts on other shards proceed in parallel.
     fn queryMemtable(
         arena: Allocator,
         mem: *memtable.Memtable,
@@ -2263,10 +2374,13 @@ pub const Engine = struct {
         merge_it: *iterator.MergeIterator,
         points_added: *u64,
     ) !void {
-        const pts = mem.getSortedPoints(series_id);
-        if (pts.len == 0) return;
+        var sorted_buf = std.ArrayListUnmanaged(types.Point).empty;
+        // sorted_buf lives in arena memory; no explicit deinit.
+        try mem.copySortedPoints(series_id, arena, &sorted_buf);
+        if (sorted_buf.items.len == 0) return;
+
         var filtered_pts = std.ArrayListUnmanaged(types.Point).empty;
-        for (pts) |pt| {
+        for (sorted_buf.items) |pt| {
             if (pt.ts >= start_ts and pt.ts <= end_ts) {
                 try filtered_pts.append(arena, pt);
             }
@@ -2396,7 +2510,14 @@ test "Engine basic operations" {
     try std.testing.expectEqual(@as(usize, 1), engine.man.segments.items.len);
 }
 
-test "Engine: appendPoints reuses payload buffer across calls (P-MEM-003)" {
+test "Engine: appendPoints round-trips multiple variable-sized batches (P-LOCK-005)" {
+    // Post-P-LOCK-005 the engine no longer reuses an internal scratch
+    // buffer for the WAL payload (the single-owner contract required
+    // `engine.mu`, which serialised all writers — see encodeAppend-
+    // PointsPayload's comment). Each appendPoints allocates and frees
+    // its own buffer. The behavioural contract this test enforces is
+    // the same as the old P-MEM-003 test: multiple variable-sized
+    // batches in a row round-trip cleanly through the WAL.
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2414,32 +2535,20 @@ test "Engine: appendPoints reuses payload buffer across calls (P-MEM-003)" {
     }, &pool);
     defer engine.deinit();
 
-    // Before any append, the engine-owned scratch buffer is empty.
-    try std.testing.expectEqual(@as(usize, 0), engine.append_payload_buf.capacity);
-
-    // First append: buffer grows to fit (16 + 16*4 = 80 bytes).
+    // Three batches of different sizes — small, smaller, bigger.
     try engine.appendPoints(1, &.{
         .{ .ts = 1, .value = 10 },
         .{ .ts = 2, .value = 20 },
         .{ .ts = 3, .value = 30 },
         .{ .ts = 4, .value = 40 },
     });
-    const cap_after_first = engine.append_payload_buf.capacity;
-    try std.testing.expect(cap_after_first >= 80);
-
-    // Second SMALLER append: capacity must not shrink (the reuse
-    // contract). clearRetainingCapacity preserves the allocation.
     try engine.appendPoints(2, &.{.{ .ts = 5, .value = 50 }});
-    try std.testing.expectEqual(cap_after_first, engine.append_payload_buf.capacity);
-
-    // Third LARGER append: capacity grows.
     var bigger: [16]types.Point = undefined;
     for (&bigger, 0..) |*p, i| p.* = .{ .ts = @intCast(100 + i), .value = @intCast(i) };
     try engine.appendPoints(3, &bigger);
-    try std.testing.expect(engine.append_payload_buf.capacity >= 16 + 16 * bigger.len);
 
-    // Verify the points round-trip cleanly via query — the buffer
-    // reuse must not have corrupted the WAL record contents.
+    // Verify the points round-trip cleanly via query — no
+    // payload encoding corruption.
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
@@ -2683,7 +2792,7 @@ test "Engine: WAL encryption key round-trips append/recover/query" {
         }, &pool);
         defer eng.deinit();
 
-        try std.testing.expectEqual(@as(usize, 3), eng.active_mem.point_count);
+        try std.testing.expectEqual(@as(usize, 3), eng.active_mem.load(.acquire).point_count.load(.acquire));
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
@@ -2814,7 +2923,7 @@ test "Engine: AccessController denies appendPoints with AccessDenied (GAP-0002 /
     const stats = engine.stats();
     try std.testing.expectEqual(@as(u64, 0), stats.append_count);
     try std.testing.expectEqual(@as(u64, 0), stats.append_points);
-    try std.testing.expectEqual(@as(usize, 0), engine.active_mem.point_count);
+    try std.testing.expectEqual(@as(usize, 0), engine.active_mem.load(.acquire).point_count.load(.acquire));
 }
 
 test "Engine: AccessController denies queryPoints with AccessDenied (GAP-0002 / SEC-007)" {
@@ -3523,7 +3632,7 @@ test "Engine: per_call durability mode survives crash without explicit sync (P-I
     }, &pool);
     defer eng2.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), eng2.active_mem.point_count);
+    try std.testing.expectEqual(@as(usize, 2), eng2.active_mem.load(.acquire).point_count.load(.acquire));
 }
 
 test "Engine: batch durability mode background syncer drains the WAL (P-IO-002)" {

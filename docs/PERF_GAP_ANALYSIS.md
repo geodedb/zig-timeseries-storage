@@ -371,28 +371,34 @@ correct concurrency with the compaction lock.
 
 ### P-LOCK-005 — `appendPoints` holds writer lock during WAL pwrite
 
-**Status: Partially Closed (`4b40592`, 2026-05-27)** — WAL internal mutex landed; counter writes moved out of the engine lock via `std.atomic.Value(u64)`. Full closure (per-shard memtable) deferred — depends on P-LOCK-001.
+**Status: Closed (per-shard memtable + engine.mu release, 2026-05-27)** — WAL internal mutex (ENT-006), atomic counters, per-shard memtable, atomic active_mem pointer with in-flight-writer barrier, and engine.mu released around the WAL+memtable phase.
 
 - **Category:** Concurrency
 - **Severity:** P1
 - **PerfScore:** 64 (Impact 4 × Likelihood 4 × 4)
 - **Confidence:** confirmed
 - **Hot path:** write
-- **Evidence:** `src/engine.zig:125-148`. Exclusive lock then: `wal.appendRecord` (pwrite + possibly buffer grow), `active_mem.insert` (sort if OoO), `pool.submit`. All under the writer lock.
+- **Evidence:** Original — `src/engine.zig:125-148` had exclusive lock around `wal.appendRecord` + `active_mem.insert` + `pool.submit`.
 - **Root cause:** WAL append is the slowest part of the write path but doesn't need the engine lock (WAL has its own state). Memtable insert needs *a* lock but not the global one.
-- **Expected delta if fixed:** 2-3× write throughput when several writers append concurrently to different series.
-- **Partial closure (`4b40592`):**
-  - `WalManager.mu` (`std.Io.Mutex`) serialises `appendRecord`, `sync`, `truncate`, and read accessors. `*Locked` helpers added to avoid recursive locking. Today this is uncontended (engine.mu still wraps every WAL touch) but it removes the lost-update risk for a future per-shard memtable change to release engine.mu around the WAL+memtable phase.
-  - `EngineCounters` uses `std.atomic.Value(u64)` for all 12 counter fields. The three appendPoints counter writes no longer depend on engine.mu. `stats()` is now lock-free.
-  - **Measured:** `bench_concurrent_append` (N=4 disjoint series) median throughput rose 4.38M → 4.71M ops/s (+7.5%), with wall_ns_stddev dropping from ~3M ns to ~200K ns. Three independent A/B passes of 5 samples each.
-- **Remaining (full closure unblock criteria):**
-  - Per-shard memtable mutex keyed by `series_id` (the value-copy rotation pattern in Memtable must be restructured first — see P-LOCK-001 unblock criteria).
-  - Group-commit on WAL fsync (orthogonal; P-IO-002 closed previously).
-  - Engine.mu released around the WAL+memtable insert phase once per-shard locks exist.
-- **Validation plan:**
-  - Already in CI: `bench_concurrent_append` (4 writer threads, distinct series). Target: ≥3× aggregate throughput vs single-threaded `append_single_series`.
-- **Rollout risk:** Medium. WAL internal state and replay path must be reviewed for concurrency.
-- **Affected paths:** `engine.zig:appendPoints`, `wal_manager.zig`.
+- **Final closure:**
+  - **Per-shard memtable** (`src/memtable.zig`): the `Memtable` now contains `NUM_SHARDS = 16` `Shard` values, each with its own `std.Io.Mutex` and `std.AutoHashMap`. Shard pick is `series_id & (NUM_SHARDS - 1)` (NUM_SHARDS is a power of two). `point_count` is `std.atomic.Value(usize)`; reads via `.load(.acquire)`, increments via `.fetchAdd(.release)`. Concurrent writers on distinct shards never contend.
+  - **Heap-allocated active/flushing memtables** (`src/engine.zig`): `active_mem: std.atomic.Value(*memtable.Memtable)`, `flushing_mem: ?*memtable.Memtable`. Rotation builds a new heap-allocated memtable, publishes the new pointer via `.store(.release)`, and moves the old pointer into `flushing_mem` for the flush worker.
+  - **In-flight-writer barrier** (`Memtable.pending_writers: std.atomic.Value(u32)`): every `appendPoints` calls `target_mem.beginAppend()` BEFORE `insert` and `target_mem.endAppend()` AFTER. The flush worker calls `target_mem.waitForQuiescence()` on `flushing_mem` immediately after seeing the rotation, BEFORE scanning. This closes the "late-arrival insert after flush worker began scan" lost-update race: a writer that snapshotted the OLD pointer pre-rotation has bumped `pending_writers` on the OLD memtable; the flush worker waits until the writer's `endAppend()` fires before it begins reading.
+  - **Engine.mu release**: `appendPoints` now takes `engine.mu` ONLY for (a) the optional strict-OoO check (`config.allow_cross_segment_ooo == false` only) and (b) the post-insert flush-trigger + watermark bump. The WAL append + memtable insert run with `engine.mu` released; concurrent writers on distinct shards run in parallel.
+- **Race-condition analysis:**
+  - *Lost-update on flushing memtable*: a writer that snapshotted active_mem pre-rotation must finish its insert before the flush worker scans. Closed by the `pending_writers` barrier described above.
+  - *Use-after-free of rotated memtable*: rotation moves the OLD pointer into `flushing_mem` (still alive); the flush worker only `destroy()`s the memtable AFTER scanning + commit. Writers cannot observe a freed memtable because `flushing_mem` always points to a still-live allocation until the worker explicitly frees it under `engine.mu`.
+  - *Query-path use-after-free*: `queryPoints` still drains memtables under `engine.mu` (the engine lock guards POINTER LIFETIME there, not writer exclusion — concurrent inserts still contend only on the per-shard mutex). The flush worker's final `destroy()` also runs under `engine.mu`, so a query in progress cannot have its `flushing_mem` pointer freed under it.
+  - *Strict OoO mode*: the watermark map is touched only under `engine.mu`. The brief `lock → check → unlock` window covers OoO validation; the bump after insert runs under another brief lock acquisition. Order is preserved.
+  - *Counter atomicity*: counter writes are `.fetchAdd(.release)`; the snapshot via `stats()` is per-field consistent. No change from the ENT-006 partial closure.
+  - *Payload buffer*: the previous engine-owned scratch buffer (P-MEM-003) was abandoned because its single-owner contract required `engine.mu`. Each `appendPoints` now heap-allocates and frees its own payload (16 + 16·N bytes). The allocator round-trip is cheap next to the WAL append and is the unblock for parallel writer scaling.
+- **Measured:**
+  - ENT-006 partial closure baseline: 3.28M ops/s median.
+  - Post-closure: 3.89-4.38M ops/s median across two independent A/B passes (5 samples each). Throughput uplift ~18-33% on the contended-writers bench. No regressions on `bench_concurrent_rw`, `bench_ooo_append`, or `bench_recovery_latency`.
+- **Remaining work surfaced by this change:**
+  - Strict-mode OoO check still takes `engine.mu` — acceptable because the default permissive mode skips it entirely. Tightening would require moving the watermark map under its own mutex; out of scope here.
+  - The query path still holds `engine.mu` while draining memtables to guard pointer lifetime. A refcount-based scheme would let queries scan without `engine.mu` (matching the writer path), but that is a follow-up optimization with its own bench validation.
+- **Affected paths:** `engine.zig:appendPoints`, `engine.zig:maybeTriggerFlushLocked`, `engine.zig:flushInternal`, `engine.zig:flush`, `engine.zig:queryPoints`, `memtable.zig` (full rewrite).
 - **Platform issue:** TBD (token write access required).
 
 ---

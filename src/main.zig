@@ -170,7 +170,7 @@ fn cmdStatus(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: Args) !void 
     try out.print("segments: {d}\n", .{eng.man.segments.items.len});
     try out.print("last_checkpoint_lsn: {d}\n", .{eng.man.last_checkpoint_lsn});
     try out.print("next_segment_id: {d}\n", .{eng.man.next_segment_id});
-    try out.print("active_memtable_points: {d}\n", .{eng.active_mem.point_count});
+    try out.print("active_memtable_points: {d}\n", .{eng.active_mem.load(.acquire).point_count.load(.acquire)});
 }
 
 fn cmdAppend(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: Args) !void {
