@@ -43,6 +43,8 @@ pub const Args = struct {
     to: ?[]const u8 = null,
     from: ?[]const u8 = null,
     max_age_ms: ?i64 = null,
+    src: ?[]const u8 = null,
+    dst: ?[]const u8 = null,
 
     /// Parse `argv[start_idx..]` into self. Returns `error.UsageError`
     /// on unknown flags or missing flag values. Unknown flags are
@@ -88,6 +90,14 @@ pub const Args = struct {
                 if (i + 1 >= argv.len) return error.UsageError;
                 out.max_age_ms = std.fmt.parseInt(i64, argv[i + 1], 10) catch return error.UsageError;
                 i += 1;
+            } else if (std.mem.eql(u8, a, "--src")) {
+                if (i + 1 >= argv.len) return error.UsageError;
+                out.src = argv[i + 1];
+                i += 1;
+            } else if (std.mem.eql(u8, a, "--dst")) {
+                if (i + 1 >= argv.len) return error.UsageError;
+                out.dst = argv[i + 1];
+                i += 1;
             } else {
                 return error.UsageError;
             }
@@ -108,6 +118,7 @@ pub const SubCommand = enum {
     backup,
     restore,
     prune,
+    migrate,
     help,
 
     pub fn parse(s: []const u8) ?SubCommand {
@@ -121,6 +132,7 @@ pub const SubCommand = enum {
             .{ "backup", SubCommand.backup },
             .{ "restore", SubCommand.restore },
             .{ "prune", SubCommand.prune },
+            .{ "migrate", SubCommand.migrate },
             .{ "help", SubCommand.help },
             .{ "-h", SubCommand.help },
             .{ "--help", SubCommand.help },
@@ -290,6 +302,46 @@ fn cmdPrune(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: Args) !void {
     try out.print("pruned {d} segment(s); remaining={d}\n", .{ removed, eng.man.segments.items.len });
 }
 
+fn cmdMigrate(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: Args) !void {
+    // GAP-0009: migrate every *.tsseg file from --src to --dst,
+    // upgrading TSSEG001 -> TSSEG002. Source files are left in
+    // place. Destination directory is created if missing.
+    const src = args.src orelse return error.UsageError;
+    const dst = args.dst orelse return error.UsageError;
+
+    try Io.Dir.cwd().createDirPath(io, dst);
+
+    var src_dir = try Io.Dir.cwd().openDir(io, src, .{ .iterate = true });
+    defer src_dir.close(io);
+
+    var it = src_dir.iterate();
+    var migrated: usize = 0;
+    var skipped: usize = 0;
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".tsseg")) continue;
+
+        const src_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ src, entry.name });
+        defer gpa.free(src_path);
+        const dst_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dst, entry.name });
+        defer gpa.free(dst_path);
+
+        const blocks = lib.migration.migrateSegment(gpa, src_path, dst_path) catch |err| switch (err) {
+            // A file that is already v2 is skipped, not migrated.
+            error.NotV1Segment => {
+                skipped += 1;
+                try out.print("skip {s}: not a v1 segment\n", .{entry.name});
+                continue;
+            },
+            else => return err,
+        };
+        migrated += 1;
+        try out.print("migrated {s}: {d} block(s)\n", .{ entry.name, blocks });
+    }
+
+    try out.print("done: {d} migrated, {d} skipped\n", .{ migrated, skipped });
+}
+
 fn cmdHelp(out: *Io.Writer) !void {
     try out.writeAll(
         \\timeseries-storage CLI
@@ -315,6 +367,9 @@ fn cmdHelp(out: *Io.Writer) !void {
         \\           Verify <src> and copy its files into <dest>.
         \\  prune    --data-dir <dir> --max-age-ms <N>
         \\           Remove segments whose max_ts is older than (now - N) ms.
+        \\  migrate  --src <v1-dir> --dst <v2-dir>
+        \\           Upgrade every *.tsseg file from TSSEG001 to TSSEG002
+        \\           (adds per-block CRC32C). Source files are left intact.
         \\
         \\Exit codes: 0 = ok, 1 = usage error, 2 = engine error.
         \\
@@ -397,6 +452,7 @@ fn dispatch(
         .backup => try cmdBackup(gpa, io, out, args),
         .restore => try cmdRestore(gpa, io, out, args),
         .prune => try cmdPrune(gpa, io, out, args),
+        .migrate => try cmdMigrate(gpa, io, out, args),
         .help => try cmdHelp(out),
     }
 }
@@ -415,6 +471,7 @@ test "SubCommand.parse: every documented name resolves" {
     try std.testing.expectEqual(SubCommand.backup, SubCommand.parse("backup").?);
     try std.testing.expectEqual(SubCommand.restore, SubCommand.parse("restore").?);
     try std.testing.expectEqual(SubCommand.prune, SubCommand.parse("prune").?);
+    try std.testing.expectEqual(SubCommand.migrate, SubCommand.parse("migrate").?);
     try std.testing.expectEqual(SubCommand.help, SubCommand.parse("help").?);
     try std.testing.expectEqual(SubCommand.help, SubCommand.parse("--help").?);
     try std.testing.expectEqual(SubCommand.help, SubCommand.parse("-h").?);
@@ -494,6 +551,20 @@ test "Args.parse: --max-age-ms populates max_age_ms" {
     const a = try Args.parse(&argv, 2);
     try std.testing.expectEqualStrings("/tmp/p", a.data_dir.?);
     try std.testing.expectEqual(@as(i64, 60_000), a.max_age_ms.?);
+}
+
+test "Args.parse: migrate --src / --dst populate fields" {
+    const argv = [_][]const u8{
+        "tsdb",
+        "migrate",
+        "--src",
+        "/var/lib/old",
+        "--dst",
+        "/var/lib/new",
+    };
+    const a = try Args.parse(&argv, 2);
+    try std.testing.expectEqualStrings("/var/lib/old", a.src.?);
+    try std.testing.expectEqualStrings("/var/lib/new", a.dst.?);
 }
 
 test "Args.parse: query flags populate start/end" {
