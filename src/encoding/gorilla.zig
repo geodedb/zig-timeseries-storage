@@ -310,11 +310,70 @@ pub const GorillaDecoder = struct {
         return bit;
     }
 
+    /// Bulk read up to 64 bits at once (P-ALGO-005).
+    ///
+    /// Builds a temporary 64-bit word by loading up to 9 consecutive
+    /// bytes from the stream and shifting them into a register, then
+    /// extracts `num_bits` from the MSB end. This replaces the previous
+    /// per-bit loop that called `readBit` `num_bits` times, eliminating
+    /// the per-iteration bounds check, modulo, and shift overhead.
+    ///
+    /// On-disk encoding (matches `GorillaEncoder.getCompressedData`):
+    /// bytes are stored MSB-first — bit at stream position `p` is the
+    /// `7 - (p % 8)` bit of `data[p / 8]`. To read `num_bits` starting
+    /// at `bit_pos`, we:
+    ///
+    ///   1. Load 9 consecutive bytes into a u128 (handles up to a
+    ///      7-bit start offset plus 64 bits of payload).
+    ///   2. Shift the loaded value so the first bit of the payload is
+    ///      at the MSB of the high u64 half.
+    ///   3. Return the top `num_bits` bits.
+    ///
+    /// Carefully handles three edge cases:
+    ///   * `num_bits == 0`: returns 0 immediately.
+    ///   * `bit_pos % 8 != 0`: partial-byte alignment — the load picks
+    ///     up `bit_pos % 8` junk bits at the top which the shift
+    ///     discards.
+    ///   * Reading past the end: returns `error.EndOfStream` BEFORE
+    ///     any load happens, so the trailing-byte read never touches
+    ///     out-of-bounds memory.
     fn readBits(self: *GorillaDecoder, num_bits: u8) !u64 {
-        var value: u64 = 0;
-        for (0..num_bits) |_| {
-            value = (value << 1) | @as(u64, try self.readBit());
+        if (num_bits == 0) return 0;
+        if (self.bit_pos + num_bits > self.total_bits) return error.EndOfStream;
+
+        const start_byte = self.bit_pos / 8;
+        const bit_offset: u7 = @intCast(self.bit_pos % 8);
+
+        // Number of source bytes we must touch to cover the bit range.
+        // Bits span [start_byte*8, start_byte*8 + bit_offset + num_bits).
+        // Inclusive byte count is ceil((bit_offset + num_bits) / 8).
+        const span_bits: usize = @as(usize, bit_offset) + @as(usize, num_bits);
+        const byte_count: usize = (span_bits + 7) / 8;
+        std.debug.assert(byte_count <= 9); // bit_offset≤7, num_bits≤64
+
+        // Assemble the bytes into a u128 in big-endian order so the
+        // highest stream bit ends up in the highest u128 bit.
+        var word: u128 = 0;
+        var i: usize = 0;
+        while (i < byte_count) : (i += 1) {
+            word = (word << 8) | @as(u128, self.data[start_byte + i]);
         }
+        // After the loop, the LSB of `word` is the last bit of the
+        // `byte_count`-th byte. Total loaded bits = byte_count * 8.
+        // The payload starts at bit_offset bits into the first byte
+        // and is num_bits long. The number of trailing bits below the
+        // payload is: (byte_count * 8) - bit_offset - num_bits.
+        const total_loaded: usize = byte_count * 8;
+        const trailing: u7 = @intCast(total_loaded - @as(usize, bit_offset) - @as(usize, num_bits));
+        // Shift the payload to the LSB end and mask to num_bits.
+        const shifted: u128 = word >> trailing;
+        const mask: u128 = if (num_bits == 64)
+            std.math.maxInt(u64)
+        else
+            (@as(u128, 1) << @intCast(num_bits)) - 1;
+        const value: u64 = @intCast(shifted & mask);
+
+        self.bit_pos += num_bits;
         return value;
     }
 
@@ -445,6 +504,109 @@ pub const GorillaDecoder = struct {
         return try points.toOwnedSlice(allocator);
     }
 };
+
+/// Reference per-bit decoder kept ONLY for the bulk-decode equivalence
+/// test below. Preserves the pre-P-ALGO-005 implementation so we can
+/// prove the optimised path is byte-identical against a known-good
+/// baseline. Do NOT call from production code.
+fn readBitsPerBitForTest(self: *GorillaDecoder, num_bits: u8) !u64 {
+    var value: u64 = 0;
+    for (0..num_bits) |_| {
+        value = (value << 1) | @as(u64, try self.readBit());
+    }
+    return value;
+}
+
+test "GorillaDecoder: readBits bulk decode matches per-bit baseline (P-ALGO-005)" {
+    const allocator = std.testing.allocator;
+
+    // Encode a known-varied bit pattern: every prefix code shape +
+    // a 64-bit literal, then a few odd-width payloads (7, 9, 12, 32).
+    var enc = try GorillaEncoder.init(allocator);
+    defer enc.deinit();
+
+    // Some points whose deltas/XORs land in every Gorilla bucket.
+    const pts = [_]types.Point{
+        .{ .ts = 1000, .value = 0x0123_4567_89AB_CDEF },
+        .{ .ts = 2000, .value = 0x0123_4567_89AB_CDEF }, // xor=0, dod=999
+        .{ .ts = 3000, .value = 0x0123_4567_89AB_CDFF }, // xor small
+        .{ .ts = 4000, .value = -1 }, // xor wide
+        .{ .ts = 4100, .value = 7 }, // dod-of-delta small
+        .{ .ts = 5000, .value = 1_000_000 }, // dod medium
+        .{ .ts = 10_000, .value = 0 }, // dod large
+        .{ .ts = 1_000_000, .value = std.math.minInt(i64) }, // dod 32-bit
+    };
+    for (pts) |p| try enc.encodePoint(p);
+
+    const data = try enc.getCompressedData(allocator);
+    defer allocator.free(data);
+
+    // Decode with the optimised bulk path.
+    var dec_bulk = GorillaDecoder.init(data, pts.len);
+    const out_bulk = try dec_bulk.decodeAll(allocator);
+    defer allocator.free(out_bulk);
+
+    // Decode with the per-bit baseline. We do this manually by
+    // exercising the public `decodePoint` while temporarily swapping
+    // readBits — easier path: re-walk the same bit positions through
+    // a second decoder and assert every readBits call returns the
+    // same value via both paths.
+    var dec_a = GorillaDecoder.init(data, pts.len);
+    var dec_b = GorillaDecoder.init(data, pts.len);
+    // Mirror a handful of mixed-width reads from the start of the stream.
+    const widths = [_]u8{ 1, 1, 64, 1, 7, 1, 9, 1, 12, 1, 32, 1, 5, 6, 7, 64 };
+    var total: usize = 0;
+    for (widths) |w| {
+        if (total + w > dec_a.total_bits) break;
+        const a_val = try dec_a.readBits(w);
+        const b_val = try readBitsPerBitForTest(&dec_b, w);
+        try std.testing.expectEqual(b_val, a_val);
+        total += w;
+    }
+
+    // Final point-by-point equivalence: bulk decode must return the
+    // exact original sequence.
+    try std.testing.expectEqual(pts.len, out_bulk.len);
+    for (pts, 0..) |expected, i| {
+        try std.testing.expectEqual(expected.ts, out_bulk[i].ts);
+        try std.testing.expectEqual(expected.value, out_bulk[i].value);
+    }
+}
+
+test "GorillaDecoder: readBits handles every bit_pos alignment (P-ALGO-005)" {
+    const allocator = std.testing.allocator;
+
+    // Hand-craft a known byte stream: 0b10101010, 0b11001100, 0b11110000, 0b00001111.
+    const raw = [_]u8{ 0xAA, 0xCC, 0xF0, 0x0F };
+    // Sample expected values at every bit position for widths 1..16.
+    for (0..(raw.len * 8)) |start_pos| {
+        var max_w: usize = 16;
+        if (start_pos + max_w > raw.len * 8) max_w = raw.len * 8 - start_pos;
+
+        for (1..max_w + 1) |w| {
+            var dec_bulk = GorillaDecoder.init(&raw, 0);
+            dec_bulk.bit_pos = start_pos;
+            const bulk_val = try dec_bulk.readBits(@intCast(w));
+
+            var dec_perbit = GorillaDecoder.init(&raw, 0);
+            dec_perbit.bit_pos = start_pos;
+            const perbit_val = try readBitsPerBitForTest(&dec_perbit, @intCast(w));
+
+            try std.testing.expectEqual(perbit_val, bulk_val);
+            try std.testing.expectEqual(dec_perbit.bit_pos, dec_bulk.bit_pos);
+        }
+    }
+    _ = allocator;
+}
+
+test "GorillaDecoder: readBits surfaces EndOfStream past the buffer (P-ALGO-005)" {
+    const raw = [_]u8{0xFF};
+    var dec = GorillaDecoder.init(&raw, 0);
+    dec.bit_pos = 4;
+    try std.testing.expectError(error.EndOfStream, dec.readBits(8));
+    // Position MUST NOT advance on error.
+    try std.testing.expectEqual(@as(usize, 4), dec.bit_pos);
+}
 
 test "GorillaEncoder: refuses to grow past the absolute point cap" {
     const allocator = std.testing.allocator;
