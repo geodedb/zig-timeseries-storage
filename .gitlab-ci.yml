@@ -314,3 +314,103 @@ scale-bench:
     paths:
     - benchmarks/results/scale-current.json
     expire_in: 30 days
+
+# ---------------------------------------------------------------
+# Coverage (Q-CI-005).
+#
+# Builds the unit + integration test binaries via `zig build test`,
+# then runs them under kcov so per-file line coverage is recorded.
+# Output is uploaded as a GitLab cobertura artifact so the MR diff
+# shows red/green per line. The `coverage:` regex on the job parses
+# the kcov summary so the GitLab badge picks it up.
+#
+# Allowed to fail because kcov occasionally hiccups on optimised
+# binaries on Ubuntu 24.04; we treat the coverage number as an
+# advisory metric until a stable threshold is set.
+# ---------------------------------------------------------------
+
+coverage:
+  extends: .zig-host-base
+  stage: test
+  rules:
+  - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  - if: '$RUN_COVERAGE == "true"'
+  - when: manual
+    allow_failure: true
+  before_script:
+  - apt-get update -qq
+  - apt-get install -y --no-install-recommends curl ca-certificates xz-utils git build-essential python3 kcov || true
+  - bash scripts/install-zig.sh "$ZIG_VERSION"
+  - export PATH="$(pwd)/zig-${ZIG_VERSION}:$PATH"
+  - zig version
+  - kcov --version || echo "kcov unavailable on this runner"
+  script:
+  - mkdir -p coverage
+  # Build all test artifacts first so kcov has stable paths to run.
+  - zig build test --summary all
+  - zig build test-integration --summary all
+  # Discover and run every cached test binary. The Zig build system
+  # places each test artifact under .zig-cache/o/<hash>/test; kcov
+  # tolerates per-binary failures and merges results across runs.
+  - |
+    for t in $(find .zig-cache/o -type f -name test -executable 2>/dev/null); do
+      kcov --include-path=src/ coverage "$t" || echo "kcov skipped $t"
+    done
+  coverage: '/^lines\.*:\s*([\d.]+%)/'
+  artifacts:
+    when: always
+    paths:
+    - coverage/
+    expire_in: 30 days
+  allow_failure: true
+
+# ---------------------------------------------------------------
+# Nightly ThreadSanitizer matrix.
+#
+# Runs the test suite with TSan enabled (-Dtsan=true). Build.zig
+# automatically drops ReleaseFast to Debug under TSan so the
+# sanitizer can see real races instead of having them optimised
+# away. Scheduled-only by default so PRs aren't gated on the (still
+# expensive) TSan run; allow_failure: true while we burn down any
+# remaining benign warnings.
+# ---------------------------------------------------------------
+
+test-tsan-unit:
+  extends: .zig-host-base
+  stage: test
+  rules:
+  - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  - if: '$RUN_TSAN == "true"'
+  - when: manual
+    allow_failure: true
+  script:
+  - zig build test -Dtsan=true --summary all
+  allow_failure: true
+  timeout: "30m"
+
+test-tsan-integration:
+  extends: .zig-host-base
+  stage: test
+  rules:
+  - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  - if: '$RUN_TSAN == "true"'
+  - when: manual
+    allow_failure: true
+  script:
+  - zig build test-integration -Dtsan=true --summary all
+  allow_failure: true
+  timeout: "30m"
+
+test-tsan-stress:
+  extends: .zig-host-base
+  stage: test
+  rules:
+  - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  - if: '$RUN_TSAN == "true"'
+  - when: manual
+    allow_failure: true
+  script:
+  - zig build test-stress -Dtsan=true --summary all
+  allow_failure: true
+  timeout: "30m"
