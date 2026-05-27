@@ -8,14 +8,21 @@
 //! and every cold-cache read respectively:
 //!
 //!   * `segment_write_block_256` — open a fresh `SegmentWriter` over a
-//!     tmp file, encode + write one 256-point block via the public
-//!     `writeBlock(series_id, points)` API, `sync()` to force the
-//!     bytes to disk, then `deinit()` to close. This mirrors the
-//!     single-block fast path the engine takes for small memtable
-//!     flushes; it captures both the Gorilla encoder cost (already
-//!     measured in isolation by `gorilla_encode_256`) AND the I/O
-//!     header serialization + fsync cost, so a regression in either
-//!     half surfaces here even if the codec-only bench stays flat.
+//!     tmp file, encode + write `BLOCKS_PER_ITER` 256-point blocks via
+//!     the public `writeBlock(series_id, points)` API, `sync()` to
+//!     force the bytes to disk, then `deinit()` to close. This mirrors
+//!     the multi-block path the engine takes during a memtable flush
+//!     (one block per series) and during compaction (many blocks per
+//!     output segment); it captures both the Gorilla encoder cost
+//!     (already measured in isolation by `gorilla_encode_256`) AND the
+//!     I/O header serialization + fsync cost, so a regression in
+//!     either half surfaces here even if the codec-only bench stays
+//!     flat. ENT-003 update: writing multiple blocks per iteration
+//!     exercises the pooled `GorillaEncoder` inside `SegmentWriter` —
+//!     the encoder bitset is allocated once on the first block and
+//!     reused (via `reset`) for every subsequent block, so the
+//!     `alloc_count` should reflect ONE encoder allocation per iter
+//!     regardless of `BLOCKS_PER_ITER`.
 //!
 //!   * `segment_read_block_256` — pre-write one 256-point block in
 //!     setup, then measure the open + iterate + `decodePoints` round
@@ -41,6 +48,15 @@ const Io = std.Io;
 const lib = @import("timeseries_storage");
 const framework = @import("framework");
 
+/// Number of blocks per iteration in `segment_write_block_256`. The
+/// fixture is reused across all blocks (only the series_id changes),
+/// so the on-disk bitstream is byte-identical for each block — the
+/// scenario is measuring the SegmentWriter framing + I/O + pooled
+/// encoder reset cost across multiple blocks, not divergent encoder
+/// behaviour. ENT-003: chosen so the pooled-encoder win is visible
+/// in `alloc_count` (1 encoder alloc instead of `BLOCKS_PER_ITER`).
+const BLOCKS_PER_ITER: usize = 8;
+
 pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
@@ -53,7 +69,11 @@ pub fn main(init: std.process.Init) !void {
     const scenarios = [_]framework.Scenario{
         .{
             .name = "segment_write_block_256",
-            .ops_per_iteration = 256,
+            // ENT-003: 8 blocks × 256 points per iteration. The
+            // pooled GorillaEncoder amortises across all 8 blocks so
+            // the alloc_count reflects ONE encoder allocation rather
+            // than one per block.
+            .ops_per_iteration = 256 * BLOCKS_PER_ITER,
             .warmup_iterations = 2,
             .sample_iterations = 10,
             .run = runWriteBlock256,
@@ -99,12 +119,20 @@ fn fillFixture(pts: *[256]lib.types.Point) void {
     }
 }
 
-/// Open `SegmentWriter`, write ONE 256-point block, `sync()`, close.
+/// Open `SegmentWriter`, write `BLOCKS_PER_ITER` 256-point blocks
+/// (one per distinct series_id), `sync()`, close.
 ///
-/// Mirrors the single-block path inside `Engine.flushInternal` at
+/// Mirrors the multi-block path inside `Engine.flushInternal` at
 /// `src/engine.zig:1615` (which calls `initWithEncryption` — we use
 /// the `init` convenience wrapper that passes `null` encryption,
-/// producing the plaintext v2 / `TSSEG002` format).
+/// producing the plaintext v2 / `TSSEG002` format) where a single
+/// segment file accumulates one block per series being flushed.
+///
+/// ENT-003: this scenario was updated to write multiple blocks per
+/// iteration so the pooled-encoder win is visible. With the
+/// SegmentWriter-internal encoder pool, the bitset is allocated once
+/// on the first `writeBlock` and reused (via `reset`) for every
+/// subsequent block, dropping `alloc_count` from O(blocks) to O(1).
 fn runWriteBlock256(ctx: *framework.Context) anyerror!void {
     const io = std.Io.Threaded.global_single_threaded.io();
     const tmp = try benchTmpDir(ctx.allocator, ctx);
@@ -118,7 +146,14 @@ fn runWriteBlock256(ctx: *framework.Context) anyerror!void {
 
     var writer = try lib.segment.SegmentWriter.init(ctx.allocator, seg_path);
     defer writer.deinit();
-    try writer.writeBlock(1, &pts);
+    var b: usize = 0;
+    while (b < BLOCKS_PER_ITER) : (b += 1) {
+        // Each block gets a distinct series_id so the writer-side
+        // header path is exercised independently per block; the
+        // payload is identical, which is fine — the bench is measuring
+        // framing + I/O + encoder pool reuse, not codec divergence.
+        try writer.writeBlock(@intCast(b + 1), &pts);
+    }
     try writer.sync();
 
     std.mem.doNotOptimizeAway(writer.block_index);

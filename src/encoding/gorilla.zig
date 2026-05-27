@@ -96,6 +96,54 @@ pub const GorillaEncoder = struct {
         self.bits.deinit();
     }
 
+    /// Reset encoder state for a fresh block while retaining the
+    /// `DynamicBitSet` backing allocation. ENT-003: callers that
+    /// produce many blocks back-to-back (e.g. `SegmentWriter.writeBlock`
+    /// loops in flush + compaction) avoid one bitset allocation per
+    /// block by pooling the encoder and calling `reset()` between blocks
+    /// instead of `init/deinit`.
+    ///
+    /// Equivalent to constructing a new encoder via `initWithCapacity`
+    /// at the current capacity, minus the allocation. Logically the
+    /// bitset behaves as if it had been re-initialised: subsequent
+    /// `writeBit` / `writeBits` calls land starting at bit position 0
+    /// and overwrite any residual bits.
+    ///
+    /// Implementation note: we deliberately do NOT call
+    /// `self.bits.resize(0, false)` to "truncate". The Zig 0.16
+    /// `DynamicBitSetUnmanaged.resize` implementation (see
+    /// `lib/std/bit_set.zig:747-752`) explicitly frees the mask array
+    /// when `new_len == 0`, which would defeat the entire purpose of
+    /// pooling — the next `writeBit` would have to reallocate. Instead
+    /// we leave `bits.bit_length` unchanged (preserving capacity) and
+    /// rely on the fact that `writeBit` uses `setValue` and `writeBits`
+    /// explicitly clear-then-set each destination bit, so residual
+    /// contents from the previous block are unconditionally overwritten
+    /// as new bits are written.
+    ///
+    /// If the next block exceeds the retained capacity, the bitset
+    /// grows normally through `writeBit` / `writeBits` — that path is
+    /// exactly what `initWithCapacity` would do on a fresh encoder.
+    pub fn reset(self: *GorillaEncoder) void {
+        self.bit_pos = 0;
+        self.stats = .{
+            .min_ts = std.math.maxInt(i64),
+            .max_ts = std.math.minInt(i64),
+            .count = 0,
+            .min_value = std.math.maxInt(i64),
+            .max_value = std.math.minInt(i64),
+            .sum = 0,
+            .first_value = 0,
+            .last_value = 0,
+        };
+        self.prev_ts = 0;
+        self.prev_delta = 0;
+        self.prev_value = 0;
+        self.prev_xor = 0;
+        self.prev_leading = 0;
+        self.prev_trailing = 0;
+    }
+
     /// Encode a time-series point using Gorilla compression.
     ///
     /// On the first point, both the timestamp and the value are
@@ -703,6 +751,95 @@ test "GorillaEncoder: pre-sized encoder produces the same bitstream as default-s
 
     try std.testing.expectEqualSlices(u8, out_default, out_sized);
     try std.testing.expectEqual(enc_default.bit_pos, enc_sized.bit_pos);
+}
+
+test "GorillaEncoder: reset produces identical bitstream to fresh init (ENT-003)" {
+    const allocator = std.testing.allocator;
+
+    const pts_a = [_]types.Point{
+        .{ .ts = 1, .value = 1 },
+        .{ .ts = 2, .value = 2 },
+        .{ .ts = 3, .value = 3 },
+        .{ .ts = 100, .value = -7 },
+        .{ .ts = 200, .value = 99 },
+    };
+    const pts_b = [_]types.Point{
+        .{ .ts = 5000, .value = -42 },
+        .{ .ts = 5100, .value = 17 },
+        .{ .ts = 5200, .value = 17 },
+        .{ .ts = 9000, .value = std.math.maxInt(i64) },
+    };
+
+    // Reference: encode pts_b with a fresh encoder.
+    var enc_ref = try GorillaEncoder.initForPoints(allocator, pts_b.len);
+    defer enc_ref.deinit();
+    for (pts_b) |p| try enc_ref.encodePoint(p);
+    const out_ref = try enc_ref.getCompressedData(allocator);
+    defer allocator.free(out_ref);
+
+    // Pooled: encode pts_a then reset and encode pts_b.
+    var enc_pool = try GorillaEncoder.initForPoints(allocator, pts_a.len);
+    defer enc_pool.deinit();
+    for (pts_a) |p| try enc_pool.encodePoint(p);
+    const cap_before_reset = enc_pool.bits.capacity();
+    enc_pool.reset();
+    // After reset: bit_pos must be 0, stats must be cleared, and
+    // capacity must NOT have shrunk (the whole point of pooling).
+    try std.testing.expectEqual(@as(usize, 0), enc_pool.bit_pos);
+    try std.testing.expectEqual(@as(u32, 0), enc_pool.stats.count);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), enc_pool.stats.min_ts);
+    try std.testing.expect(enc_pool.bits.capacity() >= cap_before_reset);
+
+    for (pts_b) |p| try enc_pool.encodePoint(p);
+    const out_pool = try enc_pool.getCompressedData(allocator);
+    defer allocator.free(out_pool);
+
+    // The pooled encoder's second block must be byte-identical to a
+    // fresh encoder's encoding of the same points.
+    try std.testing.expectEqualSlices(u8, out_ref, out_pool);
+    try std.testing.expectEqual(enc_ref.bit_pos, enc_pool.bit_pos);
+    try std.testing.expectEqual(enc_ref.stats.count, enc_pool.stats.count);
+    try std.testing.expectEqual(enc_ref.stats.min_ts, enc_pool.stats.min_ts);
+    try std.testing.expectEqual(enc_ref.stats.max_ts, enc_pool.stats.max_ts);
+
+    // Round-trip: the pooled bitstream must decode back to pts_b.
+    var dec = GorillaDecoder.init(out_pool, @intCast(pts_b.len));
+    const decoded = try dec.decodeAll(allocator);
+    defer allocator.free(decoded);
+    try std.testing.expectEqual(pts_b.len, decoded.len);
+    for (pts_b, 0..) |expected, i| {
+        try std.testing.expectEqual(expected.ts, decoded[i].ts);
+        try std.testing.expectEqual(expected.value, decoded[i].value);
+    }
+}
+
+test "GorillaEncoder: reset retains capacity for hot-loop pooling (ENT-003)" {
+    const allocator = std.testing.allocator;
+
+    // Pre-size for 256 points × 18 bits ≈ 4608 bits.
+    var enc = try GorillaEncoder.initForPoints(allocator, 256);
+    defer enc.deinit();
+    const initial_capacity = enc.bits.capacity();
+    try std.testing.expect(initial_capacity >= 256 * GorillaEncoder.TYPICAL_BITS_PER_POINT);
+
+    // Drive several reset cycles. Capacity must monotonically retain.
+    for (0..8) |i| {
+        const ts_base = @as(i64, @intCast(i)) * 1_000_000;
+        for (0..64) |j| {
+            try enc.encodePoint(.{
+                .ts = ts_base + @as(i64, @intCast(j)) * 1000,
+                .value = @as(i64, @intCast(j)) * 7 + 13,
+            });
+        }
+        try std.testing.expectEqual(@as(u32, 64), enc.stats.count);
+        const cap_now = enc.bits.capacity();
+        try std.testing.expect(cap_now >= initial_capacity);
+        enc.reset();
+        try std.testing.expectEqual(@as(usize, 0), enc.bit_pos);
+        try std.testing.expectEqual(@as(u32, 0), enc.stats.count);
+        // Critically: capacity must be retained across reset.
+        try std.testing.expectEqual(cap_now, enc.bits.capacity());
+    }
 }
 
 test "GorillaEncoder: refuses to grow past the absolute point cap" {

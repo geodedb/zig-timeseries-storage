@@ -217,6 +217,14 @@ pub const SegmentWriter = struct {
     allocator: Allocator,
     encryption: ?EncryptionContext = null,
     block_index: u32 = 0,
+    /// Pooled Gorilla encoder reused across `writeBlock` calls (ENT-003).
+    /// Lazily initialised on the first `writeBlock` so a writer that is
+    /// constructed but never appended to (e.g. an error path between
+    /// `init` and the first append) never allocates the bitset. After
+    /// the first block the encoder is retained and `reset()` is called
+    /// between blocks instead of `init/deinit`, eliminating one bitset
+    /// allocation per block on the hot flush + compaction paths.
+    encoder: ?gorilla.GorillaEncoder = null,
 
     pub fn init(allocator: Allocator, path: []const u8) !SegmentWriter {
         return initWithEncryption(allocator, path, null);
@@ -249,6 +257,8 @@ pub const SegmentWriter = struct {
     }
 
     pub fn deinit(self: *SegmentWriter) void {
+        if (self.encoder) |*enc| enc.deinit();
+        self.encoder = null;
         self.file.close(self.io_ctx);
     }
 
@@ -287,12 +297,33 @@ pub const SegmentWriter = struct {
     pub fn writeBlock(self: *SegmentWriter, series_id: types.SeriesId, points: []const types.Point) !void {
         if (points.len == 0) return;
 
-        // P-MEM-002: pre-size the encoder bitset for the known input
-        // count, eliminating most realloc-doubling cycles during the
-        // hot encode loop. The estimate clamps internally so an
-        // adversarial input cannot drive an absurd up-front allocation.
-        var encoder = try gorilla.GorillaEncoder.initForPoints(self.allocator, points.len);
-        defer encoder.deinit();
+        // ENT-003: pool the Gorilla encoder across `writeBlock` calls.
+        // The first call lazily allocates the encoder pre-sized via
+        // `initForPoints` (P-MEM-002). Every subsequent call reuses the
+        // retained `DynamicBitSet` allocation by calling `reset()`,
+        // which clears the bit position and stats without freeing the
+        // mask array. If a later block is larger than any prior block
+        // the bitset grows normally inside `writeBit` / `writeBits`.
+        //
+        // We use the optional-payload-pointer pattern (`|*e|`) so the
+        // encoder pointer is stable across ReleaseFast / ReleaseSmall
+        // builds; taking `&self.encoder.?` is fragile in those modes
+        // because the optional unwrap can produce a value copy.
+        const encoder: *gorilla.GorillaEncoder = blk: {
+            if (self.encoder) |*existing| {
+                existing.reset();
+                break :blk existing;
+            }
+            self.encoder = try gorilla.GorillaEncoder.initForPoints(self.allocator, points.len);
+            // After the assignment above, `self.encoder` is non-null —
+            // take the payload pointer through the same payload-capture
+            // pattern to keep the lifetime semantics identical to the
+            // reuse branch.
+            if (self.encoder) |*fresh| {
+                break :blk fresh;
+            }
+            unreachable;
+        };
 
         for (points) |p| {
             try encoder.encodePoint(p);
