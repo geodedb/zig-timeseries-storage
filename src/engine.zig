@@ -188,6 +188,18 @@ pub const Engine = struct {
     /// where flush() returned after "some" flush completed rather
     /// than "the flush I scheduled" (Q-REL-010).
     flushes_completed: u64 = 0,
+    /// Engine-owned scratch buffer reused by `appendPoints` to
+    /// serialise the WAL payload. Previously each call heap-allocated
+    /// a fresh buffer (16 + 16*N bytes) only to free it a few
+    /// microseconds later — pure allocator churn on the hot ingest
+    /// path. The buffer is sized on first use and grown in-place when
+    /// a larger batch arrives; it is only freed at `deinit`.
+    ///
+    /// Concurrency: every `appendPoints` call serialises through
+    /// `self.mu` (writer-exclusive), so the buffer has a single
+    /// writer at a time. No additional synchronisation is needed.
+    /// Other call sites MUST NOT touch this buffer. Closes P-MEM-003.
+    append_payload_buf: std.ArrayListUnmanaged(u8) = .empty,
 
     /// Open (or create) an engine over `config.data_dir`.
     ///
@@ -459,6 +471,7 @@ pub const Engine = struct {
         self.man.deinit();
         self.active_mem.deinit();
         if (self.flushing_mem) |*fm| fm.deinit();
+        self.append_payload_buf.deinit(self.allocator);
     }
 
     /// Append a batch of points to the given series.
@@ -502,40 +515,54 @@ pub const Engine = struct {
         // allocation an external caller can force.
         if (points.len > limits.MAX_APPEND_BATCH_POINTS) return error.BatchTooLarge;
 
-        const payload = try encodeAppendPointsPayload(self.allocator, series_id, points);
-        defer self.allocator.free(payload);
-
         const io = std.Io.Threaded.global_single_threaded.io();
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
+
+        // P-MEM-003: reuse the engine-owned scratch buffer instead of
+        // heap-allocating a fresh payload per call. The writer lock is
+        // already held, so `append_payload_buf` has a single owner for
+        // the duration of this call.
+        const payload = try self.encodeAppendPointsPayloadLocked(series_id, points);
 
         _ = try self.appendToWalLocked(payload);
         try self.active_mem.insert(series_id, points);
         try self.maybeTriggerFlushLocked(io);
     }
 
-    /// Serialise `(series_id, points)` into the WAL record payload
-    /// format expected by `wal_record.WalRecord`. Layout is
-    /// `series_id (u128 LE) || (i64 ts, i64 value)*`. Caller owns the
-    /// returned buffer.
-    fn encodeAppendPointsPayload(
-        allocator: Allocator,
+    /// Serialise `(series_id, points)` into the engine-owned payload
+    /// buffer and return a slice over the live bytes. The slice is
+    /// only valid until the next `encodeAppendPointsPayloadLocked` /
+    /// `appendPoints` call; the WAL append must consume it before
+    /// releasing the writer lock.
+    ///
+    /// Layout matches `wal_record.WalRecord`:
+    /// `series_id (u128 LE) || (i64 ts, i64 value)*`.
+    ///
+    /// MUST be called with `self.mu` held — the buffer is shared
+    /// state and is not otherwise synchronised.
+    fn encodeAppendPointsPayloadLocked(
+        self: *Engine,
         series_id: types.SeriesId,
         points: []const types.Point,
-    ) ![]u8 {
+    ) ![]const u8 {
         const payload_size = 16 + (points.len * 16);
-        const payload = try allocator.alloc(u8, payload_size);
-        errdefer allocator.free(payload);
 
-        std.mem.writeInt(u128, payload[0..16], series_id, .little);
+        // Grow once if needed; subsequent calls reuse the capacity.
+        self.append_payload_buf.clearRetainingCapacity();
+        try self.append_payload_buf.ensureTotalCapacity(self.allocator, payload_size);
+        self.append_payload_buf.items.len = payload_size;
+        const buf = self.append_payload_buf.items;
+
+        std.mem.writeInt(u128, buf[0..16], series_id, .little);
         var pos: usize = 16;
         for (points) |pt| {
-            std.mem.writeInt(i64, payload[pos..][0..8], pt.ts, .little);
+            std.mem.writeInt(i64, buf[pos..][0..8], pt.ts, .little);
             pos += 8;
-            std.mem.writeInt(i64, payload[pos..][0..8], pt.value, .little);
+            std.mem.writeInt(i64, buf[pos..][0..8], pt.value, .little);
             pos += 8;
         }
-        return payload;
+        return buf;
     }
 
     /// Append an already-encoded payload to the WAL and return the
@@ -1307,6 +1334,59 @@ test "Engine basic operations" {
     try engine.flush();
 
     try std.testing.expectEqual(@as(usize, 1), engine.man.segments.items.len);
+}
+
+test "Engine: appendPoints reuses payload buffer across calls (P-MEM-003)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 1_000_000,
+    }, &pool);
+    defer engine.deinit();
+
+    // Before any append, the engine-owned scratch buffer is empty.
+    try std.testing.expectEqual(@as(usize, 0), engine.append_payload_buf.capacity);
+
+    // First append: buffer grows to fit (16 + 16*4 = 80 bytes).
+    try engine.appendPoints(1, &.{
+        .{ .ts = 1, .value = 10 },
+        .{ .ts = 2, .value = 20 },
+        .{ .ts = 3, .value = 30 },
+        .{ .ts = 4, .value = 40 },
+    });
+    const cap_after_first = engine.append_payload_buf.capacity;
+    try std.testing.expect(cap_after_first >= 80);
+
+    // Second SMALLER append: capacity must not shrink (the reuse
+    // contract). clearRetainingCapacity preserves the allocation.
+    try engine.appendPoints(2, &.{.{ .ts = 5, .value = 50 }});
+    try std.testing.expectEqual(cap_after_first, engine.append_payload_buf.capacity);
+
+    // Third LARGER append: capacity grows.
+    var bigger: [16]types.Point = undefined;
+    for (&bigger, 0..) |*p, i| p.* = .{ .ts = @intCast(100 + i), .value = @intCast(i) };
+    try engine.appendPoints(3, &bigger);
+    try std.testing.expect(engine.append_payload_buf.capacity >= 16 + 16 * bigger.len);
+
+    // Verify the points round-trip cleanly via query — the buffer
+    // reuse must not have corrupted the WAL record contents.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+    var merge_it = try engine.queryPoints(arena_alloc, 1, 0, 1000);
+    var count: usize = 0;
+    while (merge_it.next()) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 4), count);
 }
 
 test "Engine: appendPoints rejects oversized batch" {
