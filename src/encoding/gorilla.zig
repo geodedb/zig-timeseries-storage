@@ -53,6 +53,13 @@ pub const GorillaEncoder = struct {
     }
 
     /// Encode a time-series point using Gorilla compression.
+    ///
+    /// On the first point, both the timestamp and the value are
+    /// stored verbatim. From the second point onward the timestamp is
+    /// encoded as delta-of-delta against the previous delta, and the
+    /// value is encoded as XOR against the previous value — see
+    /// `encodeTimestamp` and `encodeValue` for the per-field
+    /// encodings.
     pub fn encodePoint(self: *GorillaEncoder, point: types.Point) !void {
         // CWE-770: hard cap on points per block. Without this the
         // internal `DynamicBitSet` would double its capacity every
@@ -80,8 +87,19 @@ pub const GorillaEncoder = struct {
             return;
         }
 
-        // Encode timestamp using delta-of-delta.
-        const delta = point.ts - self.prev_ts;
+        try self.encodeTimestamp(point.ts);
+        try self.encodeValue(point.value);
+    }
+
+    /// Emit the timestamp portion of a non-first point.
+    ///
+    /// Computes `delta_of_delta = (ts - prev_ts) - prev_delta` and
+    /// stores it with a variable-length prefix code (Gorilla's
+    /// standard buckets — 1, 7, 9, 12, or 32 significant bits) so
+    /// near-regular interval streams collapse to a single zero bit
+    /// per point. Updates `prev_delta` and `prev_ts` on success.
+    fn encodeTimestamp(self: *GorillaEncoder, ts: i64) !void {
+        const delta = ts - self.prev_ts;
         const delta_of_delta = delta - self.prev_delta;
 
         if (delta_of_delta == 0) {
@@ -105,10 +123,20 @@ pub const GorillaEncoder = struct {
         }
 
         self.prev_delta = delta;
-        self.prev_ts = point.ts;
+        self.prev_ts = ts;
+    }
 
-        // Encode value using XOR compression.
-        const xor: u64 = @bitCast(point.value ^ self.prev_value);
+    /// Emit the value portion of a non-first point.
+    ///
+    /// Computes `xor = value ^ prev_value` and stores:
+    ///   * `0`            — value unchanged.
+    ///   * `1 0 <bits>`   — XOR fits inside the previous
+    ///     leading/trailing zero envelope (reuse).
+    ///   * `1 1 <leading:5> <bits_count:6> <bits>` — new envelope.
+    /// Updates `prev_value` and (on a new envelope) `prev_leading` /
+    /// `prev_trailing`.
+    fn encodeValue(self: *GorillaEncoder, value: i64) !void {
+        const xor: u64 = @bitCast(value ^ self.prev_value);
 
         if (xor == 0) {
             try self.writeBit(0);
@@ -136,7 +164,7 @@ pub const GorillaEncoder = struct {
             }
         }
 
-        self.prev_value = point.value;
+        self.prev_value = value;
         self.prev_xor = xor;
     }
 
@@ -303,6 +331,11 @@ pub const GorillaDecoder = struct {
     }
 
     /// Decode the next point from the compressed bitstream.
+    ///
+    /// First point: raw 64-bit ts + raw 64-bit value. Every
+    /// subsequent point is reconstructed from the delta-of-delta
+    /// timestamp prefix code and the XOR value prefix code — see
+    /// `decodeTimestamp` and `decodeValue` for the per-field reads.
     pub fn decodePoint(self: *GorillaDecoder) !types.Point {
         if (self.point_count >= self.num_points) return error.EndOfStream;
 
@@ -317,8 +350,15 @@ pub const GorillaDecoder = struct {
         }
 
         self.point_count += 1;
+        const ts = try self.decodeTimestamp();
+        const value = try self.decodeValue();
+        return .{ .ts = ts, .value = value };
+    }
 
-        // Decode timestamp delta-of-delta.
+    /// Read the delta-of-delta prefix code, sign-extend the payload,
+    /// fold it back into `(prev_delta, prev_ts)`, and return the new
+    /// absolute timestamp.
+    fn decodeTimestamp(self: *GorillaDecoder) !i64 {
         var delta_of_delta: i64 = 0;
         const first_bit = try self.readBit();
         if (first_bit == 0) {
@@ -354,8 +394,13 @@ pub const GorillaDecoder = struct {
         const ts = self.prev_ts + delta;
         self.prev_delta = delta;
         self.prev_ts = ts;
+        return ts;
+    }
 
-        // Decode value using XOR compression.
+    /// Read the XOR value prefix code and reconstruct the absolute
+    /// value. Updates `prev_value` and (on a new envelope)
+    /// `prev_leading` / `prev_trailing`.
+    fn decodeValue(self: *GorillaDecoder) !i64 {
         const xor_control = try self.readBit();
         var value: i64 = undefined;
         if (xor_control == 0) {
@@ -383,7 +428,7 @@ pub const GorillaDecoder = struct {
         }
 
         self.prev_value = value;
-        return .{ .ts = ts, .value = value };
+        return value;
     }
 
     /// Decode all points from the compressed bitstream.
