@@ -26,7 +26,7 @@
 const std = @import("std");
 
 /// Library version. Keep in sync with build.zig.zon.
-pub const version: []const u8 = "0.1.0";
+pub const version: []const u8 = "0.2.0";
 
 pub const types = @import("types.zig");
 pub const limits = @import("limits.zig");
