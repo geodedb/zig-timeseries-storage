@@ -5,18 +5,18 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .wal = .{
-            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=v0.1.5#622b26362fa99af36a4d1ac16df11458852b1449",
-            .hash = "wal-0.1.4-EqPqplNCBABXz05SjRtYYdrpbwjwIMiJNnlPgj2bcv9-",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=v0.1.7#56f52d68c2169bc6a8fba33ea0b0c004cbeaf72d",
+            .hash = "wal-0.1.6-EqPqpmfUBADm0cg-zpxLxqBDg64oG7OL45uOcfpe3sbq",
         },
         .uuid = .{
-            .url = "git+https://gitlab.com/devnw/zig/uuid.git#9bd6057558fc3f4f8bce0df003fb02eadaf0e712",
-            .hash = "uuid-0.1.1-tL1irrA0GABCD1IFLc0L_1SMfcWxyUTcYV0NSCuvbuxI",
+            .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=v0.1.3#7a7c717e13500762f0d87d44bc402ba47d1d6099",
+            .hash = "uuid-0.1.2-tL1irllLHABdG7QaL5h6WTNX5DrxSIzyxPozjsZMum9s",
         },
         .thread_pool = .{
             // Aligned with upstream geode main (post-d54fab4f) which pins
             // thread-pool to 39528a3 (WaitGroup completion-broadcast lifetime fix).
-            .url = "git+https://gitlab.com/devnw/zig/thread-pool.git#39528a3e92212efab8ed5840bc20e619a419c0f5",
-            .hash = "thread_pool-0.2.4-11B1BnyUdgCUNlqgBwHNvE4plLwP1s1MAyCjODPafrpo",
+            .url = "git+https://gitlab.com/devnw/zig/thread-pool.git?ref=v0.2.6#aa4493781d962f42ba1dd37261e0e107be5f6ffe",
+            .hash = "thread_pool-0.2.5-11B1BiNceQDdiX2mLCg-blCuvBT0ZHh0_A_gH9j7t2Gl",
         },
     },
     .paths = .{
