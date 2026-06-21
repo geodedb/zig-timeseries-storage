@@ -86,6 +86,7 @@ pub const EngineError = engine.EngineError;
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("crypto_backend_smoke_test.zig");
 }
 
 test "root: named error sets are reachable and well-formed" {

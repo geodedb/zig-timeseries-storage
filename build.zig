@@ -10,6 +10,7 @@ fn importedModule(
     optimize: std.builtin.OptimizeMode,
     module: *std.Build.Module,
     thread_pool_module: *std.Build.Module,
+    crypto_backend_mod: *std.Build.Module,
 ) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = b.path(path),
@@ -18,6 +19,7 @@ fn importedModule(
         .imports = &.{
             .{ .name = "timeseries_storage", .module = module },
             .{ .name = "thread_pool", .module = thread_pool_module },
+            .{ .name = "crypto_backend", .module = crypto_backend_mod },
         },
     });
 }
@@ -58,6 +60,41 @@ pub fn build(b: *std.Build) void {
     const tsan = b.option(bool, "tsan", "Enable ThreadSanitizer on test artifacts") orelse false;
     const no_cli = b.option(bool, "no-cli", "Skip building the CLI executable (library-only build)") orelse false;
 
+    // -------------------------------------------------------------------------
+    // FIPS-140-3 seam (GAP-0020-safe: exactly ONE build_options instance for
+    // THIS repo's fips flag — the wal/uuid/thread_pool deps carry their OWN
+    // private build_options, resolved separately as dependency modules).
+    // Off by default with zero overhead; -Dfips=true routes security crypto
+    // through the linked OpenSSL FIPS provider via the lazy `fips` dep.
+    // -------------------------------------------------------------------------
+    const fips = b.option(bool, "fips", "Route security crypto through the linked FIPS-140-3 provider (off by default; zero overhead when off)") orelse false;
+    const openssl_path = b.option([]const u8, "openssl_path", "OpenSSL install prefix for non-standard installs (e.g. /usr/local/ssl)");
+    const link = @import("src/link.zig");
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "fips", fips);
+    const build_options_mod = build_options.createModule();
+
+    const crypto_backend_mod = b.addModule("crypto_backend", .{
+        .root_source_file = b.path("src/crypto_backend.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "build_options", .module = build_options_mod }},
+    });
+    const std_shim_mod = b.addModule("std_shim", .{
+        .root_source_file = b.path("src/std_shim.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    crypto_backend_mod.addImport("std_shim", std_shim_mod);
+    if (fips) {
+        if (b.lazyDependency("fips", .{ .target = target, .optimize = optimize, .openssl_path = openssl_path orelse "/usr/local/ssl" })) |fips_dep| {
+            const fips_mod = fips_dep.module("fips");
+            crypto_backend_mod.addImport("fips", fips_mod);
+            link.linkOpenssl(b, fips_mod, openssl_path);
+        }
+    }
+
     // ------------------------------------------------------------------
     // Library module — primary public surface for downstream consumers.
     // ------------------------------------------------------------------
@@ -84,6 +121,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "wal", .module = wal },
             .{ .name = "uuid", .module = uuid },
             .{ .name = "thread_pool", .module = thread_pool },
+            .{ .name = "crypto_backend", .module = crypto_backend_mod },
         },
     });
 
@@ -109,6 +147,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "timeseries_storage", .module = module },
                 .{ .name = "thread_pool", .module = thread_pool },
+                .{ .name = "crypto_backend", .module = crypto_backend_mod },
             },
         });
         const cli_exe = b.addExecutable(.{
@@ -157,7 +196,7 @@ pub fn build(b: *std.Build) void {
 
     const integration_step = b.step("test-integration", "Run integration tests");
     const integration_tests = b.addTest(.{
-        .root_module = importedModule(b, "tests/integration.zig", target, optimize, module, thread_pool),
+        .root_module = importedModule(b, "tests/integration.zig", target, optimize, module, thread_pool, crypto_backend_mod),
     });
     integration_tests.root_module.link_libc = true;
     if (tsan) integration_tests.root_module.sanitize_thread = true;
@@ -167,7 +206,7 @@ pub fn build(b: *std.Build) void {
     const stress_optimize: std.builtin.OptimizeMode = if (tsan) .Debug else .ReleaseFast;
     const stress_step = b.step("test-stress", "Run stress and load tests");
     const stress_tests = b.addTest(.{
-        .root_module = importedModule(b, "tests/stress.zig", target, stress_optimize, module, thread_pool),
+        .root_module = importedModule(b, "tests/stress.zig", target, stress_optimize, module, thread_pool, crypto_backend_mod),
     });
     stress_tests.root_module.link_libc = true;
     if (tsan) stress_tests.root_module.sanitize_thread = true;
@@ -177,7 +216,7 @@ pub fn build(b: *std.Build) void {
     // default unit suite so `zig build test` stays fast).
     const e2e_step = b.step("test-engine-e2e", "Run engine end-to-end tests");
     const e2e_tests = b.addTest(.{
-        .root_module = importedModule(b, "tests/engine_e2e.zig", target, optimize, module, thread_pool),
+        .root_module = importedModule(b, "tests/engine_e2e.zig", target, optimize, module, thread_pool, crypto_backend_mod),
     });
     e2e_tests.root_module.link_libc = true;
     if (tsan) e2e_tests.root_module.sanitize_thread = true;
@@ -187,7 +226,7 @@ pub fn build(b: *std.Build) void {
     // policies under `Engine.init`. Closes GAP-0005 / SEC-002 / SEC-003.
     const wal_recovery_step = b.step("test-wal-recovery", "Run WAL recovery regression tests");
     const wal_recovery_tests = b.addTest(.{
-        .root_module = importedModule(b, "tests/wal_recovery.zig", target, optimize, module, thread_pool),
+        .root_module = importedModule(b, "tests/wal_recovery.zig", target, optimize, module, thread_pool, crypto_backend_mod),
     });
     wal_recovery_tests.root_module.link_libc = true;
     if (tsan) wal_recovery_tests.root_module.sanitize_thread = true;
@@ -206,7 +245,7 @@ pub fn build(b: *std.Build) void {
     const example_step = b.step("example", "Build and run the basic example");
     const example_exe = b.addExecutable(.{
         .name = "timeseries-storage-basic",
-        .root_module = importedModule(b, "examples/basic.zig", target, optimize, module, thread_pool),
+        .root_module = importedModule(b, "examples/basic.zig", target, optimize, module, thread_pool, crypto_backend_mod),
     });
     example_step.dependOn(&b.addRunArtifact(example_exe).step);
 
@@ -232,7 +271,7 @@ pub fn build(b: *std.Build) void {
 
     const bench_exe = b.addExecutable(.{
         .name = "timeseries-storage-bench",
-        .root_module = benchModule(b, "benchmarks/bench.zig", target, module, framework_module, thread_pool),
+        .root_module = benchModule(b, "benchmarks/bench.zig", target, module, framework_module, thread_pool, crypto_backend_mod),
     });
     b.installArtifact(bench_exe);
     const run_bench = b.addRunArtifact(bench_exe);
@@ -242,7 +281,7 @@ pub fn build(b: *std.Build) void {
 
     const scale_bench_exe = b.addExecutable(.{
         .name = "timeseries-storage-scale-bench",
-        .root_module = benchModule(b, "benchmarks/scale.zig", target, module, framework_module, thread_pool),
+        .root_module = benchModule(b, "benchmarks/scale.zig", target, module, framework_module, thread_pool, crypto_backend_mod),
     });
     b.installArtifact(scale_bench_exe);
     const run_scale_bench = b.addRunArtifact(scale_bench_exe);
@@ -269,7 +308,7 @@ pub fn build(b: *std.Build) void {
 
     const micro_example_exe = b.addExecutable(.{
         .name = "timeseries-storage-micro-example",
-        .root_module = benchModule(b, "benchmarks/micro/example.zig", target, module, framework_module, thread_pool),
+        .root_module = benchModule(b, "benchmarks/micro/example.zig", target, module, framework_module, thread_pool, crypto_backend_mod),
     });
     const run_micro_example = b.addRunArtifact(micro_example_exe);
     if (b.args) |args| run_micro_example.addArgs(args);
@@ -279,7 +318,7 @@ pub fn build(b: *std.Build) void {
     // codec
     const micro_codec_exe = b.addExecutable(.{
         .name = "timeseries-storage-micro-codec",
-        .root_module = benchModule(b, "benchmarks/micro/codec.zig", target, module, framework_module, thread_pool),
+        .root_module = benchModule(b, "benchmarks/micro/codec.zig", target, module, framework_module, thread_pool, crypto_backend_mod),
     });
     const run_micro_codec = b.addRunArtifact(micro_codec_exe);
     if (b.args) |args| run_micro_codec.addArgs(args);
@@ -289,7 +328,7 @@ pub fn build(b: *std.Build) void {
     // segment read/write
     const micro_segment_rw_exe = b.addExecutable(.{
         .name = "timeseries-storage-micro-segment-rw",
-        .root_module = benchModule(b, "benchmarks/micro/segment_rw.zig", target, module, framework_module, thread_pool),
+        .root_module = benchModule(b, "benchmarks/micro/segment_rw.zig", target, module, framework_module, thread_pool, crypto_backend_mod),
     });
     const run_micro_segment_rw = b.addRunArtifact(micro_segment_rw_exe);
     if (b.args) |args| run_micro_segment_rw.addArgs(args);
@@ -299,7 +338,7 @@ pub fn build(b: *std.Build) void {
     // merge iterator
     const micro_merge_exe = b.addExecutable(.{
         .name = "timeseries-storage-micro-merge",
-        .root_module = benchModule(b, "benchmarks/micro/merge.zig", target, module, framework_module, thread_pool),
+        .root_module = benchModule(b, "benchmarks/micro/merge.zig", target, module, framework_module, thread_pool, crypto_backend_mod),
     });
     const run_micro_merge = b.addRunArtifact(micro_merge_exe);
     if (b.args) |args| run_micro_merge.addArgs(args);
@@ -309,7 +348,7 @@ pub fn build(b: *std.Build) void {
     // WAL I/O
     const micro_wal_exe = b.addExecutable(.{
         .name = "timeseries-storage-micro-wal",
-        .root_module = benchModule(b, "benchmarks/micro/wal_io.zig", target, module, framework_module, thread_pool),
+        .root_module = benchModule(b, "benchmarks/micro/wal_io.zig", target, module, framework_module, thread_pool, crypto_backend_mod),
     });
     const run_micro_wal = b.addRunArtifact(micro_wal_exe);
     if (b.args) |args| run_micro_wal.addArgs(args);
@@ -319,7 +358,7 @@ pub fn build(b: *std.Build) void {
     // Manifest I/O
     const micro_manifest_exe = b.addExecutable(.{
         .name = "timeseries-storage-micro-manifest",
-        .root_module = benchModule(b, "benchmarks/micro/manifest_io.zig", target, module, framework_module, thread_pool),
+        .root_module = benchModule(b, "benchmarks/micro/manifest_io.zig", target, module, framework_module, thread_pool, crypto_backend_mod),
     });
     const run_micro_manifest = b.addRunArtifact(micro_manifest_exe);
     if (b.args) |args| run_micro_manifest.addArgs(args);
@@ -329,7 +368,7 @@ pub fn build(b: *std.Build) void {
     // Memtable
     const micro_memtable_exe = b.addExecutable(.{
         .name = "timeseries-storage-micro-memtable",
-        .root_module = benchModule(b, "benchmarks/micro/memtable.zig", target, module, framework_module, thread_pool),
+        .root_module = benchModule(b, "benchmarks/micro/memtable.zig", target, module, framework_module, thread_pool, crypto_backend_mod),
     });
     const run_micro_memtable = b.addRunArtifact(micro_memtable_exe);
     if (b.args) |args| run_micro_memtable.addArgs(args);
@@ -339,7 +378,7 @@ pub fn build(b: *std.Build) void {
     // Integration benches (concurrent, ooo, recovery)
     const bench_integration_exe = b.addExecutable(.{
         .name = "timeseries-storage-bench-integration",
-        .root_module = benchModule(b, "benchmarks/bench_integration.zig", target, module, framework_module, thread_pool),
+        .root_module = benchModule(b, "benchmarks/bench_integration.zig", target, module, framework_module, thread_pool, crypto_backend_mod),
     });
     const run_bench_integration = b.addRunArtifact(bench_integration_exe);
     if (b.args) |args| run_bench_integration.addArgs(args);
@@ -397,6 +436,7 @@ fn benchModule(
     lib_module: *std.Build.Module,
     framework_module: *std.Build.Module,
     thread_pool_module: *std.Build.Module,
+    crypto_backend_mod: *std.Build.Module,
 ) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = b.path(path),
@@ -406,6 +446,7 @@ fn benchModule(
             .{ .name = "timeseries_storage", .module = lib_module },
             .{ .name = "framework", .module = framework_module },
             .{ .name = "thread_pool", .module = thread_pool_module },
+            .{ .name = "crypto_backend", .module = crypto_backend_mod },
         },
     });
 }
