@@ -42,6 +42,9 @@ const segment = @import("segment.zig");
 const limits = @import("limits.zig");
 const types = @import("types.zig");
 
+// fips-exempt: non-security — CRC32C per-block framing checksum recomputed
+// during the TSSEG001 -> TSSEG002 migration; data-integrity only, not a
+// cryptographic primitive (no FIPS-regulated algorithm).
 const Crc32C = std.hash.crc.Crc32Iscsi;
 const owner_only_file_mode = 0o600;
 

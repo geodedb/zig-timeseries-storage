@@ -5,6 +5,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 
+// fips-exempt: non-security — CRC32C WAL-record trailer checksum for
+// corruption detection on replay; data-integrity only, not a cryptographic
+// primitive (no FIPS-regulated algorithm).
+const Crc32C = std.hash.crc.Crc32Iscsi;
+
 pub const WalRecordType = enum(u8) {
     append_points = 1,
     create_series = 2,
@@ -37,7 +42,7 @@ pub const WalRecord = struct {
         const total_size = self.serializedSize();
         if (buf.len < total_size) return error.BufferTooSmall;
 
-        var hasher = std.hash.crc.Crc32Iscsi.init();
+        var hasher = Crc32C.init();
         var offset: usize = 0;
 
         // lsn
@@ -126,7 +131,7 @@ pub const WalRecord = struct {
     }
 
     pub fn computeChecksum(self: *const WalRecord) u32 {
-        var hasher = std.hash.crc.Crc32Iscsi.init();
+        var hasher = Crc32C.init();
         hasher.update(&std.mem.toBytes(std.mem.nativeToLittle(u64, self.lsn)));
         hasher.update(&[_]u8{@intFromEnum(self.record_type)});
         const payload_len: u32 = @intCast(self.payload.len);
