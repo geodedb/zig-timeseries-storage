@@ -5,10 +5,14 @@ const std = @import("std");
 const types = @import("types.zig");
 const limits = @import("limits.zig");
 const gorilla = @import("encoding/gorilla.zig");
+const crypto_backend = @import("crypto_backend");
 
 const Allocator = std.mem.Allocator;
 const owner_only_file_mode = 0o600;
+// fips-exempt: non-security — CRC32C per-block framing checksum for plaintext
+// (TSSEG002) segments; encrypted (TSSEG003) blocks use the AES-GCM tag instead.
 const Crc32C = std.hash.crc.Crc32Iscsi;
+// fips-exempt: compile-time nonce/tag sizes only; AEAD goes through the seam.
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
 /// AES-256-GCM nonce size in bytes (96-bit random nonce).
@@ -644,10 +648,10 @@ pub const SegmentWriter = struct {
         plaintext: []const u8,
         enc: EncryptionContext,
     ) !void {
-        // Generate a random 12-byte nonce from the OS CSPRNG. Same
-        // entropy source the WAL encryption uses for its nonces.
+        // Generate a random 12-byte nonce. FIPS-0006: per-block random nonce
+        // via the seam (FIPS DRBG under -Dfips).
         var nonce: [ENCRYPTION_NONCE_SIZE]u8 = undefined;
-        self.io_ctx.random(&nonce);
+        crypto_backend.Csprng.bytes(&nonce) catch return error.EncryptionFailed;
 
         // Build the AAD: graph_uuid(16) || "seg"(3) || segment_id(u64 LE) || block_index(u32 LE)
         var aad: [16 + 3 + 8 + 4]u8 = undefined;
@@ -674,7 +678,8 @@ pub const SegmentWriter = struct {
         const ciphertext = try self.allocator.alloc(u8, plaintext.len);
         defer self.allocator.free(ciphertext);
         var tag: [ENCRYPTION_TAG_SIZE]u8 = undefined;
-        Aes256Gcm.encrypt(ciphertext, &tag, plaintext, &aad, nonce, enc.key);
+        // FIPS-0006: block AES-256-GCM seal via the seam.
+        crypto_backend.Aead.seal(.aes_256_gcm, &enc.key, &nonce, &aad, plaintext, ciphertext, &tag) catch return error.EncryptionFailed;
 
         try self.file.writeStreamingAll(self.io_ctx, &hdr_buf);
         try self.file.writeStreamingAll(self.io_ctx, &nonce);
@@ -1039,7 +1044,8 @@ pub const Block = struct {
 
         const plaintext = try allocator.alloc(u8, self.header.data_len);
         errdefer allocator.free(plaintext);
-        Aes256Gcm.decrypt(plaintext, ciphertext, tag, &aad, nonce, enc.key) catch {
+        // FIPS-0006: block AES-256-GCM open via the seam.
+        crypto_backend.Aead.open(.aes_256_gcm, &enc.key, &nonce, &aad, ciphertext, &tag, plaintext) catch {
             return error.DecryptionFailed;
         };
         defer allocator.free(plaintext);
@@ -1728,4 +1734,11 @@ test "Footer.lookup: binary search hits and misses" {
     try std.testing.expect(f.lookup(15) == null);
     try std.testing.expect(f.lookup(45) == null);
     try std.testing.expectEqual(@as(u32, 3), f.lookup(30).?.count);
+}
+
+test "FIPS-0006: encrypted block path uses the seam (Aead decl reachable)" {
+    // The full encrypted round-trip + tamper-detect is covered by the existing
+    // "Segment: encrypted round-trip" tests, which now exercise the seam-routed
+    // AES-256-GCM seal/open. This asserts the seam symbol the routing depends on.
+    try std.testing.expect(@hasDecl(crypto_backend, "Aead"));
 }

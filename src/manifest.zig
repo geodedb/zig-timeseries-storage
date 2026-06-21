@@ -4,7 +4,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const limits = @import("limits.zig");
+const crypto_backend = @import("crypto_backend");
+// fips-exempt: non-security — CRC32 manifest framing checksum, not
+// adversary-resistant integrity (AES-GCM tag covers that).
 const Crc32 = std.hash.crc.Crc32Iscsi;
+// fips-exempt: compile-time nonce/tag sizes only; AEAD goes through the seam.
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 const owner_only_file_mode = 0o600;
 
@@ -841,11 +845,10 @@ fn wrapEncrypted(
     pos += 16;
     writeU64(buf, &pos, counter);
 
-    // Generate a fresh random nonce. The OS CSPRNG is the same
-    // entropy source used by the WAL/segment paths.
+    // Generate a fresh random nonce. FIPS-0006: per-manifest random nonce
+    // via the seam (FIPS DRBG under -Dfips).
     var nonce: [ENCRYPTION_NONCE_SIZE]u8 = undefined;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    io.random(&nonce);
+    crypto_backend.Csprng.bytes(&nonce) catch return error.OutOfMemory;
     @memcpy(buf[pos..][0..ENCRYPTION_NONCE_SIZE], &nonce);
     pos += ENCRYPTION_NONCE_SIZE;
 
@@ -853,14 +856,16 @@ fn wrapEncrypted(
 
     const aad = buildManifestAad(ts_uuid, counter);
     var tag: [ENCRYPTION_TAG_SIZE]u8 = undefined;
-    Aes256Gcm.encrypt(
+    // FIPS-0006: manifest AES-256-GCM seal via the seam.
+    crypto_backend.Aead.seal(
+        .aes_256_gcm,
+        &key,
+        &nonce,
+        &aad,
+        plaintext,
         buf[pos..][0..plaintext.len],
         &tag,
-        plaintext,
-        &aad,
-        nonce,
-        key,
-    );
+    ) catch return error.OutOfMemory;
     pos += plaintext.len;
 
     @memcpy(buf[pos..][0..ENCRYPTION_TAG_SIZE], &tag);
@@ -923,7 +928,8 @@ fn unwrapEncrypted(
     const plaintext = try allocator.alloc(u8, ct_len);
     errdefer allocator.free(plaintext);
 
-    Aes256Gcm.decrypt(plaintext, ciphertext, tag, &aad, nonce, key) catch {
+    // FIPS-0006: manifest AES-256-GCM open via the seam.
+    crypto_backend.Aead.open(.aes_256_gcm, &key, &nonce, &aad, ciphertext, &tag, plaintext) catch {
         return error.DecryptionFailed;
     };
 

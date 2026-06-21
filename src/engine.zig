@@ -5,6 +5,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const limits = @import("limits.zig");
+const crypto_backend = @import("crypto_backend");
 const wal_manager = @import("wal_manager.zig");
 const manifest = @import("manifest.zig");
 const memtable = @import("memtable.zig");
@@ -441,8 +442,11 @@ pub fn opaqueSeriesId(tenant: u64, app_key: u64, key: [32]u8) types.SeriesId {
     std.mem.writeInt(u64, input[0..8], tenant, .little);
     std.mem.writeInt(u64, input[8..16], app_key, .little);
 
-    var mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
-    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, &input, &key);
+    var mac: [32]u8 = undefined;
+    // FIPS-0006b: opaque series-id keyed HMAC-SHA256 PRF via the seam.
+    // opaqueSeriesId has no error channel, so @panic on the impossible OpenSSL
+    // failure matches the seam contract; the std backend never errors.
+    _ = crypto_backend.Mac.hmac(.sha256, &key, &input, &mac) catch @panic("series-id hmac failed");
 
     // Take the first 16 bytes (128 bits) of the HMAC output as the
     // little-endian encoding of the u128 SeriesId. Endianness here
@@ -4211,4 +4215,13 @@ test "Engine: pruneExpired keeps straddling segments untouched" {
     const removed = try engine.pruneExpired();
     try std.testing.expectEqual(@as(u32, 0), removed);
     try std.testing.expectEqual(@as(usize, 1), engine.man.segments.items.len);
+}
+
+test "FIPS-0006b: opaqueSeriesId is a deterministic keyed HMAC-SHA256 PRF (seam-routed)" {
+    const key = [_]u8{0x66} ** 32;
+    const a = opaqueSeriesId(1, 2, key);
+    const b = opaqueSeriesId(1, 2, key);
+    const c = opaqueSeriesId(1, 3, key);
+    try std.testing.expectEqual(a, b); // deterministic
+    try std.testing.expect(a != c); // distinct inputs -> distinct ids
 }
