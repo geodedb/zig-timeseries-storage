@@ -1,0 +1,20 @@
+110:17:2:ZL106.unchecked_array_access:using pointer/int cast as array index may cause out-of-bounds access
+125:45:2:ZL106.unchecked_array_access:using pointer/int cast as array index may cause out-of-bounds access
+38:9:1:ZL009.var_should_be_const:variable 'batch' is never reassigned; consider using 'const'
+40:9:1:ZL009.var_should_be_const:variable 'iter' is never reassigned; consider using 'const'
+58:9:1:ZL009.var_should_be_const:variable 'count' is never reassigned; consider using 'const'
+92:9:1:ZL009.var_should_be_const:variable 'batch_buf' is never reassigned; consider using 'const'
+96:9:1:ZL009.var_should_be_const:variable 'expected' is never reassigned; consider using 'const'
+98:9:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+118:9:1:ZL009.var_should_be_const:variable 's' is never reassigned; consider using 'const'
+123:13:1:ZL009.var_should_be_const:variable 'count' is never reassigned; consider using 'const'
+131:9:1:ZL009.var_should_be_const:variable 'tmp' is never reassigned; consider using 'const'
+138:9:1:ZL009.var_should_be_const:variable 'pool' is never reassigned; consider using 'const'
+141:9:1:ZL009.var_should_be_const:variable 'eng' is never reassigned; consider using 'const'
+150:9:1:ZL009.var_should_be_const:variable 'batch' is never reassigned; consider using 'const'
+152:9:1:ZL009.var_should_be_const:variable 'f' is never reassigned; consider using 'const'
+176:9:1:ZL009.var_should_be_const:variable 'arena' is never reassigned; consider using 'const'
+178:9:1:ZL009.var_should_be_const:variable 'it' is never reassigned; consider using 'const'
+179:9:1:ZL009.var_should_be_const:variable 'count' is never reassigned; consider using 'const'
+73:77:1:ZL010.magic_number:magic number 4; consider using a named constant
+80:32:1:ZL010.magic_number:magic number 2_000; consider using a named constant

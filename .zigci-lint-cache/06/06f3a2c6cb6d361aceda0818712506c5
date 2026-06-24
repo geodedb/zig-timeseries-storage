@@ -1,0 +1,7 @@
+23:11:1:ZL203.const_snakecase:constant 'MAX_APPEND_BATCH_POINTS' should use snake_case (or PascalCase for types)
+29:11:1:ZL203.const_snakecase:constant 'MAX_BLOCK_DATA_LEN' should use snake_case (or PascalCase for types)
+35:11:1:ZL203.const_snakecase:constant 'MAX_MANIFEST_SIZE' should use snake_case (or PascalCase for types)
+42:11:1:ZL203.const_snakecase:constant 'MAX_SEGMENTS_PER_MANIFEST' should use snake_case (or PascalCase for types)
+49:11:1:ZL203.const_snakecase:constant 'MAX_POINTS_PER_BLOCK_ABSOLUTE' should use snake_case (or PascalCase for types)
+60:11:1:ZL203.const_snakecase:constant 'DEFAULT_EXPECTED_SERIES' should use snake_case (or PascalCase for types)
+14:35:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path

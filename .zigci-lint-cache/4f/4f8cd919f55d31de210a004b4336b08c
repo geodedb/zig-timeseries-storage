@@ -1,0 +1,35 @@
+118:9:1:ZL009.var_should_be_const:variable 'src_manifest' is never reassigned; consider using 'const'
+129:13:1:ZL009.var_should_be_const:variable 'magic_buf' is never reassigned; consider using 'const'
+140:9:1:ZL009.var_should_be_const:variable 'src' is never reassigned; consider using 'const'
+143:9:1:ZL009.var_should_be_const:variable 'dst' is never reassigned; consider using 'const'
+150:9:1:ZL009.var_should_be_const:variable 'iter' is never reassigned; consider using 'const'
+184:9:1:ZL009.var_should_be_const:variable 'snapshot_tmp' is never reassigned; consider using 'const'
+186:9:1:ZL009.var_should_be_const:variable 'restore_tmp' is never reassigned; consider using 'const'
+237:13:1:ZL009.var_should_be_const:variable 'arena' is never reassigned; consider using 'const'
+239:13:1:ZL009.var_should_be_const:variable 'it' is never reassigned; consider using 'const'
+240:13:1:ZL009.var_should_be_const:variable 'values' is never reassigned; consider using 'const'
+241:13:1:ZL009.var_should_be_const:variable 'count' is never reassigned; consider using 'const'
+288:9:1:ZL009.var_should_be_const:variable 'src_tmp' is never reassigned; consider using 'const'
+290:9:1:ZL009.var_should_be_const:variable 'dst_tmp' is never reassigned; consider using 'const'
+325:9:1:ZL009.var_should_be_const:variable 'tmp' is never reassigned; consider using 'const'
+332:9:1:ZL009.var_should_be_const:variable 'pool' is never reassigned; consider using 'const'
+335:9:1:ZL009.var_should_be_const:variable 'eng' is never reassigned; consider using 'const'
+217:22:1:ZL010.magic_number:magic number 10; consider using a named constant
+218:22:1:ZL010.magic_number:magic number 20; consider using a named constant
+218:35:1:ZL010.magic_number:magic number 200; consider using a named constant
+219:22:1:ZL010.magic_number:magic number 30; consider using a named constant
+219:35:1:ZL010.magic_number:magic number 300; consider using a named constant
+221:30:1:ZL010.magic_number:magic number 123; consider using a named constant
+239:57:1:ZL010.magic_number:magic number 123; consider using a named constant
+247:48:1:ZL010.magic_number:magic number 3; consider using a named constant
+249:46:1:ZL010.magic_number:magic number 200; consider using a named constant
+250:46:1:ZL010.magic_number:magic number 300; consider using a named constant
+342:30:1:ZL010.magic_number:magic number 11; consider using a named constant
+343:30:1:ZL010.magic_number:magic number 22; consider using a named constant
+345:26:1:ZL010.magic_number:magic number 7; consider using a named constant
+127:35:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+168:18:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+73:31:1:ZL603.missing_defer_cleanup:resource '.openDir(' may not be properly cleaned up; consider using defer
+76:31:1:ZL603.missing_defer_cleanup:resource '.openDir(' may not be properly cleaned up; consider using defer
+140:31:1:ZL603.missing_defer_cleanup:resource '.openDir(' may not be properly cleaned up; consider using defer
+143:31:1:ZL603.missing_defer_cleanup:resource '.openDir(' may not be properly cleaned up; consider using defer

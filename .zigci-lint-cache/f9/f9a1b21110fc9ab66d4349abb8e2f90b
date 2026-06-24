@@ -1,0 +1,20 @@
+69:11:1:ZL203.const_snakecase:constant 'opaqueSeriesId' should use snake_case (or PascalCase for types)
+31:1:1:ZL011.missing_doc_comment:public declaration 'types' is missing documentation
+32:1:1:ZL011.missing_doc_comment:public declaration 'limits' is missing documentation
+33:1:1:ZL011.missing_doc_comment:public declaration 'gorilla' is missing documentation
+34:1:1:ZL011.missing_doc_comment:public declaration 'segment' is missing documentation
+35:1:1:ZL011.missing_doc_comment:public declaration 'wal_record' is missing documentation
+36:1:1:ZL011.missing_doc_comment:public declaration 'wal_manager' is missing documentation
+37:1:1:ZL011.missing_doc_comment:public declaration 'manifest' is missing documentation
+38:1:1:ZL011.missing_doc_comment:public declaration 'memtable' is missing documentation
+39:1:1:ZL011.missing_doc_comment:public declaration 'iterator' is missing documentation
+40:1:1:ZL011.missing_doc_comment:public declaration 'compaction' is missing documentation
+41:1:1:ZL011.missing_doc_comment:public declaration 'engine' is missing documentation
+42:1:1:ZL011.missing_doc_comment:public declaration 'backup' is missing documentation
+43:1:1:ZL011.missing_doc_comment:public declaration 'safety' is missing documentation
+44:1:1:ZL011.missing_doc_comment:public declaration 'migration' is missing documentation
+78:1:1:ZL011.missing_doc_comment:public declaration 'WalError' is missing documentation
+79:1:1:ZL011.missing_doc_comment:public declaration 'SegmentError' is missing documentation
+80:1:1:ZL011.missing_doc_comment:public declaration 'ManifestError' is missing documentation
+81:1:1:ZL011.missing_doc_comment:public declaration 'EngineError' is missing documentation
+33:29:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path

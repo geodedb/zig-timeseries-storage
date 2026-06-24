@@ -1,0 +1,57 @@
+636:27:2:ZL002.no_unreachable:use of 'unreachable' may hide bugs
+383:36:3:ZL003.no_empty_catch:empty catch block suppresses errors
+636:21:2:ZL004.no_catch_unreachable:catch unreachable suppresses error handling
+22:11:1:ZL203.const_snakecase:constant 'NUM_SHARDS' should use snake_case (or PascalCase for types)
+673:11:1:ZL203.const_snakecase:constant 'shardIndexOf' should use snake_case (or PascalCase for types)
+230:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+487:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+572:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+332:67:2:ZL303.max_nesting:nesting depth exceeds 4 (6)
+163:13:1:ZL009.var_should_be_const:variable 'built' is never reassigned; consider using 'const'
+419:17:1:ZL009.var_should_be_const:variable 'it' is never reassigned; consider using 'const'
+440:9:1:ZL009.var_should_be_const:variable 'raw_buf' is never reassigned; consider using 'const'
+466:9:1:ZL009.var_should_be_const:variable 'seed_buf' is never reassigned; consider using 'const'
+552:9:1:ZL009.var_should_be_const:variable 'ascending' is never reassigned; consider using 'const'
+576:9:1:ZL009.var_should_be_const:variable 'sorted_buf' is never reassigned; consider using 'const'
+631:17:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+646:9:1:ZL009.var_should_be_const:variable 't1' is never reassigned; consider using 'const'
+647:9:1:ZL009.var_should_be_const:variable 't2' is never reassigned; consider using 'const'
+656:9:1:ZL009.var_should_be_const:variable 'mem' is never reassigned; consider using 'const'
+434:18:1:ZL010.magic_number:magic number 2000; consider using a named constant
+434:33:1:ZL010.magic_number:magic number 20; consider using a named constant
+435:33:1:ZL010.magic_number:magic number 10; consider using a named constant
+444:42:1:ZL010.magic_number:magic number 2000; consider using a named constant
+453:42:1:ZL010.magic_number:magic number 2000; consider using a named constant
+459:40:1:ZL010.magic_number:magic number 1_000_000; consider using a named constant
+477:36:1:ZL010.magic_number:magic number 500; consider using a named constant
+487:46:1:ZL010.magic_number:magic number 500; consider using a named constant
+494:42:1:ZL010.magic_number:magic number 500; consider using a named constant
+501:36:1:ZL010.magic_number:magic number 300; consider using a named constant
+513:46:1:ZL010.magic_number:magic number 300; consider using a named constant
+524:18:1:ZL010.magic_number:magic number 10; consider using a named constant
+525:18:1:ZL010.magic_number:magic number 20; consider using a named constant
+528:18:1:ZL010.magic_number:magic number 30; consider using a named constant
+528:31:1:ZL010.magic_number:magic number 3; consider using a named constant
+529:18:1:ZL010.magic_number:magic number 40; consider using a named constant
+529:31:1:ZL010.magic_number:magic number 4; consider using a named constant
+535:44:1:ZL010.magic_number:magic number 4; consider using a named constant
+546:52:1:ZL010.magic_number:magic number 1_000_000; consider using a named constant
+567:36:1:ZL010.magic_number:magic number 500; consider using a named constant
+572:46:1:ZL010.magic_number:magic number 500; consider using a named constant
+579:42:1:ZL010.magic_number:magic number 500; consider using a named constant
+595:18:1:ZL010.magic_number:magic number 10; consider using a named constant
+596:18:1:ZL010.magic_number:magic number 20; consider using a named constant
+609:18:1:ZL010.magic_number:magic number 20; consider using a named constant
+610:18:1:ZL010.magic_number:magic number 10; consider using a named constant
+626:40:1:ZL010.magic_number:magic number 1_000_000; consider using a named constant
+633:41:1:ZL010.magic_number:magic number 7; consider using a named constant
+651:44:1:ZL010.magic_number:magic number 2000; consider using a named constant
+656:40:1:ZL010.magic_number:magic number 1_000_000; consider using a named constant
+119:5:1:ZL011.missing_doc_comment:public declaration 'SeriesEntry' is missing documentation
+124:5:1:ZL011.missing_doc_comment:public declaration 'Shard' is missing documentation
+129:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+188:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+389:5:1:ZL011.missing_doc_comment:public declaration 'clear' is missing documentation
+673:1:1:ZL011.missing_doc_comment:public declaration 'shardIndexOf' is missing documentation
+646:18:1:ZL603.missing_defer_cleanup:resource 'std.Thread.spawn(' may not be properly cleaned up; consider using defer
+647:18:1:ZL603.missing_defer_cleanup:resource 'std.Thread.spawn(' may not be properly cleaned up; consider using defer

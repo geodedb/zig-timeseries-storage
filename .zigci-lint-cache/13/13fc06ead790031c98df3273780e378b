@@ -1,0 +1,97 @@
+556:26:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+562:28:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+31:15:1:ZL203.const_snakecase:constant 'MIN_INITIAL_BITS' should use snake_case (or PascalCase for types)
+41:15:1:ZL203.const_snakecase:constant 'TYPICAL_BITS_PER_POINT' should use snake_case (or PascalCase for types)
+57:15:1:ZL203.const_snakecase:constant 'MAX_BITS' should use snake_case (or PascalCase for types)
+565:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+531:42:2:ZL303.max_nesting:nesting depth exceeds 4 (6)
+285:17:1:ZL009.var_should_be_const:variable 'new_cap' is never reassigned; consider using 'const'
+298:13:1:ZL009.var_should_be_const:variable 'bit_idx' is never reassigned; consider using 'const'
+299:13:1:ZL009.var_should_be_const:variable 'pos' is never reassigned; consider using 'const'
+449:13:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+587:13:1:ZL009.var_should_be_const:variable 'points' is never reassigned; consider using 'const'
+646:9:1:ZL009.var_should_be_const:variable 'dec_a' is never reassigned; consider using 'const'
+647:9:1:ZL009.var_should_be_const:variable 'dec_b' is never reassigned; consider using 'const'
+650:9:1:ZL009.var_should_be_const:variable 'total' is never reassigned; consider using 'const'
+679:17:1:ZL009.var_should_be_const:variable 'dec_bulk' is never reassigned; consider using 'const'
+683:17:1:ZL009.var_should_be_const:variable 'dec_perbit' is never reassigned; consider using 'const'
+719:9:1:ZL009.var_should_be_const:variable 'small' is never reassigned; consider using 'const'
+724:9:1:ZL009.var_should_be_const:variable 'huge' is never reassigned; consider using 'const'
+740:9:1:ZL009.var_should_be_const:variable 'enc_default' is never reassigned; consider using 'const'
+746:9:1:ZL009.var_should_be_const:variable 'enc_sized' is never reassigned; consider using 'const'
+774:9:1:ZL009.var_should_be_const:variable 'enc_ref' is never reassigned; consider using 'const'
+781:9:1:ZL009.var_should_be_const:variable 'enc_pool' is never reassigned; consider using 'const'
+806:9:1:ZL009.var_should_be_const:variable 'dec' is never reassigned; consider using 'const'
+847:9:1:ZL009.var_should_be_const:variable 'enc' is never reassigned; consider using 'const'
+44:44:1:ZL010.magic_number:magic number 65536; consider using a named constant
+199:39:1:ZL010.magic_number:magic number 63; consider using a named constant
+202:32:1:ZL010.magic_number:magic number 7; consider using a named constant
+203:39:1:ZL010.magic_number:magic number 255; consider using a named constant
+204:32:1:ZL010.magic_number:magic number 3; consider using a named constant
+204:35:1:ZL010.magic_number:magic number 0b110; consider using a named constant
+206:32:1:ZL010.magic_number:magic number 9; consider using a named constant
+207:39:1:ZL010.magic_number:magic number 2047; consider using a named constant
+207:66:1:ZL010.magic_number:magic number 2048; consider using a named constant
+208:32:1:ZL010.magic_number:magic number 4; consider using a named constant
+208:35:1:ZL010.magic_number:magic number 0b1110; consider using a named constant
+210:32:1:ZL010.magic_number:magic number 12; consider using a named constant
+212:32:1:ZL010.magic_number:magic number 4; consider using a named constant
+212:35:1:ZL010.magic_number:magic number 0b1111; consider using a named constant
+248:36:1:ZL010.magic_number:magic number 5; consider using a named constant
+250:36:1:ZL010.magic_number:magic number 6; consider using a named constant
+444:40:1:ZL010.magic_number:magic number 9; consider using a named constant
+522:50:1:ZL010.magic_number:magic number 7; consider using a named constant
+528:54:1:ZL010.magic_number:magic number 9; consider using a named constant
+534:58:1:ZL010.magic_number:magic number 12; consider using a named constant
+622:33:1:ZL010.magic_number:magic number 0x0123_4567_89AB_CDEF; consider using a named constant
+623:18:1:ZL010.magic_number:magic number 2000; consider using a named constant
+623:33:1:ZL010.magic_number:magic number 0x0123_4567_89AB_CDEF; consider using a named constant
+624:18:1:ZL010.magic_number:magic number 3000; consider using a named constant
+624:33:1:ZL010.magic_number:magic number 0x0123_4567_89AB_CDFF; consider using a named constant
+625:18:1:ZL010.magic_number:magic number 4000; consider using a named constant
+626:18:1:ZL010.magic_number:magic number 4100; consider using a named constant
+626:33:1:ZL010.magic_number:magic number 7; consider using a named constant
+627:18:1:ZL010.magic_number:magic number 5000; consider using a named constant
+627:33:1:ZL010.magic_number:magic number 1_000_000; consider using a named constant
+628:18:1:ZL010.magic_number:magic number 10_000; consider using a named constant
+629:18:1:ZL010.magic_number:magic number 1_000_000; consider using a named constant
+649:40:1:ZL010.magic_number:magic number 7; consider using a named constant
+649:46:1:ZL010.magic_number:magic number 9; consider using a named constant
+649:52:1:ZL010.magic_number:magic number 12; consider using a named constant
+649:66:1:ZL010.magic_number:magic number 5; consider using a named constant
+649:69:1:ZL010.magic_number:magic number 6; consider using a named constant
+649:72:1:ZL010.magic_number:magic number 7; consider using a named constant
+672:24:1:ZL010.magic_number:magic number 0xAA; consider using a named constant
+672:30:1:ZL010.magic_number:magic number 0xCC; consider using a named constant
+672:36:1:ZL010.magic_number:magic number 0xF0; consider using a named constant
+672:42:1:ZL010.magic_number:magic number 0x0F; consider using a named constant
+695:23:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+697:19:1:ZL010.magic_number:magic number 4; consider using a named constant
+700:44:1:ZL010.magic_number:magic number 4; consider using a named constant
+712:51:1:ZL010.magic_number:magic number 18_000; consider using a named constant
+735:18:1:ZL010.magic_number:magic number 3; consider using a named constant
+735:30:1:ZL010.magic_number:magic number 3; consider using a named constant
+736:33:1:ZL010.magic_number:magic number 7; consider using a named constant
+737:18:1:ZL010.magic_number:magic number 200; consider using a named constant
+737:32:1:ZL010.magic_number:magic number 99; consider using a named constant
+762:18:1:ZL010.magic_number:magic number 3; consider using a named constant
+762:30:1:ZL010.magic_number:magic number 3; consider using a named constant
+763:33:1:ZL010.magic_number:magic number 7; consider using a named constant
+764:18:1:ZL010.magic_number:magic number 200; consider using a named constant
+764:32:1:ZL010.magic_number:magic number 99; consider using a named constant
+767:18:1:ZL010.magic_number:magic number 5000; consider using a named constant
+767:34:1:ZL010.magic_number:magic number 42; consider using a named constant
+768:18:1:ZL010.magic_number:magic number 5100; consider using a named constant
+768:33:1:ZL010.magic_number:magic number 17; consider using a named constant
+769:18:1:ZL010.magic_number:magic number 5200; consider using a named constant
+769:33:1:ZL010.magic_number:magic number 17; consider using a named constant
+770:18:1:ZL010.magic_number:magic number 9000; consider using a named constant
+831:50:1:ZL010.magic_number:magic number 7; consider using a named constant
+831:54:1:ZL010.magic_number:magic number 13; consider using a named constant
+5:1:1:ZL011.missing_doc_comment:public declaration 'BlockStats' is missing documentation
+43:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+95:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+381:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+2:23:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+3:24:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+324:37:1:ZL603.missing_defer_cleanup:resource '.alloc(' may not be properly cleaned up; consider using defer

@@ -1,0 +1,84 @@
+50:11:1:ZL203.const_snakecase:constant 'SEGMENT_MAGIC_V1' should use snake_case (or PascalCase for types)
+319:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+334:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+341:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+423:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+804:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+805:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+980:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+302:5:2:ZL301.max_function_lines:function exceeds 80 lines (190)
+345:25:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+45:16:3:ZL109.fips_unguarded_crypto:'std.hash.' bypasses the FIPS crypto_backend seam; route through crypto_backend or annotate '// fips-exempt: non-security'
+83:9:1:ZL009.var_should_be_const:variable 'magic_buf' is never reassigned; consider using 'const'
+102:9:1:ZL009.var_should_be_const:variable 'body_buf' is never reassigned; consider using 'const'
+136:13:1:ZL009.var_should_be_const:variable 'crc_buf' is never reassigned; consider using 'const'
+260:9:1:ZL009.var_should_be_const:variable 'dir' is never reassigned; consider using 'const'
+325:9:1:ZL009.var_should_be_const:variable 'magic_buf' is never reassigned; consider using 'const'
+340:13:1:ZL009.var_should_be_const:variable 'tail' is never reassigned; consider using 'const'
+359:9:1:ZL009.var_should_be_const:variable 'series_index' is never reassigned; consider using 'const'
+363:9:1:ZL009.var_should_be_const:variable 'offset' is never reassigned; consider using 'const'
+365:9:1:ZL009.var_should_be_const:variable 'body_buf' is never reassigned; consider using 'const'
+441:9:1:ZL009.var_should_be_const:variable 'idx' is never reassigned; consider using 'const'
+442:9:1:ZL009.var_should_be_const:variable 'map_it' is never reassigned; consider using 'const'
+460:9:1:ZL009.var_should_be_const:variable 'pos' is never reassigned; consider using 'const'
+465:9:1:ZL009.var_should_be_const:variable 'hasher' is never reassigned; consider using 'const'
+474:9:1:ZL009.var_should_be_const:variable 'tail' is never reassigned; consider using 'const'
+516:9:1:ZL009.var_should_be_const:variable 'encoder' is never reassigned; consider using 'const'
+524:9:1:ZL009.var_should_be_const:variable 'body_buf' is never reassigned; consider using 'const'
+564:9:1:ZL009.var_should_be_const:variable 'reader' is never reassigned; consider using 'const'
+764:9:1:ZL009.var_should_be_const:variable 'it' is never reassigned; consider using 'const'
+765:9:1:ZL009.var_should_be_const:variable 'seen' is never reassigned; consider using 'const'
+812:13:1:ZL009.var_should_be_const:variable 'upgraded' is never reassigned; consider using 'const'
+813:13:1:ZL009.var_should_be_const:variable 'skipped' is never reassigned; consider using 'const'
+862:13:1:ZL009.var_should_be_const:variable 'w' is never reassigned; consider using 'const'
+953:9:1:ZL009.var_should_be_const:variable 'r' is never reassigned; consider using 'const'
+1025:9:1:ZL009.var_should_be_const:variable 'tmp' is never reassigned; consider using 'const'
+459:35:1:ZL010.magic_number:magic number 4; consider using a named constant
+460:22:1:ZL010.magic_number:magic number 4; consider using a named constant
+468:42:1:ZL010.magic_number:magic number 4; consider using a named constant
+469:12:1:ZL010.magic_number:magic number 4; consider using a named constant
+553:18:1:ZL010.magic_number:magic number 200; consider using a named constant
+554:18:1:ZL010.magic_number:magic number 300; consider using a named constant
+554:32:1:ZL010.magic_number:magic number 3; consider using a named constant
+555:18:1:ZL010.magic_number:magic number 400; consider using a named constant
+555:32:1:ZL010.magic_number:magic number 4; consider using a named constant
+557:44:1:ZL010.magic_number:magic number 42; consider using a named constant
+569:53:1:ZL010.magic_number:magic number 42; consider using a named constant
+570:42:1:ZL010.magic_number:magic number 4; consider using a named constant
+713:18:1:ZL010.magic_number:magic number 200; consider using a named constant
+716:18:1:ZL010.magic_number:magic number 300; consider using a named constant
+716:32:1:ZL010.magic_number:magic number 3; consider using a named constant
+717:18:1:ZL010.magic_number:magic number 400; consider using a named constant
+717:32:1:ZL010.magic_number:magic number 4; consider using a named constant
+721:25:1:ZL010.magic_number:magic number 7; consider using a named constant
+722:25:1:ZL010.magic_number:magic number 9; consider using a named constant
+723:25:1:ZL010.magic_number:magic number 7; consider using a named constant
+731:45:1:ZL010.magic_number:magic number 7; consider using a named constant
+760:41:1:ZL010.magic_number:magic number 42; consider using a named constant
+767:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+805:83:1:ZL010.magic_number:magic number 3; consider using a named constant
+811:48:1:ZL010.magic_number:magic number 3; consider using a named constant
+835:48:1:ZL010.magic_number:magic number 3; consider using a named constant
+859:42:1:ZL010.magic_number:magic number 10; consider using a named constant
+859:69:1:ZL010.magic_number:magic number 20; consider using a named constant
+864:26:1:ZL010.magic_number:magic number 123; consider using a named constant
+865:26:1:ZL010.magic_number:magic number 456; consider using a named constant
+919:25:1:ZL010.magic_number:magic number 11; consider using a named constant
+920:25:1:ZL010.magic_number:magic number 22; consider using a named constant
+957:41:1:ZL010.magic_number:magic number 11; consider using a named constant
+958:41:1:ZL010.magic_number:magic number 22; consider using a named constant
+52:1:1:ZL011.missing_doc_comment:public declaration 'MigrationError' is missing documentation
+178:67:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+497:25:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+77:37:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+311:38:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+661:37:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+693:35:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+799:39:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+826:39:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+870:39:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+886:39:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+928:39:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+1012:39:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+1017:39:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+260:35:1:ZL603.missing_defer_cleanup:resource '.openDir(' may not be properly cleaned up; consider using defer

@@ -1,0 +1,30 @@
+83:44:2:ZL004.no_catch_unreachable:catch unreachable suppresses error handling
+18:7:1:ZL203.const_snakecase:constant 'HEADER_SIZE' should use snake_case (or PascalCase for types)
+19:7:1:ZL203.const_snakecase:constant 'CHECKSUM_SIZE' should use snake_case (or PascalCase for types)
+20:7:1:ZL203.const_snakecase:constant 'MIN_RECORD_SIZE' should use snake_case (or PascalCase for types)
+23:11:1:ZL203.const_snakecase:constant 'MAX_WAL_PAYLOAD' should use snake_case (or PascalCase for types)
+89:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+98:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+101:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+114:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+40:22:3:ZL109.fips_unguarded_crypto:'std.hash.' bypasses the FIPS crypto_backend seam; route through crypto_backend or annotate '// fips-exempt: non-security'
+129:22:3:ZL109.fips_unguarded_crypto:'std.hash.' bypasses the FIPS crypto_backend seam; route through crypto_backend or annotate '// fips-exempt: non-security'
+41:13:1:ZL009.var_should_be_const:variable 'offset' is never reassigned; consider using 'const'
+92:13:1:ZL009.var_should_be_const:variable 'offset' is never reassigned; consider using 'const'
+129:13:1:ZL009.var_should_be_const:variable 'hasher' is never reassigned; consider using 'const'
+151:9:1:ZL009.var_should_be_const:variable 'record' is never reassigned; consider using 'const'
+11:22:1:ZL010.magic_number:magic number 3; consider using a named constant
+12:25:1:ZL010.magic_number:magic number 4; consider using a named constant
+57:34:1:ZL010.magic_number:magic number 4; consider using a named constant
+59:19:1:ZL010.magic_number:magic number 4; consider using a named constant
+70:34:1:ZL010.magic_number:magic number 4; consider using a named constant
+102:19:1:ZL010.magic_number:magic number 4; consider using a named constant
+152:16:1:ZL010.magic_number:magic number 42; consider using a named constant
+165:42:1:ZL010.magic_number:magic number 42; consider using a named constant
+8:1:1:ZL011.missing_doc_comment:public declaration 'WalRecordType' is missing documentation
+32:5:1:ZL011.missing_doc_comment:public declaration 'serializedSize' is missing documentation
+36:5:1:ZL011.missing_doc_comment:public declaration 'serializeInto' is missing documentation
+76:5:1:ZL011.missing_doc_comment:public declaration 'serialize' is missing documentation
+89:5:1:ZL011.missing_doc_comment:public declaration 'deserialize' is missing documentation
+128:5:1:ZL011.missing_doc_comment:public declaration 'computeChecksum' is missing documentation
+140:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation

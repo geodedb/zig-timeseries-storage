@@ -1,0 +1,6 @@
+10:9:1:ZL009.var_should_be_const:variable 'ct' is never reassigned; consider using 'const'
+11:9:1:ZL009.var_should_be_const:variable 'tag' is never reassigned; consider using 'const'
+13:9:1:ZL009.var_should_be_const:variable 'rt' is never reassigned; consider using 'const'
+7:23:1:ZL010.magic_number:magic number 0x44; consider using a named constant
+8:25:1:ZL010.magic_number:magic number 0x55; consider using a named constant
+8:34:1:ZL010.magic_number:magic number 12; consider using a named constant

@@ -1,0 +1,80 @@
+459:17:3:ZL003.no_empty_catch:empty catch block suppresses errors
+460:17:3:ZL003.no_empty_catch:empty catch block suppresses errors
+464:105:3:ZL003.no_empty_catch:empty catch block suppresses errors
+465:49:3:ZL003.no_empty_catch:empty catch block suppresses errors
+469:98:3:ZL003.no_empty_catch:empty catch block suppresses errors
+470:49:3:ZL003.no_empty_catch:empty catch block suppresses errors
+91:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+158:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+175:101:2:ZL300.max_line_length:line exceeds 100 characters (112)
+304:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+331:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+372:101:2:ZL300.max_line_length:line exceeds 100 characters (128)
+464:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+469:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+335:64:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+54:13:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+212:9:1:ZL009.var_should_be_const:variable 'count' is never reassigned; consider using 'const'
+295:9:1:ZL009.var_should_be_const:variable 'pool' is never reassigned; consider using 'const'
+297:9:1:ZL009.var_should_be_const:variable 'eng' is never reassigned; consider using 'const'
+316:9:1:ZL009.var_should_be_const:variable 'src_dir' is never reassigned; consider using 'const'
+319:9:1:ZL009.var_should_be_const:variable 'it' is never reassigned; consider using 'const'
+320:9:1:ZL009.var_should_be_const:variable 'migrated' is never reassigned; consider using 'const'
+321:9:1:ZL009.var_should_be_const:variable 'skipped' is never reassigned; consider using 'const'
+362:9:1:ZL009.var_should_be_const:variable 'total_appended' is never reassigned; consider using 'const'
+363:9:1:ZL009.var_should_be_const:variable 'total_series' is never reassigned; consider using 'const'
+426:9:1:ZL009.var_should_be_const:variable 'stdout_buffer' is never reassigned; consider using 'const'
+427:9:1:ZL009.var_should_be_const:variable 'stdout_writer' is never reassigned; consider using 'const'
+429:9:1:ZL009.var_should_be_const:variable 'stderr_buffer' is never reassigned; consider using 'const'
+430:9:1:ZL009.var_should_be_const:variable 'stderr_writer' is never reassigned; consider using 'const'
+63:66:1:ZL010.magic_number:magic number 10; consider using a named constant
+67:61:1:ZL010.magic_number:magic number 10; consider using a named constant
+71:64:1:ZL010.magic_number:magic number 10; consider using a named constant
+75:64:1:ZL010.magic_number:magic number 10; consider using a named constant
+79:62:1:ZL010.magic_number:magic number 10; consider using a named constant
+91:69:1:ZL010.magic_number:magic number 10; consider using a named constant
+537:43:1:ZL010.magic_number:magic number 42; consider using a named constant
+539:42:1:ZL010.magic_number:magic number 7; consider using a named constant
+594:42:1:ZL010.magic_number:magic number 60_000; consider using a named constant
+626:42:1:ZL010.magic_number:magic number 9999; consider using a named constant
+125:5:1:ZL011.missing_doc_comment:public declaration 'parse' is missing documentation
+422:1:1:ZL011.missing_doc_comment:public declaration 'main' is missing documentation
+602:9:2:ZL500.os_specific_code:Unix-specific path code '"/var/' may cause portability issues; consider adding OS detection guards
+604:9:2:ZL500.os_specific_code:Unix-specific path code '"/var/' may cause portability issues; consider adding OS detection guards
+607:40:2:ZL500.os_specific_code:Unix-specific path code '"/var/' may cause portability issues; consider adding OS detection guards
+608:40:2:ZL500.os_specific_code:Unix-specific path code '"/var/' may cause portability issues; consider adding OS detection guards
+527:9:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+536:40:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+562:9:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+564:9:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+567:40:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+568:40:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+574:9:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+576:9:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+579:40:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+580:40:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+588:9:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+593:40:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+616:9:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+436:26:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+527:9:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+536:40:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+557:6:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+562:9:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+564:9:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+567:40:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+568:40:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+574:9:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+576:9:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+579:40:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+580:40:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+588:9:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+593:40:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+597:6:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+602:9:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+604:9:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+607:40:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+608:40:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+611:6:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+616:9:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+316:35:1:ZL603.missing_defer_cleanup:resource '.openDir(' may not be properly cleaned up; consider using defer

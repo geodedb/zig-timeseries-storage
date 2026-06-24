@@ -1,0 +1,8 @@
+83:9:1:ZL009.var_should_be_const:variable 'g' is never reassigned; consider using 'const'
+83:30:1:ZL010.magic_number:magic number 42; consider using a named constant
+86:42:1:ZL010.magic_number:magic number 42; consider using a named constant
+46:5:1:ZL011.missing_doc_comment:public declaration 'engine' is missing documentation
+47:5:1:ZL011.missing_doc_comment:public declaration 'slice_iterator' is missing documentation
+48:5:1:ZL011.missing_doc_comment:public declaration 'merge_iterator' is missing documentation
+49:5:1:ZL011.missing_doc_comment:public declaration 'block_stream_iterator' is missing documentation
+78:9:1:ZL011.missing_doc_comment:public declaration 'MAGIC' is missing documentation

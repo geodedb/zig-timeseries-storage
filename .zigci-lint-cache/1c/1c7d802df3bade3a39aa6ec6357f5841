@@ -1,0 +1,45 @@
+49:22:3:ZL109.fips_unguarded_crypto:'std.hash.' bypasses the FIPS crypto_backend seam; route through crypto_backend or annotate '// fips-exempt: non-security'
+67:9:1:ZL009.var_should_be_const:variable 'path_buf' is never reassigned; consider using 'const'
+87:9:1:ZL009.var_should_be_const:variable 'off' is never reassigned; consider using 'const'
+107:17:1:ZL009.var_should_be_const:variable 'h' is never reassigned; consider using 'const'
+151:13:1:ZL009.var_should_be_const:variable 'eng_mut' is never reassigned; consider using 'const'
+210:9:1:ZL009.var_should_be_const:variable 'arena' is never reassigned; consider using 'const'
+212:9:1:ZL009.var_should_be_const:variable 'it' is never reassigned; consider using 'const'
+213:9:1:ZL009.var_should_be_const:variable 'count' is never reassigned; consider using 'const'
+346:9:1:ZL009.var_should_be_const:variable 'tmp' is never reassigned; consider using 'const'
+375:9:1:ZL009.var_should_be_const:variable 'pool' is never reassigned; consider using 'const'
+378:9:1:ZL009.var_should_be_const:variable 'eng' is never reassigned; consider using 'const'
+35:32:1:ZL010.magic_number:magic number 1_000_000; consider using a named constant
+43:26:1:ZL010.magic_number:magic number 42; consider using a named constant
+88:18:1:ZL010.magic_number:magic number 12; consider using a named constant
+98:32:1:ZL010.magic_number:magic number 17; consider using a named constant
+102:42:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+108:46:1:ZL010.magic_number:magic number 12; consider using a named constant
+110:64:1:ZL010.magic_number:magic number 4; consider using a named constant
+147:32:1:ZL010.magic_number:magic number 1_000_000; consider using a named constant
+181:32:1:ZL010.magic_number:magic number 1_000_000; consider using a named constant
+197:41:1:ZL010.magic_number:magic number 5; consider using a named constant
+206:32:1:ZL010.magic_number:magic number 1_000_000; consider using a named constant
+212:53:1:ZL010.magic_number:magic number 42; consider using a named constant
+212:60:1:ZL010.magic_number:magic number 1_000_000; consider using a named constant
+215:44:1:ZL010.magic_number:magic number 5; consider using a named constant
+259:36:1:ZL010.magic_number:magic number 5; consider using a named constant
+264:34:1:ZL010.magic_number:magic number 10; consider using a named constant
+265:34:1:ZL010.magic_number:magic number 20; consider using a named constant
+267:30:1:ZL010.magic_number:magic number 7; consider using a named constant
+307:36:1:ZL010.magic_number:magic number 5; consider using a named constant
+312:34:1:ZL010.magic_number:magic number 10; consider using a named constant
+313:34:1:ZL010.magic_number:magic number 20; consider using a named constant
+314:22:1:ZL010.magic_number:magic number 3; consider using a named constant
+314:34:1:ZL010.magic_number:magic number 30; consider using a named constant
+315:22:1:ZL010.magic_number:magic number 4; consider using a named constant
+315:34:1:ZL010.magic_number:magic number 40; consider using a named constant
+316:22:1:ZL010.magic_number:magic number 5; consider using a named constant
+316:34:1:ZL010.magic_number:magic number 50; consider using a named constant
+359:36:1:ZL010.magic_number:magic number 5; consider using a named constant
+364:34:1:ZL010.magic_number:magic number 10; consider using a named constant
+365:34:1:ZL010.magic_number:magic number 20; consider using a named constant
+367:30:1:ZL010.magic_number:magic number 7; consider using a named constant
+236:21:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+71:35:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+327:39:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
