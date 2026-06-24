@@ -73,6 +73,7 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "fips", fips);
+    build_options.addOption([]const u8, "package_name", "timeseries-storage");
     const build_options_mod = build_options.createModule();
 
     const crypto_backend_mod = b.addModule("crypto_backend", .{
