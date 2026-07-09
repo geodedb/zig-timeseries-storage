@@ -29,9 +29,9 @@ pub const MAX_APPEND_BATCH_POINTS: usize = 16_384;
 pub const MAX_BLOCK_DATA_LEN: u32 = 8 * 1024 * 1024;
 
 /// Maximum manifest file size accepted on open. The manifest grows
-/// with `segments.items.len * 25 bytes` plus a fixed 76-byte header;
-/// 16 MiB leaves headroom for ~650k segments, which is well above
-/// any realistic deployment.
+/// with `segments.items.len * 33 bytes` (manifest v2 segment entry
+/// size) plus a fixed 76-byte header; 16 MiB leaves headroom for
+/// ~508k segments, which is well above any realistic deployment.
 pub const MAX_MANIFEST_SIZE: u64 = 16 * 1024 * 1024;
 
 /// Maximum number of segments the manifest reader will allocate

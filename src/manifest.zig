@@ -115,6 +115,11 @@ pub const SegmentMeta = struct {
     /// lesson): every construction site must state the count
     /// explicitly, so a rebuild/migration path can never silently
     /// zero it.
+    ///
+    /// 0 is currently unambiguous with "legitimately empty": no code
+    /// path produces a segment with zero points — flush skips empty
+    /// memtables and compaction inputs always contain points — so 0
+    /// only ever means "unknown, inherited from a v1 manifest".
     point_count: u64,
 };
 
@@ -633,7 +638,6 @@ pub const Manifest = struct {
             .last_checkpoint_lsn = new_checkpoint_lsn,
             .next_segment_id = self.next_segment_id,
             .series_count = self.series_count,
-            .point_count = self.point_count,
             .allocator = self.allocator,
             .data_dir = self.data_dir,
             .encryption_key = self.encryption_key,
@@ -756,6 +760,8 @@ pub const Manifest = struct {
         if (data.len != expected_len) return error.InvalidData;
 
         m.segments = std.ArrayListUnmanaged(SegmentMeta).empty;
+        errdefer m.segments.deinit(allocator);
+        try m.segments.ensureTotalCapacity(allocator, num_segments);
         for (0..num_segments) |_| {
             const id = readU64(data, pos);
             pos += 8;
@@ -772,7 +778,7 @@ pub const Manifest = struct {
                 pos += 8;
                 break :blk pc;
             } else 0;
-            try m.segments.append(allocator, .{ .id = id, .min_ts = min_ts, .max_ts = max_ts, .level = level, .point_count = point_count });
+            m.segments.appendAssumeCapacity(.{ .id = id, .min_ts = min_ts, .max_ts = max_ts, .level = level, .point_count = point_count });
         }
 
         // Upgrade-in-memory (22b801c pattern): a valid v1 manifest

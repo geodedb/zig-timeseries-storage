@@ -18,6 +18,23 @@ NOT-APPLICABLE findings so they are not re-audited.
 | 2291ecc recovery re-derives from replayed WAL tail | strict-OoO watermarks seeded from recovered memtable |
 | close-durability cluster (0a0f9f0/557a62d) | final WAL fsync in Engine.deinit |
 
+## Operational note: no downgrade after upgrade
+
+Once a binary at this version saves, the store carries a manifest v2
+(33-byte segment entries). Previously released binaries have no
+version gate and no length gate; the manifest CRC covers the body
+regardless of stride, so an old binary silently misparses a v2
+manifest: with 1 segment it opens cleanly and its next save silently
+rewrites v1 (dropping per-segment counts); with ≥2 segments it reads
+25-byte strides over 33-byte entries and derives garbage segment ids
+— under the default fail-closed verification that is a confusing
+open failure, and under `wal_recovery = .salvage` it prunes every
+"missing" segment and clobbers the store on the next save.
+
+Therefore: do NOT run a pre-v2 binary against a data dir that a v2
+binary has saved. Take a backup before upgrading if a rollback path
+is required.
+
 ## Audited — no action needed (with reasons)
 
 - **Buffer-pool fixes** (dirty-eviction race e8b784a, lock-free pin
