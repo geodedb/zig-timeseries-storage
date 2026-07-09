@@ -11,6 +11,7 @@ CURRENT ?= benchmarks/results/latest.json
 .PHONY: example run install help
 .PHONY: pre-commit-install pre-commit pre-commit-run
 .PHONY: bench bench-save bench-compare bench-micro scale-bench tools
+.PHONY: deps
 
 all: build test-unit
 
@@ -137,6 +138,14 @@ help:
 	@echo "  help                 Show this help message"
 
 .PHONY: test-fips test-dual
+
+# Builds the latest OpenSSL 3.x + FIPS provider into
+# $(or $(OPENSSL_PREFIX),/usr/local/ssl). Linux/macOS only (see
+# scripts/install-openssl-fips.sh); CI's `fips-deps` job runs this before
+# `test-fips`.
+deps:
+	OPENSSL_PREFIX=$(or $(OPENSSL_PREFIX),/usr/local/ssl) ./scripts/install-openssl-fips.sh
+
 # FIPS-140-3 dual-mode test (-Dfips=true). Requires the OpenSSL FIPS
 # provider at $(or $(OPENSSL_PREFIX),/usr/local/ssl) (run `make deps` first).
 test-fips:
