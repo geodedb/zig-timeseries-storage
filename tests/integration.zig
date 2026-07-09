@@ -22,7 +22,7 @@ const lib = @import("timeseries_storage");
 const thread_pool = @import("thread_pool");
 
 test "integration: version is defined" {
-    try std.testing.expectEqualStrings("0.1.0", lib.version);
+    try std.testing.expectEqualStrings("0.2.0", lib.version);
 }
 
 test "integration: engine append + query round-trip" {
