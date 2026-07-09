@@ -694,3 +694,52 @@ test "integration: flush records exact per-segment point_count in the manifest" 
     try std.testing.expectEqual(@as(usize, 1), eng.man.segments.items.len);
     try std.testing.expectEqual(@as(u64, 4), eng.man.segments.items[0].point_count);
 }
+
+test "integration: batched appends survive a clean close with no explicit sync (final WAL fsync on deinit)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    // Phase 1: batch mode (the default), append, close with NO
+    // explicit sync() and no flush. deinit's final WAL fsync is the
+    // only durability barrier for these records.
+    {
+        var eng = try lib.Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 1_000_000,
+            .durability_mode = .batch,
+        }, &pool);
+        defer eng.deinit();
+        try eng.appendPoints(9, &.{
+            .{ .ts = 10, .value = 1 },
+            .{ .ts = 20, .value = 2 },
+        });
+    }
+
+    // Phase 2: reopen and prove the records replay from the WAL.
+    // (Pinning: a same-session reopen cannot distinguish page-cache
+    // from fsync durability — this guards the replay contract and
+    // the sync-before-teardown ordering, not the power-fail case.)
+    {
+        var eng = try lib.Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 1_000_000,
+            .durability_mode = .batch,
+        }, &pool);
+        defer eng.deinit();
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        var it = try eng.queryPoints(arena.allocator(), 9, 0, 1000);
+        var count: usize = 0;
+        while (it.next()) |_| count += 1;
+        try std.testing.expectEqual(@as(usize, 2), count);
+    }
+}

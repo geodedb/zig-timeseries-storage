@@ -1335,7 +1335,10 @@ pub const Engine = struct {
     /// Does not flush the active memtable to disk — that is the
     /// caller's responsibility via `flush()` or `sync()`. Data only
     /// present in the active memtable will be recovered from the WAL
-    /// on the next open.
+    /// on the next open. As a final durability barrier, `deinit`
+    /// issues a best-effort WAL fsync so `.batch`-mode records
+    /// appended since the last syncer tick survive a power failure
+    /// after a clean close.
     pub fn deinit(self: *Engine) void {
         // P-IO-004: use the engine-owned (or caller-borrowed) IO
         // handle for every internal mutex / condition variable touch
@@ -1372,6 +1375,17 @@ pub const Engine = struct {
         while (self.flushing_mem != null or self.compaction_running or self.flush_workers_active > 0) {
             self.done_cv.waitUncancelable(io, &self.mu);
         }
+
+        // graph-storage close-durability parity (0a0f9f0/557a62d
+        // cluster): a clean close must leave the WAL tail durable.
+        // In `.batch` mode records appended since the last syncer
+        // tick are sitting in the OS page cache; without this fsync
+        // a power failure right after a "clean" close silently
+        // drops them. Best-effort by design: teardown must not
+        // fail, and an fsync error here leaves exactly the
+        // pre-existing exposure. WalManager.sync takes its own
+        // internal mutex — safe under engine.mu.
+        self.wal.sync() catch {};
 
         self.wal.deinit();
         self.man.deinit();
