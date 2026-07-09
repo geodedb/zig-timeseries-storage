@@ -1027,6 +1027,39 @@ pub const Engine = struct {
         // `wal_recovery = .salvage`.
         try replayWalIntoMemtable(allocator, &wal, mem, man.last_checkpoint_lsn + 1, config.wal_recovery, &wal_drops);
 
+        // graph-storage 2291ecc parity: state recovery derives must
+        // come from the replayed WAL tail, not just checkpoint-era
+        // manifest metadata. The strict-OoO watermark previously
+        // seeded lazily from `man.segments[].max_ts` alone, so a
+        // crash-recovered point sitting only in the memtable was
+        // invisible to it and strict mode silently accepted
+        // timestamps it rejected before the crash. Seed every
+        // replayed series here with
+        // max(segment-global max_ts, replayed per-series max ts) —
+        // the same conservative segment seed checkOoOLocked uses,
+        // widened by what the WAL tail actually contained.
+        //
+        // Single-threaded: init has not published the engine yet, so
+        // the shard maps are safe to walk without their mutexes.
+        var seeded_watermarks: std.AutoHashMapUnmanaged(types.SeriesId, i64) = .{};
+        errdefer seeded_watermarks.deinit(allocator);
+        if (!config.allow_cross_segment_ooo) {
+            var seg_max: i64 = std.math.minInt(i64);
+            for (man.segments.items) |seg| {
+                if (seg.max_ts > seg_max) seg_max = seg.max_ts;
+            }
+            for (&mem.shards) |*shard| {
+                var it = shard.series.iterator();
+                while (it.next()) |entry| {
+                    var series_max: i64 = seg_max;
+                    for (entry.value_ptr.points.items) |pt| {
+                        if (pt.ts > series_max) series_max = pt.ts;
+                    }
+                    try seeded_watermarks.put(allocator, entry.key_ptr.*, series_max);
+                }
+            }
+        }
+
         return Engine{
             .allocator = allocator,
             .config = config,
@@ -1037,6 +1070,7 @@ pub const Engine = struct {
             .threaded = owned_threaded,
             .io = io,
             .reader_cache = SegmentReaderCache.init(allocator, DEFAULT_SEGMENT_READER_CACHE_CAPACITY),
+            .series_watermarks = seeded_watermarks,
             .counters = .{
                 .wal_records_dropped = .init(wal_drops),
                 .segment_integrity_failures = .init(integrity_failures),

@@ -386,3 +386,49 @@ test "segment verification: salvage tolerates missing segment" {
     // manifest under salvage mode.
     try std.testing.expectEqual(@as(usize, 0), eng.man.segments.items.len);
 }
+
+test "wal recovery: strict OoO watermark is re-derived from the replayed WAL tail (2291ecc parity)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    // Session 1: strict engine. Append ts=100, make the WAL durable,
+    // close WITHOUT flushing — the point exists only in the WAL.
+    {
+        var eng = try lib.Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 1_000_000,
+            .allow_cross_segment_ooo = false,
+        }, &pool);
+        defer eng.deinit();
+        try eng.appendPoints(7, &.{.{ .ts = 100, .value = 1 }});
+        try eng.sync();
+    }
+
+    // Session 2: reopen strict. Recovery replays ts=100 into the
+    // memtable; no segment exists, so a manifest-only watermark seed
+    // sits at minInt(i64) and would silently accept the regression
+    // strict mode rejected before the crash.
+    {
+        var eng = try lib.Engine.init(allocator, .{
+            .data_dir = data_dir,
+            .max_memtable_points = 1_000_000,
+            .allow_cross_segment_ooo = false,
+        }, &pool);
+        defer eng.deinit();
+
+        try std.testing.expectError(
+            error.OutOfOrderTimestamp,
+            eng.appendPoints(7, &.{.{ .ts = 50, .value = 2 }}),
+        );
+        // Equal-to-watermark stays accepted (check is `ts < wm`).
+        try eng.appendPoints(7, &.{.{ .ts = 100, .value = 3 }});
+    }
+}
