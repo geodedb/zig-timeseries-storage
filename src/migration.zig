@@ -41,6 +41,7 @@ const Allocator = std.mem.Allocator;
 const segment = @import("segment.zig");
 const limits = @import("limits.zig");
 const types = @import("types.zig");
+const fs_perm = @import("fs_perm.zig");
 
 // fips-exempt: non-security — CRC32C per-block framing checksum recomputed
 // during the TSSEG001 -> TSSEG002 migration; data-integrity only, not a
@@ -90,7 +91,7 @@ pub fn migrateSegment(allocator: Allocator, src_path: []const u8, dst_path: []co
 
     const dst = try std.Io.Dir.cwd().createFile(io, dst_path, .{
         .read = false,
-        .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
+        .permissions = fs_perm.ownerOnlyMode(owner_only_file_mode),
     });
     defer dst.close(io);
 
@@ -510,7 +511,7 @@ fn writeV1Segment(
     const io = std.Io.Threaded.global_single_threaded.io();
     const f = try std.Io.Dir.cwd().createFile(io, path, .{
         .read = false,
-        .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
+        .permissions = fs_perm.ownerOnlyMode(owner_only_file_mode),
     });
     defer f.close(io);
 
@@ -623,7 +624,7 @@ test "migration: rejects truncated v1 file" {
     // Write only the magic + a partial body (50 bytes of zeros).
     const f = try std.Io.Dir.cwd().createFile(io, v1_path, .{
         .read = false,
-        .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
+        .permissions = fs_perm.ownerOnlyMode(owner_only_file_mode),
     });
     defer f.close(io);
     try f.writeStreamingAll(io, &SEGMENT_MAGIC_V1);
@@ -649,7 +650,7 @@ test "migration: empty v1 (only magic) yields a magic-only v2 file" {
 
     const f = try std.Io.Dir.cwd().createFile(io, v1_path, .{
         .read = false,
-        .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
+        .permissions = fs_perm.ownerOnlyMode(owner_only_file_mode),
     });
     defer f.close(io);
     try f.writeStreamingAll(io, &SEGMENT_MAGIC_V1);
@@ -987,7 +988,7 @@ test "P-ALGO-001 migration: skips non-segment files in data_dir" {
     {
         const f = try std.Io.Dir.cwd().createFile(io, wal_path, .{
             .read = false,
-            .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
+            .permissions = fs_perm.ownerOnlyMode(owner_only_file_mode),
         });
         defer f.close(io);
         const junk: [16]u8 = @splat(0xCD);
@@ -996,7 +997,7 @@ test "P-ALGO-001 migration: skips non-segment files in data_dir" {
     {
         const f = try std.Io.Dir.cwd().createFile(io, manifest_path, .{
             .read = false,
-            .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
+            .permissions = fs_perm.ownerOnlyMode(owner_only_file_mode),
         });
         defer f.close(io);
         const junk: [16]u8 = @splat(0xEF);

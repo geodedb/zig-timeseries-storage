@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const segment = @import("segment.zig");
 const safety = @import("safety.zig");
+const fs_perm = @import("fs_perm.zig");
 
 pub const PointIterator = struct {
     ptr: *anyopaque,
@@ -350,7 +351,7 @@ test "SegmentIterator: surfaces decode errors instead of returning null" {
     {
         const f = try std.Io.Dir.cwd().createFile(io, seg_path, .{
             .read = false,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = fs_perm.ownerOnlyMode(0o600),
         });
         defer f.close(io);
         try f.writeStreamingAll(io, &segment.SEGMENT_MAGIC);

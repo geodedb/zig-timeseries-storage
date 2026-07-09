@@ -6,6 +6,7 @@ const types = @import("types.zig");
 const limits = @import("limits.zig");
 const gorilla = @import("encoding/gorilla.zig");
 const crypto_backend = @import("crypto_backend");
+const fs_perm = @import("fs_perm.zig");
 
 const Allocator = std.mem.Allocator;
 const owner_only_file_mode = 0o600;
@@ -413,7 +414,7 @@ pub const SegmentWriter = struct {
         const io = std.Io.Threaded.global_single_threaded.io();
         const file = try std.Io.Dir.cwd().createFile(io, path, .{
             .read = false,
-            .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode),
+            .permissions = fs_perm.ownerOnlyMode(owner_only_file_mode),
         });
 
         // Magic depends on whether the file is encrypted.
@@ -1286,7 +1287,7 @@ test "Segment: decodePoints refuses oversized data_len" {
     {
         const f = try std.Io.Dir.cwd().createFile(io, seg_path, .{
             .read = false,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = fs_perm.ownerOnlyMode(0o600),
         });
         defer f.close(io);
         try f.writeStreamingAll(io, &SEGMENT_MAGIC);
@@ -1337,7 +1338,7 @@ test "Segment: decodePoints refuses forged stats.count (CWE-770)" {
     {
         const f = try std.Io.Dir.cwd().createFile(io, seg_path, .{
             .read = false,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = fs_perm.ownerOnlyMode(0o600),
         });
         defer f.close(io);
         try f.writeStreamingAll(io, &SEGMENT_MAGIC);
@@ -1474,7 +1475,7 @@ test "Segment: rejects v1 (TSSEG001) magic on open" {
     {
         const f = try std.Io.Dir.cwd().createFile(io, seg_path, .{
             .read = false,
-            .permissions = std.Io.File.Permissions.fromMode(0o600),
+            .permissions = fs_perm.ownerOnlyMode(0o600),
         });
         defer f.close(io);
         const v1_magic: [8]u8 = .{ 'T', 'S', 'S', 'E', 'G', '0', '0', '1' };

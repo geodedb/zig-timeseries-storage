@@ -5,6 +5,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const limits = @import("limits.zig");
 const crypto_backend = @import("crypto_backend");
+const fs_perm = @import("fs_perm.zig");
 // fips-exempt: non-security — CRC32 manifest framing checksum, not
 // adversary-resistant integrity (AES-GCM tag covers that).
 const Crc32 = std.hash.crc.Crc32Iscsi;
@@ -802,7 +803,7 @@ pub const Manifest = struct {
         defer allocator.free(tmp_path);
 
         const io = std.Io.Threaded.global_single_threaded.io();
-        const tmp_file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .permissions = std.Io.File.Permissions.fromMode(owner_only_file_mode) });
+        const tmp_file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .permissions = fs_perm.ownerOnlyMode(owner_only_file_mode) });
         defer tmp_file.close(io);
 
         try tmp_file.writeStreamingAll(io, final_bytes);
@@ -1113,7 +1114,7 @@ test "Manifest: readFromFile rejects oversized file" {
     // single positional write at the high offset to avoid actually
     // materialising the entire file.
     const f = try std.Io.Dir.cwd().createFile(io, mf_path, .{
-        .permissions = std.Io.File.Permissions.fromMode(0o600),
+        .permissions = fs_perm.ownerOnlyMode(0o600),
     });
     defer f.close(io);
 
@@ -1596,7 +1597,7 @@ test "Manifest: open fails closed when one slot is future-format — no silent f
 
         const path_a = try std.fmt.allocPrint(allocator, "{s}/manifest.a", .{dir_path});
         defer allocator.free(path_a);
-        const f = try std.Io.Dir.cwd().createFile(io, path_a, .{ .permissions = std.Io.File.Permissions.fromMode(0o600) });
+        const f = try std.Io.Dir.cwd().createFile(io, path_a, .{ .permissions = fs_perm.ownerOnlyMode(0o600) });
         defer f.close(io);
         try f.writeStreamingAll(io, forged);
         try f.sync(io);

@@ -5,6 +5,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const wal_lib = @import("wal");
 const wal_record = @import("wal_record.zig");
+const fs_perm = @import("fs_perm.zig");
 const WalRecord = wal_record.WalRecord;
 const TS_IDENTITY_FILE = "ts.uuid";
 
@@ -325,7 +326,7 @@ fn ensureTsIdentity(wal_dir: std.Io.Dir, ts_uuid: [16]u8, create_if_missing: boo
         error.FileNotFound => if (!create_if_missing) {
             return error.FileNotFound;
         } else blk: {
-            const new_file = try wal_dir.createFile(io, TS_IDENTITY_FILE, .{ .read = true, .permissions = std.Io.File.Permissions.fromMode(0o600) });
+            const new_file = try wal_dir.createFile(io, TS_IDENTITY_FILE, .{ .read = true, .permissions = fs_perm.ownerOnlyMode(0o600) });
             break :blk new_file;
         },
         else => return err,
