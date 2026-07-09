@@ -1965,15 +1965,20 @@ pub const Engine = struct {
         // Emit one block per (series_id, points) pair across every
         // shard. `forEachSeries` holds the shard mutex during each
         // visit so the slice the writer reads is stable.
+        // `points_written` counts exactly what lands in the segment
+        // — it feeds the manifest's per-segment point_count.
         const WriteCtx = struct {
             writer: *segment.SegmentWriter,
+            points_written: *u64,
 
             fn visit(self_ctx: @This(), id: types.SeriesId, items: []const types.Point) anyerror!void {
                 if (items.len == 0) return;
                 try self_ctx.writer.writeBlock(id, items);
+                self_ctx.points_written.* += items.len;
             }
         };
-        try mem.forEachSeries(WriteCtx{ .writer = &writer }, WriteCtx.visit);
+        var flushed_points: u64 = 0;
+        try mem.forEachSeries(WriteCtx{ .writer = &writer, .points_written = &flushed_points }, WriteCtx.visit);
 
         // Durability ordering: fsync the segment file BEFORE adding
         // it to the manifest. A crash between manifest commit and the
@@ -2033,6 +2038,7 @@ pub const Engine = struct {
             .min_ts = min_ts,
             .max_ts = max_ts,
             .level = 0,
+            .point_count = flushed_points,
         };
         try self.man.writeSlotAndPublish(io, &self.mu, .{
             .add_segments = (&new_seg)[0..1],
@@ -2467,7 +2473,7 @@ pub const Engine = struct {
         defer if (enc) |e| self.allocator.free(e.inputs);
 
         var compactor = compaction.Compactor.init(self.allocator, self.pool);
-        try compactor.compactSegmentsWithEncryption(paths.items, out_path, enc);
+        const out_points = try compactor.compactSegmentsWithEncryption(paths.items, out_path, enc);
 
         // Build the remove-id list for the publish delta. The
         // compaction publish path swaps these out and adds the
@@ -2514,6 +2520,7 @@ pub const Engine = struct {
             .min_ts = min_ts,
             .max_ts = max_ts,
             .level = out_level,
+            .point_count = out_points,
         };
         try self.man.writeSlotAndPublish(io, &self.mu, .{
             .remove_ids = remove_ids,

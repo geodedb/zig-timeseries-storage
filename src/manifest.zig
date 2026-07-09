@@ -39,7 +39,7 @@ pub const MANIFEST_MAGIC: [8]u8 = .{ 'T', 'S', 'M', 'N', 'F', 'S', '0', '1' };
 /// AAD domain separation (`"seg"` vs `"mnf"`, plus distinct shapes) is
 /// what prevents cross-context ciphertext reuse.
 pub const MANIFEST_MAGIC_V2: [8]u8 = .{ 'T', 'S', 'M', 'N', 'F', '0', '0', '2' };
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
 
 /// AES-256-GCM nonce length (96-bit, matches Zig stdlib).
 const ENCRYPTION_NONCE_SIZE: usize = Aes256Gcm.nonce_length;
@@ -94,15 +94,28 @@ pub const ManifestError = error{
 const FIELD_SIZE: usize = 4 + 16 + 8 + 8 + 8 + 8 + 8; // = 60
 const SERIALIZED_SIZE: usize = 8 + FIELD_SIZE + 4; // = 72
 
-/// Size in bytes of one serialized `SegmentMeta` entry
-/// (id u64 + min_ts i64 + max_ts i64 + level u8).
-const SEGMENT_ENTRY_BYTES: usize = 25;
+/// Serialized `SegmentMeta` entry sizes per manifest format version.
+/// v1: id u64 + min_ts i64 + max_ts i64 + level u8.
+/// v2: v1 fields + point_count u64.
+const SEGMENT_ENTRY_BYTES_V1: usize = 25;
+const SEGMENT_ENTRY_BYTES_V2: usize = 33;
 
 pub const SegmentMeta = struct {
     id: u64,
     min_ts: i64,
     max_ts: i64,
     level: u8,
+    /// Total points stored in this segment. Exact for segments
+    /// written at manifest v2+ (flush and compaction both know the
+    /// count at publish time); 0 = unknown for segments inherited
+    /// from a v1 manifest (healed to exact on their next
+    /// compaction).
+    ///
+    /// NO default value on purpose (graph-storage 2e0d3a4-F5
+    /// lesson): every construction site must state the count
+    /// explicitly, so a rebuild/migration path can never silently
+    /// zero it.
+    point_count: u64,
 };
 
 /// Immutable, reference-counted snapshot of the manifest's segment
@@ -181,6 +194,11 @@ pub const Manifest = struct {
     counter: u64 = 0,
     last_checkpoint_lsn: u64 = 0,
     next_segment_id: u64 = 1,
+    /// RESERVED — always 0. Distinct-series-across-segments is not
+    /// derivable from per-segment metadata (segments overlap in
+    /// series); persisting a wrong number is worse than none
+    /// (graph-storage af37079 lesson). Kept in the wire format for
+    /// layout stability.
     series_count: u64 = 0,
     point_count: u64 = 0,
     segments: std.ArrayListUnmanaged(SegmentMeta) = .empty,
@@ -645,7 +663,7 @@ pub const Manifest = struct {
     }
 
     pub fn serialize(self: *const Manifest, allocator: Allocator) ![]u8 {
-        const segment_bytes = self.segments.items.len * SEGMENT_ENTRY_BYTES;
+        const segment_bytes = self.segments.items.len * SEGMENT_ENTRY_BYTES_V2;
         const full_size = SERIALIZED_SIZE + 4 + segment_bytes;
         const buf = try allocator.alloc(u8, full_size);
         errdefer allocator.free(buf);
@@ -655,14 +673,22 @@ pub const Manifest = struct {
         @memcpy(buf[pos..][0..8], &MANIFEST_MAGIC);
         pos += 8;
 
-        writeU32(buf, &pos, self.format_version);
+        // Always emit the current format (22b801c pattern: accept
+        // old on read, auto-migrate on the next write).
+        writeU32(buf, &pos, MANIFEST_VERSION);
         @memcpy(buf[pos..][0..16], &self.ts_uuid);
         pos += 16;
         writeU64(buf, &pos, self.counter);
         writeU64(buf, &pos, self.last_checkpoint_lsn);
         writeU64(buf, &pos, self.next_segment_id);
         writeU64(buf, &pos, self.series_count);
-        writeU64(buf, &pos, self.point_count);
+        // Derive the total from the per-segment counts so the
+        // persisted stat can never silently go stale (af37079
+        // parity). Saturating add: a corrupt-but-parsed count must
+        // not panic the save path.
+        var total_points: u64 = 0;
+        for (self.segments.items) |seg| total_points +|= seg.point_count;
+        writeU64(buf, &pos, total_points);
         writeU32(buf, &pos, @intCast(self.segments.items.len));
         for (self.segments.items) |seg| {
             writeU64(buf, &pos, seg.id);
@@ -670,6 +696,7 @@ pub const Manifest = struct {
             writeU64(buf, &pos, @bitCast(seg.max_ts));
             buf[pos] = seg.level;
             pos += 1;
+            writeU64(buf, &pos, seg.point_count);
         }
 
         const crc = Crc32.hash(buf[0..pos]);
@@ -721,14 +748,11 @@ pub const Manifest = struct {
 
         // graph-storage 2dcc678 parity: every byte offset the
         // segment-table loop reads must be proven in-bounds BEFORE
-        // the loop runs. The plaintext manifest CRC32 is unkeyed and
-        // forgeable, so a hostile manifest can carry a valid CRC
-        // with an inflated `num_segments` and a short body; without
-        // this gate the `readU64` slices below panic in safe builds
-        // and read out of bounds in ReleaseFast. The serialized
-        // layout is exact (header + entries + trailing CRC), so
-        // require exact length — fail closed, never guess.
-        const expected_len = SERIALIZED_SIZE + 4 + @as(usize, num_segments) * SEGMENT_ENTRY_BYTES;
+        // the loop runs (see Task-1 comment). The stride is
+        // version-specific; the version gate above guarantees
+        // format_version is 1 or 2 here.
+        const entry_bytes: usize = if (m.format_version == 1) SEGMENT_ENTRY_BYTES_V1 else SEGMENT_ENTRY_BYTES_V2;
+        const expected_len = SERIALIZED_SIZE + 4 + @as(usize, num_segments) * entry_bytes;
         if (data.len != expected_len) return error.InvalidData;
 
         m.segments = std.ArrayListUnmanaged(SegmentMeta).empty;
@@ -741,8 +765,19 @@ pub const Manifest = struct {
             pos += 8;
             const level = data[pos];
             pos += 1;
-            try m.segments.append(allocator, .{ .id = id, .min_ts = min_ts, .max_ts = max_ts, .level = level });
+            // v1 entries carry no count; 0 = unknown (legacy). Made
+            // exact on the segment's next compaction.
+            const point_count: u64 = if (m.format_version >= 2) blk: {
+                const pc = readU64(data, pos);
+                pos += 8;
+                break :blk pc;
+            } else 0;
+            try m.segments.append(allocator, .{ .id = id, .min_ts = min_ts, .max_ts = max_ts, .level = level, .point_count = point_count });
         }
+
+        // Upgrade-in-memory (22b801c pattern): a valid v1 manifest
+        // is accepted verbatim and re-persisted as v2 on next save.
+        m.format_version = MANIFEST_VERSION;
 
         return m;
     }
@@ -1010,7 +1045,6 @@ test "Manifest serialize/deserialize round-trip" {
         .counter = 42,
         .next_segment_id = 100,
         .series_count = 50,
-        .point_count = 1000,
     };
 
     const data = try m.serialize(allocator);
@@ -1023,7 +1057,10 @@ test "Manifest serialize/deserialize round-trip" {
     try std.testing.expectEqual(m.counter, m2.counter);
     try std.testing.expectEqual(m.next_segment_id, m2.next_segment_id);
     try std.testing.expectEqual(m.series_count, m2.series_count);
-    try std.testing.expectEqual(m.point_count, m2.point_count);
+    // No segments -> the derived total (af37079 parity) is honestly
+    // zero, regardless of whatever stale in-memory `point_count` the
+    // caller might have set.
+    try std.testing.expectEqual(@as(u64, 0), m2.point_count);
     m2.deinit();
 }
 
@@ -1117,8 +1154,11 @@ test "Manifest: encrypted write/read round-trip (GAP-0001)" {
         .encryption_key = key,
     };
     defer m.segments.deinit(allocator);
-    try m.segments.append(allocator, .{ .id = 1, .min_ts = 100, .max_ts = 200, .level = 0 });
-    try m.segments.append(allocator, .{ .id = 2, .min_ts = 300, .max_ts = 400, .level = 1 });
+    // point_count sums to 42 so the honest, derived-at-serialize
+    // total (af37079 parity) still round-trips against the
+    // originally-supplied `Manifest.point_count` field below.
+    try m.segments.append(allocator, .{ .id = 1, .min_ts = 100, .max_ts = 200, .level = 0, .point_count = 15 });
+    try m.segments.append(allocator, .{ .id = 2, .min_ts = 300, .max_ts = 400, .level = 1, .point_count = 27 });
 
     try m.save();
 
@@ -1316,7 +1356,9 @@ test "Manifest: snapshot is stable across publish (P-LOCK-001 COW)" {
 
     var m = try Manifest.init(allocator, data_dir);
     defer m.deinit();
-    try m.segments.append(allocator, .{ .id = 1, .min_ts = 100, .max_ts = 200, .level = 0 });
+    // point_count is not exercised by this test (it verifies COW
+    // snapshot semantics, not counting); 0 is an honest "not set".
+    try m.segments.append(allocator, .{ .id = 1, .min_ts = 100, .max_ts = 200, .level = 0, .point_count = 0 });
     try m.publishInitialSnapshot();
 
     // Reader 1: holds the initial snapshot (1 segment).
@@ -1326,7 +1368,7 @@ test "Manifest: snapshot is stable across publish (P-LOCK-001 COW)" {
     try std.testing.expectEqual(@as(u64, 1), snap1.segments[0].id);
 
     // Writer: stage + publish a second segment.
-    try m.segments.append(allocator, .{ .id = 2, .min_ts = 300, .max_ts = 400, .level = 0 });
+    try m.segments.append(allocator, .{ .id = 2, .min_ts = 300, .max_ts = 400, .level = 0, .point_count = 0 });
     try m.save();
 
     // Reader 1 STILL sees the old list — refcounted snapshot is
@@ -1417,6 +1459,10 @@ test "Manifest: writeSlotAndPublish serialises concurrent writers (P-LOCK-003 pu
                 .min_ts = @intCast(new_id * 100),
                 .max_ts = @intCast(new_id * 100 + 50),
                 .level = 0,
+                // point_count is not exercised by this concurrency
+                // test (it verifies publish_mu serialisation, not
+                // counting); 0 is an honest "not set".
+                .point_count = 0,
             };
             const io2 = std.Io.Threaded.global_single_threaded.io();
             const lsn_param: ?u64 = lsn;
@@ -1557,4 +1603,71 @@ test "Manifest: open fails closed when one slot is future-format — no silent f
         error.IncompatibleManifestVersion,
         Manifest.initWithEncryption(allocator, dir_path, null),
     );
+}
+
+test "Manifest: v2 round-trip preserves per-segment point_count and derives the total" {
+    const allocator = std.testing.allocator;
+
+    var m = Manifest{};
+    defer m.segments.deinit(allocator);
+    try m.segments.append(allocator, .{ .id = 1, .min_ts = 0, .max_ts = 9, .level = 0, .point_count = 123 });
+    try m.segments.append(allocator, .{ .id = 2, .min_ts = 10, .max_ts = 19, .level = 1, .point_count = 77 });
+
+    const bytes = try m.serialize(allocator);
+    defer allocator.free(bytes);
+
+    var m2 = try Manifest.deserialize(allocator, bytes);
+    defer m2.segments.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 123), m2.segments.items[0].point_count);
+    try std.testing.expectEqual(@as(u64, 77), m2.segments.items[1].point_count);
+    // The manifest-level total is DERIVED at serialize time so the
+    // persisted stat can never silently go stale (graph-storage
+    // af37079 parity).
+    try std.testing.expectEqual(@as(u64, 200), m2.point_count);
+}
+
+test "Manifest: v1 manifest (25-byte entries) upgrades in memory (22b801c parity)" {
+    const allocator = std.testing.allocator;
+
+    // Hand-build a version-1 manifest: 72-byte header + one 25-byte
+    // segment entry + CRC. This is the exact layout every store
+    // written before manifest v2 carries on disk — rejecting it
+    // would brick existing stores (the graph-storage 22b801c bug).
+    var buf: [72 + 25 + 4]u8 = undefined;
+    var pos: usize = 0;
+    @memcpy(buf[pos..][0..8], &MANIFEST_MAGIC);
+    pos += 8;
+    writeU32(&buf, &pos, 1); // format_version = 1
+    @memset(buf[pos..][0..16], 0xAB); // ts_uuid
+    pos += 16;
+    writeU64(&buf, &pos, 9); // counter
+    writeU64(&buf, &pos, 100); // last_checkpoint_lsn
+    writeU64(&buf, &pos, 5); // next_segment_id
+    writeU64(&buf, &pos, 0); // series_count (reserved)
+    writeU64(&buf, &pos, 0); // point_count
+    writeU32(&buf, &pos, 1); // num_segments
+    writeU64(&buf, &pos, 3); // seg.id
+    writeU64(&buf, &pos, @bitCast(@as(i64, 10))); // seg.min_ts
+    writeU64(&buf, &pos, @bitCast(@as(i64, 20))); // seg.max_ts
+    buf[pos] = 1; // seg.level
+    pos += 1;
+    const crc = Crc32.hash(buf[0..pos]);
+    writeU32(&buf, &pos, crc);
+
+    var m = try Manifest.deserialize(allocator, &buf);
+    defer m.segments.deinit(allocator);
+
+    // Upgraded in memory — the next save persists v2.
+    try std.testing.expectEqual(MANIFEST_VERSION, m.format_version);
+    try std.testing.expectEqual(@as(u64, 9), m.counter);
+    try std.testing.expectEqual(@as(u64, 100), m.last_checkpoint_lsn);
+    try std.testing.expectEqual(@as(u64, 5), m.next_segment_id);
+    try std.testing.expectEqual(@as(usize, 1), m.segments.items.len);
+    try std.testing.expectEqual(@as(u64, 3), m.segments.items[0].id);
+    try std.testing.expectEqual(@as(i64, 10), m.segments.items[0].min_ts);
+    try std.testing.expectEqual(@as(i64, 20), m.segments.items[0].max_ts);
+    try std.testing.expectEqual(@as(u8, 1), m.segments.items[0].level);
+    // v1 carries no per-segment count: 0 means "unknown (legacy)".
+    try std.testing.expectEqual(@as(u64, 0), m.segments.items[0].point_count);
 }

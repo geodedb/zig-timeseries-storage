@@ -663,3 +663,34 @@ test "P-ALGO-001 migration: retrofit footers onto pre-existing segments via engi
         try std.testing.expect(!r.upgraded);
     }
 }
+
+test "integration: flush records exact per-segment point_count in the manifest" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var eng = try lib.Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 1_000_000,
+    }, &pool);
+    defer eng.deinit();
+
+    const pts = [_]lib.types.Point{
+        .{ .ts = 1, .value = 11 },
+        .{ .ts = 2, .value = 22 },
+        .{ .ts = 3, .value = 33 },
+    };
+    try eng.appendPoints(7, &pts);
+    try eng.appendPoints(9, &.{.{ .ts = 5, .value = 55 }});
+    try eng.flush();
+
+    try std.testing.expectEqual(@as(usize, 1), eng.man.segments.items.len);
+    try std.testing.expectEqual(@as(u64, 4), eng.man.segments.items[0].point_count);
+}

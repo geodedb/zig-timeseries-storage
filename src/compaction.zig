@@ -139,8 +139,9 @@ pub const Compactor = struct {
     }
 
     /// Backwards-compatible entry point: opens every input as
-    /// plaintext and writes the output as plaintext.
-    pub fn compactSegments(self: *Compactor, input_paths: []const []const u8, output_path: []const u8) !void {
+    /// plaintext and writes the output as plaintext. Returns the
+    /// total number of points written to the output segment.
+    pub fn compactSegments(self: *Compactor, input_paths: []const []const u8, output_path: []const u8) !u64 {
         return self.compactSegmentsWithEncryption(input_paths, output_path, null);
     }
 
@@ -149,12 +150,18 @@ pub const Compactor = struct {
     ///
     /// Peak RAM is O(target_block_points + largest-input-block) per
     /// series at a time, NOT O(all-points-in-all-input-segments).
+    ///
+    /// Returns the total number of points written to the output
+    /// segment — the caller (engine.runMergeAndCommit) feeds this
+    /// into the new segment's manifest `point_count` (graph-storage
+    /// af37079 parity: never leave a segment's count unknown when
+    /// the writer already knows it exactly).
     pub fn compactSegmentsWithEncryption(
         self: *Compactor,
         input_paths: []const []const u8,
         output_path: []const u8,
         encryption: ?CompactionEncryption,
-    ) !void {
+    ) !u64 {
         var readers = std.ArrayList(segment.SegmentReader).empty;
         defer {
             for (readers.items) |*r| r.deinit();
@@ -194,14 +201,17 @@ pub const Compactor = struct {
         var writer = try segment.SegmentWriter.initWithEncryption(self.allocator, output_path, out_enc);
         defer writer.deinit();
 
+        var total_points: u64 = 0;
         var it = series_blocks.iterator();
         while (it.next()) |entry| {
-            try self.compactOneSeries(&writer, entry.key_ptr.*, entry.value_ptr.items);
+            total_points += try self.compactOneSeries(&writer, entry.key_ptr.*, entry.value_ptr.items);
         }
 
         // Durability ordering: the merged segment MUST be fsynced
         // before the engine updates the manifest to reference it.
         try writer.sync();
+
+        return total_points;
     }
 
     /// Stream-compact one series. Allocates one `BlockStreamIterator`
@@ -213,8 +223,9 @@ pub const Compactor = struct {
         writer: *segment.SegmentWriter,
         series_id: types.SeriesId,
         blocks: []const BlockInfo,
-    ) !void {
-        if (blocks.len == 0) return;
+    ) !u64 {
+        var written: u64 = 0;
+        if (blocks.len == 0) return 0;
 
         // Partition blocks by file_index to preserve per-stream ordering.
         // The MergeIterator tie-break is "earliest-added iterator wins",
@@ -295,6 +306,7 @@ pub const Compactor = struct {
 
             if (out_buf.items.len >= self.target_block_points) {
                 try writer.writeBlock(series_id, out_buf.items);
+                written += out_buf.items.len;
                 out_buf.clearRetainingCapacity();
             }
         }
@@ -302,7 +314,10 @@ pub const Compactor = struct {
         // Flush the tail.
         if (out_buf.items.len > 0) {
             try writer.writeBlock(series_id, out_buf.items);
+            written += out_buf.items.len;
         }
+
+        return written;
     }
 };
 
@@ -339,7 +354,9 @@ test "Compactor basic merge" {
     defer pool.deinit();
 
     var compactor = Compactor.init(allocator, &pool);
-    try compactor.compactSegments(&.{ seg1_path, seg2_path }, out_path);
+    // series 10: 2 (w1) + 1 (w2) = 3; series 20: 1; series 30: 1.
+    const out_points = try compactor.compactSegments(&.{ seg1_path, seg2_path }, out_path);
+    try std.testing.expectEqual(@as(u64, 5), out_points);
 
     var r = try segment.SegmentReader.init(allocator, out_path);
     defer r.deinit();
@@ -406,7 +423,8 @@ test "Compactor: streaming respects target_block_points (P-MEM-001/P-MEM-005)" {
     // into 10 blocks of 100 each.
     var compactor = Compactor.init(allocator, &pool);
     compactor.target_block_points = 100;
-    try compactor.compactSegments(&.{seg_path}, out_path);
+    const out_points = try compactor.compactSegments(&.{seg_path}, out_path);
+    try std.testing.expectEqual(@as(u64, 1000), out_points);
 
     var r = try segment.SegmentReader.init(allocator, out_path);
     defer r.deinit();
@@ -458,7 +476,9 @@ test "Compactor: dedup collapses same-timestamp entries" {
     defer pool.deinit();
 
     var compactor = Compactor.init(allocator, &pool);
-    try compactor.compactSegments(&.{ seg1_path, seg2_path }, out_path);
+    const out_points = try compactor.compactSegments(&.{ seg1_path, seg2_path }, out_path);
+    // Two same-ts inputs must collapse to one output point.
+    try std.testing.expectEqual(@as(u64, 1), out_points);
 
     var r = try segment.SegmentReader.init(allocator, out_path);
     defer r.deinit();
