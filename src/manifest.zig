@@ -89,6 +89,10 @@ pub const ManifestError = error{
 const FIELD_SIZE: usize = 4 + 16 + 8 + 8 + 8 + 8 + 8; // = 60
 const SERIALIZED_SIZE: usize = 8 + FIELD_SIZE + 4; // = 72
 
+/// Size in bytes of one serialized `SegmentMeta` entry
+/// (id u64 + min_ts i64 + max_ts i64 + level u8).
+const SEGMENT_ENTRY_BYTES: usize = 25;
+
 pub const SegmentMeta = struct {
     id: u64,
     min_ts: i64,
@@ -620,7 +624,7 @@ pub const Manifest = struct {
     }
 
     pub fn serialize(self: *const Manifest, allocator: Allocator) ![]u8 {
-        const segment_bytes = self.segments.items.len * 25;
+        const segment_bytes = self.segments.items.len * SEGMENT_ENTRY_BYTES;
         const full_size = SERIALIZED_SIZE + 4 + segment_bytes;
         const buf = try allocator.alloc(u8, full_size);
         errdefer allocator.free(buf);
@@ -684,6 +688,18 @@ pub const Manifest = struct {
         // `num_segments` field is wildly inflated. We still allocate
         // O(n) below; bounding `n` bounds the worst case.
         if (num_segments > limits.MAX_SEGMENTS_PER_MANIFEST) return error.ManifestTooLarge;
+
+        // graph-storage 2dcc678 parity: every byte offset the
+        // segment-table loop reads must be proven in-bounds BEFORE
+        // the loop runs. The plaintext manifest CRC32 is unkeyed and
+        // forgeable, so a hostile manifest can carry a valid CRC
+        // with an inflated `num_segments` and a short body; without
+        // this gate the `readU64` slices below panic in safe builds
+        // and read out of bounds in ReleaseFast. The serialized
+        // layout is exact (header + entries + trailing CRC), so
+        // require exact length — fail closed, never guess.
+        const expected_len = SERIALIZED_SIZE + 4 + @as(usize, num_segments) * SEGMENT_ENTRY_BYTES;
+        if (data.len != expected_len) return error.InvalidData;
 
         m.segments = std.ArrayListUnmanaged(SegmentMeta).empty;
         for (0..num_segments) |_| {
@@ -1426,4 +1442,25 @@ test "Manifest: writeSlotAndPublish serialises concurrent writers (P-LOCK-003 pu
     defer reloaded.deinit();
     try std.testing.expectEqual(@as(u64, initial_counter + 2), reloaded.counter);
     try std.testing.expectEqual(@as(usize, 2), reloaded.segments.items.len);
+}
+
+test "Manifest: deserialize rejects inflated num_segments with short body (CWE-770 parity)" {
+    const allocator = std.testing.allocator;
+
+    var m = Manifest{};
+    const bytes = try m.serialize(allocator);
+    defer allocator.free(bytes);
+
+    // Forge: inflate num_segments (u32 LE at offset 68 — after
+    // magic 8 + version 4 + uuid 16 + counter 8 + lsn 8 +
+    // next_segment_id 8 + series_count 8 + point_count 8) without
+    // providing entry bytes, then recompute the unkeyed CRC so the
+    // forgery reaches the segment-table loop.
+    const forged = try allocator.dupe(u8, bytes);
+    defer allocator.free(forged);
+    std.mem.writeInt(u32, forged[68..72], 1000, .little);
+    const crc = Crc32.hash(forged[0 .. forged.len - 4]);
+    std.mem.writeInt(u32, forged[forged.len - 4 ..][0..4], crc, .little);
+
+    try std.testing.expectError(error.InvalidData, Manifest.deserialize(allocator, forged));
 }
