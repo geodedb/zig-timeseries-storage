@@ -82,6 +82,11 @@ pub const ManifestError = error{
     /// migration step or a mixed-mode data directory; fail closed
     /// rather than silently accept partial coverage.
     UnexpectedPlaintextManifest,
+    /// `format_version` is 0 (never shipped) or greater than
+    /// `MANIFEST_VERSION` (a layout this binary does not understand).
+    /// graph-storage 49d85dc parity: never guess at a future or
+    /// invalid layout — the segment-entry stride is version-specific.
+    IncompatibleManifestVersion,
 };
 
 /// Size of the serialized manifest in bytes:
@@ -268,6 +273,22 @@ pub const Manifest = struct {
             err_b = err;
             break :blk null;
         };
+
+        // graph-storage 49d85dc parity: a slot written by a NEWER
+        // binary must fail the whole open — even when the other slot
+        // still parses. Falling back to the older slot would
+        // time-travel the store (stale next_segment_id / stale
+        // checkpoint LSN) and let this binary overwrite segments the
+        // newer binary created.
+        for ([_]?anyerror{ err_a, err_b }) |maybe_err| {
+            if (maybe_err) |e| {
+                if (e == error.IncompatibleManifestVersion) {
+                    if (a) |*ma| ma.segments.deinit(allocator);
+                    if (b) |*mb| mb.segments.deinit(allocator);
+                    return e;
+                }
+            }
+        }
 
         // Mixed-mode / wrong-key detection: if either slot was
         // present-but-rejected (not just FileNotFound), and the OTHER
@@ -670,6 +691,15 @@ pub const Manifest = struct {
 
         m.format_version = readU32(data, pos);
         pos += 4;
+        // graph-storage 49d85dc parity: fail CLOSED on any manifest
+        // format this binary does not understand. Without this gate
+        // a future layout under the same magic would be silently
+        // misparsed (the segment-entry stride is version-specific).
+        // Version 0 never shipped — treat it as corruption rather
+        // than guessing.
+        if (m.format_version == 0 or m.format_version > MANIFEST_VERSION) {
+            return error.IncompatibleManifestVersion;
+        }
         @memcpy(&m.ts_uuid, data[pos..][0..16]);
         pos += 16;
         m.counter = readU64(data, pos);
@@ -1463,4 +1493,68 @@ test "Manifest: deserialize rejects inflated num_segments with short body (CWE-7
     std.mem.writeInt(u32, forged[forged.len - 4 ..][0..4], crc, .little);
 
     try std.testing.expectError(error.InvalidData, Manifest.deserialize(allocator, forged));
+}
+
+test "Manifest: deserialize fails closed on a future format_version (49d85dc parity)" {
+    const allocator = std.testing.allocator;
+
+    var m = Manifest{};
+    const bytes = try m.serialize(allocator);
+    defer allocator.free(bytes);
+
+    // Stamp a future version (u32 LE at offset 8) and recompute the
+    // CRC so only the version gate can reject it.
+    const forged = try allocator.dupe(u8, bytes);
+    defer allocator.free(forged);
+    std.mem.writeInt(u32, forged[8..12], MANIFEST_VERSION + 1, .little);
+    const crc = Crc32.hash(forged[0 .. forged.len - 4]);
+    std.mem.writeInt(u32, forged[forged.len - 4 ..][0..4], crc, .little);
+
+    try std.testing.expectError(error.IncompatibleManifestVersion, Manifest.deserialize(allocator, forged));
+}
+
+test "Manifest: open fails closed when one slot is future-format — no silent fallback to the older slot" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir_path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(dir_path);
+
+    // Slot B: a valid current-format manifest (counter=1 → "b").
+    {
+        var m = Manifest{ .counter = 1 };
+        const path_b = try std.fmt.allocPrint(allocator, "{s}/manifest.b", .{dir_path});
+        defer allocator.free(path_b);
+        try m.writeToFile(allocator, path_b);
+    }
+
+    // Slot A: a future-format manifest with a HIGHER counter
+    // (counter=2 → "a"), as a newer binary would have written it.
+    {
+        var m = Manifest{ .counter = 2 };
+        const bytes = try m.serialize(allocator);
+        defer allocator.free(bytes);
+        const forged = try allocator.dupe(u8, bytes);
+        defer allocator.free(forged);
+        std.mem.writeInt(u32, forged[8..12], MANIFEST_VERSION + 1, .little);
+        const crc = Crc32.hash(forged[0 .. forged.len - 4]);
+        std.mem.writeInt(u32, forged[forged.len - 4 ..][0..4], crc, .little);
+
+        const path_a = try std.fmt.allocPrint(allocator, "{s}/manifest.a", .{dir_path});
+        defer allocator.free(path_a);
+        const f = try std.Io.Dir.cwd().createFile(io, path_a, .{ .permissions = std.Io.File.Permissions.fromMode(0o600) });
+        defer f.close(io);
+        try f.writeStreamingAll(io, forged);
+        try f.sync(io);
+    }
+
+    // Opening must surface the incompatibility — falling back to the
+    // stale slot B would time-travel next_segment_id / checkpoint
+    // LSN and let this binary overwrite the newer binary's segments.
+    try std.testing.expectError(
+        error.IncompatibleManifestVersion,
+        Manifest.initWithEncryption(allocator, dir_path, null),
+    );
 }
