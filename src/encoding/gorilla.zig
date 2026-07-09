@@ -586,7 +586,18 @@ pub const GorillaDecoder = struct {
     pub fn decodeAll(self: *GorillaDecoder, allocator: std.mem.Allocator) ![]types.Point {
         var points: std.ArrayList(types.Point) = .empty;
         errdefer points.deinit(allocator);
-        try points.ensureTotalCapacity(allocator, self.num_points);
+        // CWE-770 / graph-storage 2dcc678 parity: `num_points` comes
+        // from an on-disk header an attacker may control. Never let
+        // it reserve more memory than the bitstream could possibly
+        // decode: after the first (64+64-bit literal) point,
+        // Gorilla's minimum cost is 2 bits per point (dod=0 control
+        // bit + xor=0 control bit), so `data.len` bytes hold at most
+        // `data.len * 4 + 1` points. A forged count larger than that
+        // previously reserved up to ~64 GiB up front; now the decode
+        // loop reaches the true end of the stream first and fails
+        // with `error.EndOfStream`.
+        const max_plausible = self.data.len * 4 + 1;
+        try points.ensureTotalCapacity(allocator, @min(self.num_points, max_plausible));
 
         while (self.point_count < self.num_points) {
             const point = try self.decodePoint();
@@ -698,6 +709,22 @@ test "GorillaDecoder: readBits surfaces EndOfStream past the buffer (P-ALGO-005)
     try std.testing.expectError(error.EndOfStream, dec.readBits(8));
     // Position MUST NOT advance on error.
     try std.testing.expectEqual(@as(usize, 4), dec.bit_pos);
+}
+
+test "GorillaDecoder: forged num_points cannot drive a giant up-front reservation (CWE-770)" {
+    var fba_buf: [16 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+    const allocator = fba.allocator();
+
+    // 16 bytes of stream (exactly one first point: 64-bit ts +
+    // 64-bit value) cannot hold maxInt(u32) points. The old code
+    // reserved num_points entries up front and died with
+    // OutOfMemory inside this small arena; the fixed code clamps
+    // the reserve to what the bitstream could plausibly hold and
+    // fails at the true end of the stream instead.
+    const data = [_]u8{0} ** 16;
+    var decoder = GorillaDecoder.init(&data, std.math.maxInt(u32));
+    try std.testing.expectError(error.EndOfStream, decoder.decodeAll(allocator));
 }
 
 test "GorillaEncoder: initForPoints pre-sizes the bitset (P-MEM-002)" {

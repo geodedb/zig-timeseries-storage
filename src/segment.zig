@@ -975,12 +975,21 @@ pub const Block = struct {
     /// Errors:
     ///   * `error.BlockTooLarge` — data_len exceeds the cap.
     ///   * `error.UnexpectedEOF` — truncated read.
-    ///   * `error.BlockCorrupted` — v2 CRC mismatch.
+    ///   * `error.BlockCorrupted` — v2 CRC mismatch or stats.count exceeds MAX_POINTS_PER_BLOCK_ABSOLUTE.
     ///   * `error.DecryptionFailed` — v3 tag check failed.
     ///   * Gorilla decode errors propagate unchanged.
     pub fn decodePoints(self: Block, allocator: Allocator) ![]types.Point {
         // CWE-770 cap.
         if (self.header.data_len > limits.MAX_BLOCK_DATA_LEN) return error.BlockTooLarge;
+
+        // CWE-770 / graph-storage 2dcc678 parity: `stats.count` is
+        // attacker-influenceable for plaintext (v2) blocks — the
+        // per-block CRC32C is unkeyed and forgeable. The encoder can
+        // never legitimately emit more than
+        // MAX_POINTS_PER_BLOCK_ABSOLUTE points per block, so a
+        // larger count is corruption by definition. Reject it before
+        // any payload read or decoder allocation.
+        if (self.header.stats.count > limits.MAX_POINTS_PER_BLOCK_ABSOLUTE) return error.BlockCorrupted;
 
         if (self.reader.encrypted) {
             return self.decodeEncryptedPoints(allocator);
@@ -1308,6 +1317,57 @@ test "Segment: decodePoints refuses oversized data_len" {
     const blk = (try it.next()).?;
 
     try std.testing.expectError(error.BlockTooLarge, blk.decodePoints(allocator));
+}
+
+test "Segment: decodePoints refuses forged stats.count (CWE-770)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path = try tmp_dir.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(path);
+    const seg_path = try std.fmt.allocPrint(allocator, "{s}/badcount.tsseg", .{path});
+    defer allocator.free(seg_path);
+
+    // Hand-craft a segment file: magic + a single header whose
+    // stats.count exceeds the encoder-side absolute cap. The
+    // decode-time cap must fire before any payload read, so no
+    // payload (and no valid CRC) is needed.
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, seg_path, .{
+            .read = false,
+            .permissions = std.Io.File.Permissions.fromMode(0o600),
+        });
+        defer f.close(io);
+        try f.writeStreamingAll(io, &SEGMENT_MAGIC);
+
+        var hdr_buf: [BlockHeader.encoded_size]u8 = undefined;
+        const h = BlockHeader{
+            .series_id = 1,
+            .stats = .{
+                .min_ts = 0,
+                .max_ts = 1,
+                .count = @intCast(limits.MAX_POINTS_PER_BLOCK_ABSOLUTE + 1),
+                .min_value = 0,
+                .max_value = 1,
+                .sum = 0,
+                .first_value = 0,
+                .last_value = 0,
+            },
+            .data_len = 16,
+        };
+        h.serialize(&hdr_buf);
+        try f.writeStreamingAll(io, &hdr_buf);
+        try f.sync(io);
+    }
+
+    var reader = try SegmentReader.init(allocator, seg_path);
+    defer reader.deinit();
+    var it = reader.iterator();
+    const blk = (try it.next()).?;
+
+    try std.testing.expectError(error.BlockCorrupted, blk.decodePoints(allocator));
 }
 
 test "Segment: per-block CRC32C catches a flipped byte in the payload (SEC-004)" {
