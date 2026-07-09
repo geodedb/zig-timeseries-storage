@@ -103,8 +103,8 @@ fn runManifestWriteRead(ctx: *framework.Context) anyerror!void {
 
     // Populate with 16 deterministic segments. Field shape comes from
     // `pub const SegmentMeta` in `src/manifest.zig:88`: `id`, `min_ts`,
-    // `max_ts`, `level`. Timestamps span a contiguous range so the
-    // serialised byte layout is stable run-to-run.
+    // `max_ts`, `level`, `point_count`. Timestamps span a contiguous range
+    // so the serialised byte layout is stable run-to-run.
     var i: u64 = 0;
     while (i < 16) : (i += 1) {
         const id = man.getNextSegmentId();
@@ -113,6 +113,10 @@ fn runManifestWriteRead(ctx: *framework.Context) anyerror!void {
             .min_ts = @as(i64, @intCast(i)) * 1000,
             .max_ts = @as(i64, @intCast(i)) * 1000 + 999,
             .level = 0,
+            // Synthetic benchmark: use 1000 points per segment (1 point/ms
+            // in the 1000ms timestamp range) to represent realistic segment
+            // data density for manifest I/O testing.
+            .point_count = 1000,
         });
     }
 
