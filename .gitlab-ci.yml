@@ -32,8 +32,20 @@ workflow:
 
 default:
   interruptible: true
+  # `company` alone is NOT sufficient to keep jobs off the Windows
+  # runner group: the "Hosted Windows Runners" group runner (id
+  # 52791377, tags company/windows/dedicated/x86) also carries
+  # `company`, and GitLab's tag matching only requires a runner's tags
+  # be a SUPERSET of the job's -- so any job that requests only
+  # `company` is eligible to land on that Windows box. Observed
+  # exactly this: zig-build-0.16.0 (a bash/apt-get Linux job) got
+  # dispatched to it and failed entirely on PowerShell syntax errors.
+  # The Linux runner ("Lab Servers", id 52789722) carries `linux` in
+  # addition to `company`; require it explicitly so only Linux-capable
+  # runners are eligible.
   tags:
   - company
+  - linux
   # Share Zig's local cache (build artifacts + fetched deps) across
   # jobs on the same branch. `key` is the branch slug so feature
   # branches do not contaminate each other's caches; `policy:
