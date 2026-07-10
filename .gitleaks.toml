@@ -13,6 +13,15 @@ paths = [
     '''zig-out''',
     '''\.git''',
 ]
+# OpenSSL release-signing PGP key FINGERPRINTS (public identifiers from
+# https://www.openssl.org/source/), pinned in scripts/install-openssl-fips.sh
+# to verify release tarball signatures. Not secrets — a fingerprint is the
+# public half's hash; there is nothing to leak. Allowlisted by exact value
+# so a history scan of the commit that introduced them stays clean too.
+regexes = [
+    '''B146647E45A7B33947AB226B2A2C87D161692D40''',
+    '''BA5473A2B0587B07FB27CF2D216094DFD0CB81EF''',
+]
 
 # Add custom rules or allowlist entries as needed
 # [[rules]]
