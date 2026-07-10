@@ -14,6 +14,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log() { printf '\033[0;34m==>\033[0m %s\n' "$*"; }
 
+# fetch_url <url> [output-file]
+#
+# have_build_tools() below accepts EITHER wget or curl as sufficient, but
+# every download call site used to hard-code wget -- so a host with curl
+# but no wget (e.g. a minimal apt image where build tools were already
+# present and the wget-installing package-manager step got skipped) failed
+# hard on the very first download. Route every fetch through here so
+# either tool works.
+fetch_url() {
+  local url="$1"
+  local out="${2:-}"
+  if command -v wget >/dev/null 2>&1; then
+    if [ -n "${out}" ]; then wget -q "${url}" -O "${out}"; else wget -q "${url}"; fi
+  elif command -v curl >/dev/null 2>&1; then
+    if [ -n "${out}" ]; then curl -fsSL "${url}" -o "${out}"; else curl -fsSLO "${url}"; fi
+  else
+    echo "neither wget nor curl is available to fetch ${url}" >&2
+    return 1
+  fi
+}
+
 have_build_tools() {
   command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1 \
     && command -v make >/dev/null 2>&1 \
@@ -51,8 +72,15 @@ install_prereqs() {
 # version (still a 3.x) so a transient network blip cannot wedge the
 # always-latest gate.
 resolve_latest() {
-  local tag
-  tag="$(wget -qO- https://api.github.com/repos/openssl/openssl/releases/latest 2>/dev/null \
+  local tag api_out
+  api_out="$(
+    if command -v wget >/dev/null 2>&1; then
+      wget -qO- https://api.github.com/repos/openssl/openssl/releases/latest 2>/dev/null
+    elif command -v curl >/dev/null 2>&1; then
+      curl -fsSL https://api.github.com/repos/openssl/openssl/releases/latest 2>/dev/null
+    fi
+  )"
+  tag="$(printf '%s' "${api_out}" \
     | grep -oE '"tag_name": *"openssl-3\.[0-9.]+"' \
     | grep -oE '3\.[0-9.]+' | head -n1)"
   if [ -z "${tag}" ] && command -v openssl >/dev/null 2>&1; then
@@ -96,7 +124,7 @@ log "Fetching openssl-${VER}"
 cd "${WORK}"
 BASE_URL="https://github.com/openssl/openssl/releases/download/openssl-${VER}"
 TARBALL="openssl-${VER}.tar.gz"
-wget -q "${BASE_URL}/${TARBALL}"
+fetch_url "${BASE_URL}/${TARBALL}"
 
 # ---------------------------------------------------------------------------
 # INTEGRITY / AUTHENTICITY VERIFICATION — fail closed.
@@ -115,7 +143,7 @@ GPG_VERIFIED=no
 
 # --- SHA-256 verification ---------------------------------------------------
 if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; then
-  if wget -q "${BASE_URL}/${TARBALL}.sha256" -O "${TARBALL}.sha256"; then
+  if fetch_url "${BASE_URL}/${TARBALL}.sha256" "${TARBALL}.sha256"; then
     # The .sha256 file contains "HASH *filename" with the bare filename; we
     # rewrite the path to match our working-directory copy so sha256sum/shasum
     # can verify without a directory mismatch.
@@ -133,7 +161,7 @@ fi
 
 # --- GPG signature verification ---------------------------------------------
 if command -v gpg >/dev/null 2>&1; then
-  if wget -q "${BASE_URL}/${TARBALL}.asc" -O "${TARBALL}.asc"; then
+  if fetch_url "${BASE_URL}/${TARBALL}.asc" "${TARBALL}.asc"; then
     # Import pinned OpenSSL release signing keys from the canonical keyserver.
     # We import both the current and previous keys so that any 3.x release in
     # the field (some older series use the previous key) can be verified.
