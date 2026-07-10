@@ -85,18 +85,31 @@ install_prereqs() {
 # API is unreachable/rate-limited, fall back to the system openssl
 # version (still a 3.x) so a transient network blip cannot wedge the
 # always-latest gate.
+#
+# Deliberately queries the releases LIST (newest-first), not
+# /releases/latest: openssl now ships a 4.x series too, and
+# /releases/latest returns the newest release across ALL major series
+# (currently openssl-4.0.1) regardless of which one is newer chronologically.
+# This script intentionally tracks the latest 3.x only -- the FIPS provider
+# setup here is 3.x-shaped and 4.x hasn't been adopted -- so scan the list
+# and take the first tag matching the 3.x series instead of assuming
+# "latest" means "latest 3.x". (A single /releases/latest call previously
+# silently resolved to a 4.x tag, matched nothing, and mis-reported "GitHub
+# API unavailable" before falling back to whatever ancient 3.x happened to
+# be preinstalled on the host -- see the mismatched log message this
+# replaces.)
 resolve_latest() {
   local tag api_out
   api_out="$(
     if command -v wget >/dev/null 2>&1; then
-      wget -qO- https://api.github.com/repos/openssl/openssl/releases/latest 2>/dev/null
+      wget -qO- "https://api.github.com/repos/openssl/openssl/releases?per_page=30" 2>/dev/null
     elif command -v curl >/dev/null 2>&1; then
-      curl -fsSL https://api.github.com/repos/openssl/openssl/releases/latest 2>/dev/null
+      curl -fsSL "https://api.github.com/repos/openssl/openssl/releases?per_page=30" 2>/dev/null
     fi
   )"
   tag="$(printf '%s' "${api_out}" \
-    | grep -oE '"tag_name": *"openssl-3\.[0-9.]+"' \
-    | grep -oE '3\.[0-9.]+' | head -n1)"
+    | grep -oE '"tag_name": *"openssl-3\.[0-9]+\.[0-9]+"' \
+    | grep -oE '3\.[0-9]+\.[0-9]+' | head -n1)"
   if [ -z "${tag}" ] && command -v openssl >/dev/null 2>&1; then
     tag="$(openssl version 2>/dev/null | grep -oE '3\.[0-9.]+' | head -n1)"
     [ -n "${tag}" ] && log "GitHub API unavailable; falling back to system openssl version ${tag}" >&2
