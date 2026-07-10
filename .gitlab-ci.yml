@@ -285,6 +285,17 @@ benchmark-regression:
   extends: .zig-host-base
   stage: performance
   rules: *bench-rules
+  # ADVISORY, not gating (re-opens the Q-CI-002 enforcement question).
+  # We now HAVE multi-runner statistics and they rule out gating on
+  # shared runners: two runs of byte-identical code (pipelines
+  # 2666266900 vs 2666281626, same runner host, 13 minutes apart)
+  # swung append throughput +400% and query_full_range -93% — far
+  # beyond any usable noise floor. A single-run diff against a
+  # committed baseline cannot distinguish a real regression from
+  # shared-runner load. Re-gate only with a same-job A/B design
+  # (build+run baseline ref and HEAD alternately in one job) or a
+  # dedicated quiet runner.
+  allow_failure: true
   script:
   - mkdir -p benchmarks/results
   - zig build bench -- --output benchmarks/results/ci-current.json
@@ -299,10 +310,6 @@ benchmark-regression:
     paths:
     - benchmarks/results/ci-current.json
     expire_in: 30 days
-  # Closes Q-CI-002: baseline is now committed so the regression gate
-  # is enforced. The default 15% noise floor in compare-bench gives
-  # cross-runner variance plenty of headroom; tighten it with
-  # `--floor` once we have multi-runner statistics.
 
 bench-micro:
   extends: .zig-host-base
