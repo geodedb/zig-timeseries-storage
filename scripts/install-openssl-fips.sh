@@ -14,6 +14,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log() { printf '\033[0;34m==>\033[0m %s\n' "$*"; }
 
+# Many CI containers (e.g. the plain `ubuntu:24.04` image .zig-host-base
+# uses) run as root with no `sudo` binary installed at all -- there's
+# nothing to elevate from. Only shell out to sudo when we're NOT already
+# root; fail loudly if we need privilege escalation and sudo isn't there.
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+  else
+    echo "not running as root and sudo is not available -- cannot install" >&2
+    exit 1
+  fi
+fi
+
 # fetch_url <url> [output-file]
 #
 # have_build_tools() below accepts EITHER wget or curl as sufficient, but
@@ -54,10 +68,10 @@ install_prereqs() {
   case "$(uname -s)" in
     Linux)
       if command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get update -y
-        sudo apt-get install -y build-essential perl wget ca-certificates
+        ${SUDO} apt-get update -y
+        ${SUDO} apt-get install -y build-essential perl wget ca-certificates
       elif command -v dnf >/dev/null 2>&1; then
-        sudo dnf install -y gcc make perl-core wget
+        ${SUDO} dnf install -y gcc make perl-core wget
       fi ;;
     Darwin)
       command -v brew >/dev/null 2>&1 && brew install perl wget || true ;;
@@ -222,19 +236,19 @@ log "Configuring with enable-fips (prefix=${PREFIX})"
 ./Configure enable-fips --prefix="${PREFIX}" --openssldir="${PREFIX}/ssl" \
   -Wl,-rpath,"${PREFIX}/lib64" -Wl,-rpath,"${PREFIX}/lib"
 make -j"${JOBS}"
-sudo make install_sw install_ssldirs
-sudo make install_fips
+${SUDO} make install_sw install_ssldirs
+${SUDO} make install_fips
 
 # Locate the installed fips module + lib dir (lib64 on most x86_64).
 LIBDIR="${PREFIX}/lib64"; [ -d "${LIBDIR}/ossl-modules" ] || LIBDIR="${PREFIX}/lib"
 
 log "Running openssl fipsinstall"
-sudo "${PREFIX}/bin/openssl" fipsinstall \
+${SUDO} "${PREFIX}/bin/openssl" fipsinstall \
   -out "${PREFIX}/ssl/fipsmodule.cnf" \
   -module "${LIBDIR}/ossl-modules/fips.so"
 
 log "Writing openssl.cnf activating fips + base providers"
-sudo tee "${PREFIX}/ssl/openssl.cnf" >/dev/null <<EOF
+${SUDO} tee "${PREFIX}/ssl/openssl.cnf" >/dev/null <<EOF
 config_diagnostics = 1
 openssl_conf = openssl_init
 
