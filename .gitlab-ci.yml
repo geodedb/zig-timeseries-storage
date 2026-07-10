@@ -431,18 +431,28 @@ test-tsan-stress:
 # ---------------------------------------------------------------------------
 # FIPS-140-3 dual-mode test (-Dfips=true).
 #
-# `fips-deps` builds the latest OpenSSL 3.x + FIPS provider into
-# /usr/local/ssl (via the repo `make deps` target, which the ci-catalog
-# `zig-fips-build` component also provides). `test-fips` then runs the suite
-# against the validated FIPS backend. Linux-only; MR + default-branch.
+# `fips-deps` builds the latest OpenSSL 3.x + FIPS provider (via the repo
+# `make deps` target, which the ci-catalog `zig-fips-build` component also
+# provides) into a PROJECT-RELATIVE prefix ($CI_PROJECT_DIR/.fips-ssl), NOT
+# the /usr/local/ssl default `make deps` uses for local dev. GitLab cannot
+# archive artifact paths outside the project directory -- pointing
+# `artifacts.paths` at /usr/local/ssl silently no-ops ("processPath:
+# artifact path is not a subpath of project directory", visible in the
+# fips-deps job log) and every OpenSSL FIPS provider build that job did was
+# thrown away, so `test-fips` always started from a bare system with no
+# provider installed at all ("unable to open library directory
+# '/usr/local/ssl/lib64'"). Both jobs must agree on OPENSSL_PREFIX so the
+# artifact handoff actually round-trips. Linux-only; MR + default-branch.
 fips-deps:
   extends: .zig-host-base
   stage: build
+  variables:
+    OPENSSL_PREFIX: "$CI_PROJECT_DIR/.fips-ssl"
   script:
-    - make deps   # builds latest OpenSSL + FIPS provider into /usr/local/ssl
+    - make deps   # builds latest OpenSSL + FIPS provider into $OPENSSL_PREFIX
   artifacts:
     paths:
-      - /usr/local/ssl
+      - .fips-ssl
     expire_in: 1 day
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
@@ -451,8 +461,10 @@ fips-deps:
 test-fips:
   extends: .zig-host-base
   stage: test
+  variables:
+    OPENSSL_PREFIX: "$CI_PROJECT_DIR/.fips-ssl"
   script:
-    - OPENSSL_CONF=/usr/local/ssl/ssl/openssl.cnf zig build test -Dfips=true -Dopenssl_path=/usr/local/ssl --summary all
+    - OPENSSL_CONF=$OPENSSL_PREFIX/ssl/openssl.cnf zig build test -Dfips=true -Dopenssl_path=$OPENSSL_PREFIX --summary all
   needs:
     - fips-deps
   rules:
