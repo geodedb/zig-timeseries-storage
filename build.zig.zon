@@ -9,8 +9,8 @@
             .hash = "wal-0.1.12-EqPqpmVXBQBXfTTDLspnODMxihbhEg744Xlwd2JhR9Lx",
         },
         .uuid = .{
-            .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=v0.1.5#d8250b1cd4356a1cc2d5d68147cc6bae0e911364",
-            .hash = "uuid-0.1.5-tL1irnnjHABpORObyXtwuDU9fISZc8WOe-HYVxCBFtc1",
+            .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=v0.1.6#f92bce89fcff2c96b3a0c101dd1281caa049d415",
+            .hash = "uuid-0.1.6-tL1irqfjHABYd5_hiee3UxxRXTSPPh-0fbtMdHAs8tZ6",
         },
         .thread_pool = .{
             // Aligned with upstream geode main (post-d54fab4f) which pins
