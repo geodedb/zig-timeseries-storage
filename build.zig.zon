@@ -1,16 +1,16 @@
 .{
     .name = .timeseries_storage,
-    .version = "0.2.10",
+    .version = "0.2.11",
     .fingerprint = 0x2bf0366724c10ce7,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .wal = .{
-            .url = "git+https://gitlab.com/devnw/zig/wal.git#v0.1.12",
-            .hash = "wal-0.1.12-EqPqpmVXBQBXfTTDLspnODMxihbhEg744Xlwd2JhR9Lx",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=v0.1.13#9423deef65b17ebab51f1a89670b2e446b33c5f1",
+            .hash = "wal-0.1.13-EqPqpr9XBQAqyfIYRGxnz46NycS0QMmFMu8SVsWGodVu",
         },
         .uuid = .{
-            .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=v0.1.5#d8250b1cd4356a1cc2d5d68147cc6bae0e911364",
-            .hash = "uuid-0.1.5-tL1irnnjHABpORObyXtwuDU9fISZc8WOe-HYVxCBFtc1",
+            .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=v0.1.7#c23fb4e8d923a06cc5d94e563c0ae85fb3f87782",
+            .hash = "uuid-0.1.7-tL1irlHkHAAKEQXWa1gN8GmQB6TTnmdjNGPG2cS1GKPe",
         },
         .thread_pool = .{
             // Aligned with upstream geode main (post-d54fab4f) which pins
@@ -24,7 +24,7 @@
         // only resolved on a dev machine with a sibling checkout; CI clones
         // only this repo, so `-Dfips=true` builds always failed there.)
         .fips = .{
-            .url = "git+https://gitlab.com/devnw/zig/fips.git#v0.1.1",
+            .url = "git+https://gitlab.com/devnw/zig/fips.git?ref=v0.1.1#4041d9cfdeadcab665644b3f4d3362c276f94bb7",
             .hash = "fips-0.1.1-1wf3na01BwC3voljVu61_0g6DXp6BCedXrq4QMuMeQBq",
             .lazy = true,
         },
