@@ -63,20 +63,20 @@ default:
 
 include:
   # Security scanning
-- component: gitlab.com/devnw/ci-catalog/security-sast@v1.53.0
-- component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.53.0
-- component: gitlab.com/devnw/ci-catalog/security-secrets@v1.53.0
-- component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/security-sast@v1.55.8
+- component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.55.8
+- component: gitlab.com/devnw/ci-catalog/security-secrets@v1.55.8
+- component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.55.8
 
   # SBOM
-- component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.53.0
-- component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.55.8
+- component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.55.8
 
   # Release
-- component: gitlab.com/devnw/ci-catalog/release-semantic@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/release-semantic@v1.55.8
 
   # Zig formatting (Linux).
-- component: gitlab.com/devnw/ci-catalog/zig-format@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-format@v1.55.8
   inputs:
     zig_version: "0.16.0"
     paths: "src/ tests/ examples/ benchmarks/"
@@ -88,43 +88,43 @@ include:
   # was shell-split into two args and resolved to only the `check`
   # step under the catalog wrapper, so no artifact was actually being
   # produced or verified.
-- component: gitlab.com/devnw/ci-catalog/zig-build@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-build@v1.55.8
   inputs:
     stage: build
     zig_version: "0.16.0"
     build_options: "build"
 
   # Zig tests — Linux matrix across optimize modes + integration + stress.
-- component: gitlab.com/devnw/ci-catalog/zig-test@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.8
   inputs:
     zig_version: "0.16.0"
     job_suffix: "-unit-debug"
     test_step: "test"
     optimize: "Debug"
-- component: gitlab.com/devnw/ci-catalog/zig-test@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.8
   inputs:
     zig_version: "0.16.0"
     job_suffix: "-unit-releasesafe"
     test_step: "test"
     optimize: "ReleaseSafe"
-- component: gitlab.com/devnw/ci-catalog/zig-test@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.8
   inputs:
     zig_version: "0.16.0"
     job_suffix: "-unit-releasefast"
     test_step: "test"
     optimize: "ReleaseFast"
-- component: gitlab.com/devnw/ci-catalog/zig-test@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.8
   inputs:
     zig_version: "0.16.0"
     job_suffix: "-unit-releasesmall"
     test_step: "test"
     optimize: "ReleaseSmall"
-- component: gitlab.com/devnw/ci-catalog/zig-test@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.8
   inputs:
     zig_version: "0.16.0"
     job_suffix: "-integration"
     test_step: "test-integration"
-- component: gitlab.com/devnw/ci-catalog/zig-test@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-test@v1.55.8
   inputs:
     zig_version: "0.16.0"
     job_suffix: "-stress"
@@ -132,7 +132,7 @@ include:
 
   # Fuzz sweep (advisory). fuzz_duration is the in-shell SIGINT
   # budget; timeout: is GitLab's job cap.
-- component: gitlab.com/devnw/ci-catalog/zig-fuzz@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-fuzz@v1.55.8
   inputs:
     zig_version: "0.16.0"
     test_step: "test"
@@ -142,22 +142,22 @@ include:
     allow_failure: true
 
   # Zig build + tests on macOS (gated).
-- component: gitlab.com/devnw/ci-catalog/zig-build-macos@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-build-macos@v1.55.8
   inputs:
     zig_version: "0.16.0"
     build_step: "build"
     build_options: "check"
-- component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.55.8
   inputs:
     zig_version: "0.16.0"
     job_suffix: "-unit"
     test_step: "test"
-- component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.55.8
   inputs:
     zig_version: "0.16.0"
     job_suffix: "-integration"
     test_step: "test-integration"
-- component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.55.8
   inputs:
     zig_version: "0.16.0"
     job_suffix: "-stress"
@@ -166,31 +166,31 @@ include:
   # Zig build + tests on Windows (gated). tags override routes these to
   # the self-hosted company Windows runner group; remove the override
   # once ci-catalog >v1.22.0 lands and bakes the new default in.
-- component: gitlab.com/devnw/ci-catalog/zig-build-windows@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-build-windows@v1.55.8
   inputs:
     zig_version: "0.16.0"
     build_step: "build"
     build_options: "check"
     tags: ["company", "windows"]
-- component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.55.8
   inputs:
     zig_version: "0.16.0"
     job_suffix: "-unit"
     test_step: "test"
     tags: ["company", "windows"]
-- component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.55.8
   inputs:
     zig_version: "0.16.0"
     job_suffix: "-integration"
     test_step: "test-integration"
     tags: ["company", "windows"]
-- component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.55.8
   inputs:
     zig_version: "0.16.0"
     job_suffix: "-stress"
     test_step: "test-stress"
     tags: ["company", "windows"]
-- component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@v1.53.0
+- component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@v1.55.8
 
 variables:
   ZIG_VERSION: "0.16.0"
@@ -453,6 +453,9 @@ test-tsan-stress:
 fips-deps:
   extends: .zig-host-base
   stage: build
+  # Pin to x86: fips-deps hands a compiled OpenSSL to test-fips as an
+  # artifact, so both jobs must run on the same CPU architecture.
+  tags: [company, linux, x86]
   variables:
     OPENSSL_PREFIX: "$CI_PROJECT_DIR/.fips-ssl"
   script:
@@ -468,6 +471,9 @@ fips-deps:
 test-fips:
   extends: .zig-host-base
   stage: test
+  # Pin to x86: fips-deps hands a compiled OpenSSL to test-fips as an
+  # artifact, so both jobs must run on the same CPU architecture.
+  tags: [company, linux, x86]
   variables:
     OPENSSL_PREFIX: "$CI_PROJECT_DIR/.fips-ssl"
   script:
