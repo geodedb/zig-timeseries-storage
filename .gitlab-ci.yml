@@ -26,8 +26,6 @@ workflow:
     auto_cancel:
       on_new_commit: none
   - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    auto_cancel:
-      on_new_commit: none
   - when: always
 
 default:
