@@ -63,7 +63,7 @@ repos:
   hooks:
   - id: zig-fmt
     name: zig fmt (check)
-    entry: mise x zig@0.16.0 -- zig fmt --check
+    entry: bash scripts/hook-env.sh mise x zig@0.16.0 -- zig fmt --check
     language: system
     files: \.zig$
     pass_filenames: false
@@ -71,14 +71,14 @@ repos:
 
   - id: zig-build
     name: zig build (check)
-    entry: mise x zig@0.16.0 -- zig build check
+    entry: bash scripts/hook-env.sh mise x zig@0.16.0 -- zig build check
     language: system
     pass_filenames: false
     files: \.zig$
 
   - id: zig-test
     name: zig test
-    entry: mise x zig@0.16.0 -- zig build test
+    entry: bash scripts/hook-env.sh mise x zig@0.16.0 -- zig build test
     language: system
     pass_filenames: false
     files: \.zig$
@@ -98,17 +98,24 @@ repos:
   hooks:
   - id: detect-diamond-deps
     name: detect diamond deps in build.zig.zon
-    entry: uvx --refresh --from git+https://gitlab.com/devnw/zig/zig-tool detect-diamond-deps
+    entry: bash scripts/hook-env.sh uvx --refresh --from git+https://gitlab.com/devnw/zig/zig-tool detect-diamond-deps
     language: system
     files: ^build\.zig\.zon$
     pass_filenames: false
   - id: check-version-tag
     name: release tag matches build.zig.zon version
-    entry: uvx --refresh --from git+https://gitlab.com/devnw/zig/zig-tool zig-tool check-version-tag
+    entry: bash scripts/hook-env.sh uvx --refresh --from git+https://gitlab.com/devnw/zig/zig-tool zig-tool check-version-tag
     language: system
     stages: [pre-push]
     pass_filenames: false
     always_run: true
+  - id: hook-env-regression
+    name: hook Git environment isolation regressions
+    entry: bash scripts/hook-env.sh python3 scripts/test_hook_env.py
+    language: system
+    files: ^(scripts/(hook-env\.sh|test_hook_env\.py)|\.pre-commit-config\.yaml)$
+    pass_filenames: false
+    stages: [pre-commit, pre-push]
 ci:
   autofix_prs: true
   autofix_commit_msg: '[pre-commit.ci] auto fixes'

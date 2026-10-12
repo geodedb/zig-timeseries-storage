@@ -69,3 +69,6 @@ zig-*/
 *.key
 *.p12
 *.pfx
+
+# Keep the hook environment regression test in the source tree.
+!/scripts/test_hook_env.py
