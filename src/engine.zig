@@ -764,6 +764,11 @@ pub const Engine = struct {
     /// how to pair with an `Io.Mutex`. Switching to a plain mutex
     /// removes a class of spin loops and simplifies reasoning.
     mu: std.Io.Mutex = std.Io.Mutex.init,
+    /// Queries share this lease from segment-list capture through decoding.
+    /// Compaction and retention take it exclusively only AFTER publishing,
+    /// before cache invalidation/unlink. Never acquire it while holding mu:
+    /// queries take the lease before mu, and retirement may wait for queries.
+    query_files: std.Io.RwLock = .init,
     /// Broadcast whenever a background flush or compaction worker
     /// clears its in-flight flag (`flushing_mem = null` or
     /// `compaction_running = false`). Waiters in `deinit`, `flush`,
@@ -2576,6 +2581,11 @@ pub const Engine = struct {
             .new_checkpoint_lsn = null,
         });
 
+        // Publish first, then wait for every query that could have captured
+        // the old segment list before invalidating or unlinking its files.
+        self.query_files.lockUncancelable(io);
+        defer self.query_files.unlock(io);
+
         // P-IO-001: invalidate FD cache entries for the compacted
         // segments before unlinking. Refcount-safe: deferred close
         // for entries still borrowed by an in-flight query.
@@ -2658,6 +2668,9 @@ pub const Engine = struct {
             .remove_ids = doomed_ids.items,
         });
 
+        self.query_files.lockUncancelable(io);
+        defer self.query_files.unlock(io);
+
         // P-IO-001: invalidate FD cache entries for the pruned
         // segments before unlinking. Cache invalidate is refcount-
         // safe — in-flight queries finish on the live FD, then the
@@ -2707,9 +2720,8 @@ pub const Engine = struct {
     ///
     /// Errors:
     /// - `error.OutOfMemory` from the arena.
-    /// - Segment read errors are currently silently skipped for the
-    ///   affected segment (per-segment best-effort) — this is tracked
-    ///   under Q-REL-003 and will be tightened in a follow-up.
+    /// - Missing or unreadable segment files and corrupt blocks propagate;
+    ///   a successful query never silently omits a referenced segment.
     pub fn queryPoints(self: *Engine, arena: Allocator, series_id: types.SeriesId, start_ts: i64, end_ts: i64) !*iterator.MergeIterator {
         const io = self.io;
 
@@ -2732,46 +2744,31 @@ pub const Engine = struct {
         const merge_it = try arena.create(iterator.MergeIterator);
         merge_it.* = iterator.MergeIterator.init(arena);
 
-        // P-LOCK-001 / P-LOCK-003 manifest COW: acquire a refcounted
-        // immutable snapshot of the segment list, lock-free. The
-        // returned `*Snapshot` is stable for the lifetime of the ref
-        // — concurrent writers may stage and publish NEW snapshots
-        // but our view remains coherent until we `release()`.
-        //
-        // queryPoints no longer holds engine.mu at all on the
-        // manifest-read path. The memtable drain still takes
-        // engine.mu briefly (to guarantee POINTER lifetime against
-        // the flush worker's `destroy(flushing_mem)`); the per-shard
-        // mutex inside each memtable continues to serialise the
-        // copy out against concurrent inserts.
-        const man_snap = self.man.snapshot();
-        defer man_snap.release();
+        // A manifest snapshot preserves metadata, not the files it names.
+        // Hold the shared file lease before capturing the current manifest so
+        // compaction/prune cannot unlink a segment before we open its reader.
+        self.query_files.lockSharedUncancelable(io);
+        defer self.query_files.unlockShared(io);
 
-        {
+        const segments = blk: {
             self.mu.lockUncancelable(io);
             defer self.mu.unlock(io);
 
-            // Memtables are drained under `engine.mu` so the
-            // flushing memtable cannot be freed by the flush worker
-            // (which also takes `engine.mu` for the final destroy)
-            // mid-scan. The per-shard mutex inside each memtable
-            // still serialises against concurrent `appendPoints` —
-            // we hold `engine.mu` only to guarantee POINTER lifetime
-            // here, not to exclude writers. Concurrent writes
-            // remain lock-free against engine.mu and contend only
-            // on the per-shard mutex they touch.
+            // Capture the authoritative segment list and both memtables under
+            // one lock. A flush cannot disappear between separate snapshots.
+            // Copy the live list rather than the optional COW snapshot, whose
+            // publication can lag after an allocation failure.
+            const segments = try arena.dupe(manifest.SegmentMeta, self.man.segments.items);
             try queryMemtable(arena, self.active_mem.load(.acquire), series_id, start_ts, end_ts, merge_it, &points_added);
             if (self.flushing_mem) |fm| {
                 try queryMemtable(arena, fm, series_id, start_ts, end_ts, merge_it, &points_added);
             }
-        }
+            break :blk segments;
+        };
 
-        // Iterate the manifest snapshot WITHOUT the engine lock.
-        // Concurrent appends, flushes, and compactions are now free
-        // to run. Compaction's invalidate() / our cache's refcount
-        // guard ensure readers we are using cannot be closed under
-        // us.
-        for (man_snap.segments) |seg| {
+        // Decode without engine.mu. Concurrent queries share the lease;
+        // appends and manifest publication can still make progress.
+        for (segments) |seg| {
             if (seg.min_ts > end_ts or seg.max_ts < start_ts) continue;
             try self.querySegment(arena, io, seg, series_id, start_ts, end_ts, merge_it, &points_added);
         }
@@ -2826,12 +2823,9 @@ pub const Engine = struct {
     ///
     /// Error handling, post Q-REL-003 / Q-REL-009 / Q-REL-010:
     ///
-    /// - If the segment file is gone, the most likely cause is a
-    ///   benign race with a concurrent compaction worker that has
-    ///   already swapped the manifest entry. We swallow
-    ///   `error.FileNotFound` and treat the segment as empty.
-    /// - Every other open error propagates (permissions, I/O failure,
-    ///   bad magic).
+    /// - The caller holds query_files shared, so engine-managed retirement
+    ///   cannot remove a captured segment before it is opened. Every open
+    ///   error propagates, including FileNotFound from external file loss.
     /// - Block iterator and decode errors propagate — they indicate
     ///   on-disk corruption that the caller should know about
     ///   instead of silently receiving truncated results.
@@ -2854,13 +2848,7 @@ pub const Engine = struct {
         // P-IO-001 / P-MEM-006: borrow a cached reader instead of
         // opening from scratch. Cache lookup is O(1) under its own
         // mutex; the engine lock is NOT held here.
-        const reader_ptr = self.reader_cache.acquire(io, seg.id, p, self.segmentEncryptionContext(seg.id)) catch |err| switch (err) {
-            // Benign race with compaction: the segment was just
-            // unlinked but the in-memory manifest snapshot we
-            // captured still references it. Skip.
-            error.FileNotFound => return,
-            else => return err,
-        };
+        const reader_ptr = try self.reader_cache.acquire(io, seg.id, p, self.segmentEncryptionContext(seg.id));
         defer self.reader_cache.release(io, seg.id);
 
         // P-ALGO-001 (partial): consult the segment's optional footer
@@ -4279,4 +4267,167 @@ test "FIPS-0006b: opaqueSeriesId is a deterministic keyed HMAC-SHA256 PRF (seam-
     const c = opaqueSeriesId(1, 3, key);
     try std.testing.expectEqual(a, b); // deterministic
     try std.testing.expect(a != c); // distinct inputs -> distinct ids
+}
+
+// Pause a real query while decoding its first segment, before later segment
+// readers have been acquired. This makes the retirement race reproducible.
+const QueryRetirementFixture = struct {
+    engine: *Engine,
+    backing: Allocator,
+    paused: std.Io.Semaphore = .{},
+    resume_query: std.Io.Semaphore = .{},
+    did_pause: bool = false,
+    query_error: ?anyerror = null,
+    query_done: std.atomic.Value(bool) = .init(false),
+    retirement_error: ?anyerror = null,
+    retired: std.atomic.Value(bool) = .init(false),
+    prune: bool,
+    count: usize = 0,
+
+    fn allocator(self: *@This()) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (!self.did_pause) {
+            self.engine.reader_cache.mu.lockUncancelable(self.engine.io);
+            const has_reader = self.engine.reader_cache.entries.count() > 0;
+            self.engine.reader_cache.mu.unlock(self.engine.io);
+            if (has_reader) {
+                self.did_pause = true;
+                self.paused.post(self.engine.io);
+                self.resume_query.waitUncancelable(self.engine.io);
+            }
+        }
+        return self.backing.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+
+    fn query(self: *@This()) void {
+        defer self.query_done.store(true, .release);
+        // Also wake the test if setup failed before the first decoded block.
+        defer if (!self.did_pause) self.paused.post(self.engine.io);
+        var it = self.engine.queryPoints(self.allocator(), 7, 0, 100) catch |err| {
+            self.query_error = err;
+            return;
+        };
+        while (it.next()) |_| self.count += 1;
+    }
+
+    fn retire(self: *@This()) void {
+        defer self.retired.store(true, .release);
+        if (self.prune) {
+            _ = self.engine.pruneExpired() catch |err| {
+                self.retirement_error = err;
+                return;
+            };
+        } else {
+            self.engine.compactAll() catch |err| {
+                self.retirement_error = err;
+            };
+        }
+    }
+};
+
+fn testQueryDuringRetirement(prune: bool) !void {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 2 });
+    defer pool.deinit();
+    var engine = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 100,
+        .retention_max_age_ms = if (prune) 1000 else null,
+        .retention_now_override = 10_000,
+    }, &pool);
+    defer engine.deinit();
+    // Three segments stay below the background compaction threshold.
+    for (0..3) |i| {
+        const base: i64 = @intCast(i * 2);
+        try engine.appendPoints(7, &.{ .{ .ts = base, .value = base }, .{ .ts = base + 1, .value = base + 1 } });
+        try engine.flush();
+    }
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var fixture = QueryRetirementFixture{ .engine = &engine, .backing = arena.allocator(), .prune = prune };
+    const query_thread = try std.Thread.spawn(.{}, QueryRetirementFixture.query, .{&fixture});
+    // Always resume before joining, including assertion/error paths.
+    defer {
+        fixture.resume_query.post(engine.io);
+        query_thread.join();
+    }
+    fixture.paused.waitUncancelable(engine.io);
+    if (fixture.query_error) |err| return err;
+
+    const retire_thread = try std.Thread.spawn(.{}, QueryRetirementFixture.retire, .{&fixture});
+    defer retire_thread.join();
+    // Above join is LIFO: resume the query before allowing it to wait.
+    defer fixture.resume_query.post(engine.io);
+
+    // Wait until the real compaction/prune has published its replacement.
+    // Publication can proceed while the query retains its old file view.
+    var started = std.Io.Clock.awake.now(io).nanoseconds;
+    var published = false;
+    while (std.Io.Clock.awake.now(io).nanoseconds - started < 5 * std.time.ns_per_s) {
+        engine.mu.lockUncancelable(engine.io);
+        published = engine.man.segments.items.len != 3;
+        engine.mu.unlock(engine.io);
+        if (published) break;
+        try std.Io.sleep(io, .{ .nanoseconds = std.time.ns_per_ms }, .awake);
+    }
+    try std.testing.expect(published);
+    // The paused query holds only the first reader. Metadata publication must
+    // not authorize unlinking the two files it has yet to open.
+    try std.Io.sleep(io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake);
+    try std.testing.expect(!fixture.retired.load(.acquire));
+    fixture.resume_query.post(engine.io);
+    // Wait for the query's owned result before assertions without joining twice.
+    // Retirement can finish only once queryPoints has completed decoding.
+    started = std.Io.Clock.awake.now(io).nanoseconds;
+    while ((!fixture.retired.load(.acquire) or !fixture.query_done.load(.acquire)) and std.Io.Clock.awake.now(io).nanoseconds - started < 5 * std.time.ns_per_s) {
+        try std.Io.sleep(io, .{ .nanoseconds = std.time.ns_per_ms }, .awake);
+    }
+    try std.testing.expect(fixture.retired.load(.acquire));
+    try std.testing.expect(fixture.query_done.load(.acquire));
+    if (fixture.retirement_error) |err| return err;
+    if (fixture.query_error) |err| return err;
+    try std.testing.expectEqual(@as(usize, 6), fixture.count);
+}
+
+test "Engine: compaction retains files for a paused query (SONNY-4883)" {
+    try testQueryDuringRetirement(false);
+}
+
+test "Engine: retention retains files for a paused query (SONNY-4883)" {
+    try testQueryDuringRetirement(true);
+}
+
+test "Engine: missing query segment is an error, not an empty result (SONNY-4883)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+    var engine = try Engine.init(allocator, .{ .data_dir = data_dir, .max_memtable_points = 100 }, &pool);
+    defer engine.deinit();
+    try engine.appendPoints(7, &.{.{ .ts = 1, .value = 2 }});
+    try engine.flush();
+    const path = try segment.segmentPath(allocator, data_dir, engine.man.segments.items[0].id);
+    defer allocator.free(path);
+    try std.Io.Dir.cwd().deleteFile(io, path);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.FileNotFound, engine.queryPoints(arena.allocator(), 7, 0, 100));
 }
