@@ -22,19 +22,19 @@ workflow:
   auto_cancel:
     on_new_commit: interruptible
   rules:
-  - if: '$CI_COMMIT_TAG'
-    auto_cancel:
-      on_new_commit: none
-  - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+      auto_cancel:
+        on_new_commit: none
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
   # SRE-194: validation pipelines fail fast on the first blocking job failure;
   # these rules admit only what the next rule already admits.
-  - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    auto_cancel:
-      on_job_failure: all
-  - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
-    auto_cancel:
-      on_job_failure: all
-  - when: always
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      auto_cancel:
+        on_job_failure: all
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      auto_cancel:
+        on_job_failure: all
+    - when: always
 
 default:
   interruptible: true
@@ -50,9 +50,9 @@ default:
   # addition to `company`; require it explicitly so only Linux-capable
   # runners are eligible.
   tags:
-  - company
-  - linux
-  - x86
+    - company
+    - linux
+    - x86
   # Share Zig's local cache (build artifacts + fetched deps) across
   # jobs on the same branch. `key` is the branch slug so feature
   # branches do not contaminate each other's caches; `policy:
@@ -65,44 +65,35 @@ default:
   cache:
     key: "$CI_COMMIT_REF_SLUG"
     paths:
-    - .zig-cache/
+      - .zig-cache/
     policy: pull-push
 
 include:
   # Security scanning
-- component: gitlab.com/devnw/ci-catalog/security-sast@v1.57.0
-  inputs:
-    tags: ["company", "linux", "x86"]
-- component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.57.0
-  inputs:
-    tags: ["company", "linux", "x86"]
-- component: gitlab.com/devnw/ci-catalog/security-secrets@v1.57.0
-  inputs:
-    tags: ["company", "linux", "x86"]
-- component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.57.0
-  inputs:
-    tags: ["company", "linux", "x86"]
+  - component: gitlab.com/devnw/ci-catalog/security-gitleaks@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      tags: ["company", "linux", "x86"]
 
   # SBOM
-- component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.57.0
-  inputs:
-    tags: ["company", "linux", "x86"]
-- component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.57.0
-  inputs:
-    tags: ["company", "linux", "x86"]
+  - component: gitlab.com/devnw/ci-catalog/sbom-generate@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      tags: ["company", "linux", "x86"]
+  - component: gitlab.com/devnw/ci-catalog/sbom-scan@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      tags: ["company", "linux", "x86"]
 
   # Release
-- component: gitlab.com/devnw/ci-catalog/release-semantic@v1.57.0
-  inputs:
-    tags: ["company", "linux", "x86"]
-    release_auth: job_token
+  - component: gitlab.com/devnw/ci-catalog/release-semantic@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      tags: ["company", "linux", "x86"]
+      release_auth: job_token
 
   # Zig formatting (Linux).
-- component: gitlab.com/devnw/ci-catalog/zig-format@v1.57.0
-  inputs:
-    tags: ["company", "linux", "x86"]
-    zig_version: "0.16.0"
-    paths: "src/ tests/ examples/ benchmarks/"
+  - component: gitlab.com/devnw/ci-catalog/zig-format@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      tags: ["company", "linux", "x86"]
+      zig_version: "0.16.0"
+      paths: "src/ tests/ examples/ benchmarks/"
 
   # Zig build (Linux): static lib + CLI + check-compile.
   # `build_options: "build"` runs the actual `zig build` step which
@@ -111,132 +102,132 @@ include:
   # was shell-split into two args and resolved to only the `check`
   # step under the catalog wrapper, so no artifact was actually being
   # produced or verified.
-- component: gitlab.com/devnw/ci-catalog/zig-build@v1.57.0
-  inputs:
-    tags: ["company", "linux", "x86"]
-    stage: build
-    zig_version: "0.16.0"
-    build_options: "build"
+  - component: gitlab.com/devnw/ci-catalog/zig-build@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      tags: ["company", "linux", "x86"]
+      stage: build
+      zig_version: "0.16.0"
+      build_options: "build"
 
   # Zig tests — Linux matrix across optimize modes + integration + stress.
-- component: gitlab.com/devnw/ci-catalog/zig-test@v1.57.0
-  inputs:
-    tags: ["company", "linux", "x86"]
-    zig_version: "0.16.0"
-    job_suffix: "-unit-debug"
-    test_step: "test"
-    optimize: "Debug"
-- component: gitlab.com/devnw/ci-catalog/zig-test@v1.57.0
-  inputs:
-    tags: ["company", "linux", "x86"]
-    zig_version: "0.16.0"
-    job_suffix: "-unit-releasesafe"
-    test_step: "test"
-    optimize: "ReleaseSafe"
-- component: gitlab.com/devnw/ci-catalog/zig-test@v1.57.0
-  inputs:
-    tags: ["company", "linux", "x86"]
-    zig_version: "0.16.0"
-    job_suffix: "-unit-releasefast"
-    test_step: "test"
-    optimize: "ReleaseFast"
-- component: gitlab.com/devnw/ci-catalog/zig-test@v1.57.0
-  inputs:
-    tags: ["company", "linux", "x86"]
-    zig_version: "0.16.0"
-    job_suffix: "-unit-releasesmall"
-    test_step: "test"
-    optimize: "ReleaseSmall"
-- component: gitlab.com/devnw/ci-catalog/zig-test@v1.57.0
-  inputs:
-    tags: ["company", "linux", "x86"]
-    zig_version: "0.16.0"
-    job_suffix: "-integration"
-    test_step: "test-integration"
-- component: gitlab.com/devnw/ci-catalog/zig-test@v1.57.0
-  inputs:
-    tags: ["company", "linux", "x86"]
-    zig_version: "0.16.0"
-    job_suffix: "-stress"
-    test_step: "test-stress"
+  - component: gitlab.com/devnw/ci-catalog/zig-test@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      tags: ["company", "linux", "x86"]
+      zig_version: "0.16.0"
+      job_suffix: "-unit-debug"
+      test_step: "test"
+      optimize: "Debug"
+  - component: gitlab.com/devnw/ci-catalog/zig-test@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      tags: ["company", "linux", "x86"]
+      zig_version: "0.16.0"
+      job_suffix: "-unit-releasesafe"
+      test_step: "test"
+      optimize: "ReleaseSafe"
+  - component: gitlab.com/devnw/ci-catalog/zig-test@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      tags: ["company", "linux", "x86"]
+      zig_version: "0.16.0"
+      job_suffix: "-unit-releasefast"
+      test_step: "test"
+      optimize: "ReleaseFast"
+  - component: gitlab.com/devnw/ci-catalog/zig-test@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      tags: ["company", "linux", "x86"]
+      zig_version: "0.16.0"
+      job_suffix: "-unit-releasesmall"
+      test_step: "test"
+      optimize: "ReleaseSmall"
+  - component: gitlab.com/devnw/ci-catalog/zig-test@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      tags: ["company", "linux", "x86"]
+      zig_version: "0.16.0"
+      job_suffix: "-integration"
+      test_step: "test-integration"
+  - component: gitlab.com/devnw/ci-catalog/zig-test@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      tags: ["company", "linux", "x86"]
+      zig_version: "0.16.0"
+      job_suffix: "-stress"
+      test_step: "test-stress"
 
   # Fuzz sweep (advisory). fuzz_duration is the in-shell SIGINT
   # budget; timeout: is GitLab's job cap.
-- component: gitlab.com/devnw/ci-catalog/zig-fuzz@v1.57.0
-  inputs:
-    tags: ["company", "linux", "x86"]
-    zig_version: "0.16.0"
-    test_step: "test"
-    test_options: "--fuzz"
-    fuzz_duration: "60"
-    timeout: "5m"
-    allow_failure: true
+  - component: gitlab.com/devnw/ci-catalog/zig-fuzz@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      tags: ["company", "linux", "x86"]
+      zig_version: "0.16.0"
+      test_step: "test"
+      test_options: "--fuzz"
+      fuzz_duration: "60"
+      timeout: "5m"
+      allow_failure: true
 
   # Zig build + tests on macOS (gated).
-- component: gitlab.com/devnw/ci-catalog/zig-build-macos@v1.57.0
-  inputs:
-    zig_version: "0.16.0"
-    build_step: "build"
-    build_options: "check"
-- component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.57.0
-  inputs:
-    zig_version: "0.16.0"
-    job_suffix: "-unit"
-    test_step: "test"
-- component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.57.0
-  inputs:
-    zig_version: "0.16.0"
-    job_suffix: "-integration"
-    test_step: "test-integration"
-- component: gitlab.com/devnw/ci-catalog/zig-test-macos@v1.57.0
-  inputs:
-    zig_version: "0.16.0"
-    job_suffix: "-stress"
-    test_step: "test-stress"
+  - component: gitlab.com/devnw/ci-catalog/zig-build-macos@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      zig_version: "0.16.0"
+      build_step: "build"
+      build_options: "check"
+  - component: gitlab.com/devnw/ci-catalog/zig-test-macos@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      zig_version: "0.16.0"
+      job_suffix: "-unit"
+      test_step: "test"
+  - component: gitlab.com/devnw/ci-catalog/zig-test-macos@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      zig_version: "0.16.0"
+      job_suffix: "-integration"
+      test_step: "test-integration"
+  - component: gitlab.com/devnw/ci-catalog/zig-test-macos@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      zig_version: "0.16.0"
+      job_suffix: "-stress"
+      test_step: "test-stress"
 
   # Zig build + tests on Windows (gated). tags override routes these to
   # the self-hosted company Windows runner group; remove the override
   # once ci-catalog >v1.22.0 lands and bakes the new default in.
-- component: gitlab.com/devnw/ci-catalog/zig-build-windows@v1.57.0
-  inputs:
-    zig_version: "0.16.0"
-    build_step: "build"
-    build_options: "check"
-    tags: ["company", "windows"]
-- component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.57.0
-  inputs:
-    zig_version: "0.16.0"
-    job_suffix: "-unit"
-    test_step: "test"
-    tags: ["company", "windows"]
-- component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.57.0
-  inputs:
-    zig_version: "0.16.0"
-    job_suffix: "-integration"
-    test_step: "test-integration"
-    tags: ["company", "windows"]
-- component: gitlab.com/devnw/ci-catalog/zig-test-windows@v1.57.0
-  inputs:
-    zig_version: "0.16.0"
-    job_suffix: "-stress"
-    test_step: "test-stress"
-    tags: ["company", "windows"]
-- component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@v1.57.0
-  inputs:
-    tags: ["company", "linux", "x86"]
+  - component: gitlab.com/devnw/ci-catalog/zig-build-windows@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      zig_version: "0.16.0"
+      build_step: "build"
+      build_options: "check"
+      tags: ["company", "windows"]
+  - component: gitlab.com/devnw/ci-catalog/zig-test-windows@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      zig_version: "0.16.0"
+      job_suffix: "-unit"
+      test_step: "test"
+      tags: ["company", "windows"]
+  - component: gitlab.com/devnw/ci-catalog/zig-test-windows@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      zig_version: "0.16.0"
+      job_suffix: "-integration"
+      test_step: "test-integration"
+      tags: ["company", "windows"]
+  - component: gitlab.com/devnw/ci-catalog/zig-test-windows@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      zig_version: "0.16.0"
+      job_suffix: "-stress"
+      test_step: "test-stress"
+      tags: ["company", "windows"]
+  - component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@aad997d40e358eeef7ec943f761498341c37c724
+    inputs:
+      tags: ["company", "linux", "x86"]
 
 variables:
   ZIG_VERSION: "0.16.0"
 
 stages:
-- lint
-- build
-- test
-- fuzz
-- performance
-- security
-- sbom
-- release
+  - lint
+  - build
+  - test
+  - fuzz
+  - performance
+  - security
+  - sbom
+  - release
 
 # ---------------------------------------------------------------
 # Cross-OS gating: apply rules to the catalog-generated jobs so
@@ -245,11 +236,11 @@ stages:
 # ---------------------------------------------------------------
 
 .cross-os-rules: &cross-os-rules
-- if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-- if: '$CI_PIPELINE_SOURCE == "schedule"'
-- if: '$RUN_CROSS_OS == "true"'
-- when: manual
-  allow_failure: true
+  - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  - if: '$RUN_CROSS_OS == "true"'
+  - when: manual
+    allow_failure: true
 
 zig-build-macos-0.16.0:
   rules: *cross-os-rules
@@ -301,18 +292,18 @@ zig-test-windows-stress-0.16.0:
   image: "ubuntu:26.04"
   interruptible: true
   before_script:
-  - apt-get update -qq
-  - apt-get install -y --no-install-recommends curl ca-certificates xz-utils git build-essential python3
-  - bash scripts/install-zig.sh "$ZIG_VERSION"
-  - export PATH="$(pwd)/zig-${ZIG_VERSION}:$PATH"
-  - zig version
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends curl ca-certificates xz-utils git build-essential python3
+    - bash scripts/install-zig.sh "$ZIG_VERSION"
+    - export PATH="$(pwd)/zig-${ZIG_VERSION}:$PATH"
+    - zig version
 
 .bench-rules: &bench-rules
-- if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-- if: '$CI_PIPELINE_SOURCE == "schedule"'
-- if: '$RUN_BENCH == "true"'
-- when: manual
-  allow_failure: true
+  - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  - if: '$CI_PIPELINE_SOURCE == "schedule"'
+  - if: '$RUN_BENCH == "true"'
+  - when: manual
+    allow_failure: true
 
 benchmark-regression:
   extends: .zig-host-base
@@ -330,18 +321,18 @@ benchmark-regression:
   # dedicated quiet runner.
   allow_failure: true
   script:
-  - mkdir -p benchmarks/results
-  - zig build bench -- --output benchmarks/results/ci-current.json
-  - |
-    if [ -f benchmarks/results/baseline.json ]; then
-      zig build compare-bench -- --baseline benchmarks/results/baseline.json --current benchmarks/results/ci-current.json
-    else
-      echo "no benchmarks/results/baseline.json yet; skipping regression gate"
-    fi
+    - mkdir -p benchmarks/results
+    - zig build bench -- --output benchmarks/results/ci-current.json
+    - |
+      if [ -f benchmarks/results/baseline.json ]; then
+        zig build compare-bench -- --baseline benchmarks/results/baseline.json --current benchmarks/results/ci-current.json
+      else
+        echo "no benchmarks/results/baseline.json yet; skipping regression gate"
+      fi
   artifacts:
     when: always
     paths:
-    - benchmarks/results/ci-current.json
+      - benchmarks/results/ci-current.json
     expire_in: 30 days
 
 bench-micro:
@@ -349,23 +340,23 @@ bench-micro:
   stage: performance
   rules: *bench-rules
   script:
-  - zig build bench-micro
+    - zig build bench-micro
   allow_failure: true # advisory; thresholds aren't gated yet
 
 scale-bench:
   extends: .zig-host-base
   stage: performance
   rules:
-  - if: '$CI_PIPELINE_SOURCE == "schedule"'
-  - when: manual
-    allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - when: manual
+      allow_failure: true
   script:
-  - mkdir -p benchmarks/results
-  - timeout 300 zig build scale-bench -- --output benchmarks/results/scale-current.json
+    - mkdir -p benchmarks/results
+    - timeout 300 zig build scale-bench -- --output benchmarks/results/scale-current.json
   artifacts:
     when: always
     paths:
-    - benchmarks/results/scale-current.json
+      - benchmarks/results/scale-current.json
     expire_in: 30 days
 
 # ---------------------------------------------------------------
@@ -386,35 +377,35 @@ coverage:
   extends: .zig-host-base
   stage: test
   rules:
-  - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-  - if: '$CI_PIPELINE_SOURCE == "schedule"'
-  - if: '$RUN_COVERAGE == "true"'
-  - when: manual
-    allow_failure: true
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$RUN_COVERAGE == "true"'
+    - when: manual
+      allow_failure: true
   before_script:
-  - apt-get update -qq
-  - apt-get install -y --no-install-recommends curl ca-certificates xz-utils git build-essential python3 kcov || true
-  - bash scripts/install-zig.sh "$ZIG_VERSION"
-  - export PATH="$(pwd)/zig-${ZIG_VERSION}:$PATH"
-  - zig version
-  - kcov --version || echo "kcov unavailable on this runner"
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends curl ca-certificates xz-utils git build-essential python3 kcov || true
+    - bash scripts/install-zig.sh "$ZIG_VERSION"
+    - export PATH="$(pwd)/zig-${ZIG_VERSION}:$PATH"
+    - zig version
+    - kcov --version || echo "kcov unavailable on this runner"
   script:
-  - mkdir -p coverage
+    - mkdir -p coverage
   # Build all test artifacts first so kcov has stable paths to run.
-  - zig build test --summary all
-  - zig build test-integration --summary all
+    - zig build test --summary all
+    - zig build test-integration --summary all
   # Discover and run every cached test binary. The Zig build system
   # places each test artifact under .zig-cache/o/<hash>/test; kcov
   # tolerates per-binary failures and merges results across runs.
-  - |
-    for t in $(find .zig-cache/o -type f -name test -executable 2>/dev/null); do
-      kcov --include-path=src/ coverage "$t" || echo "kcov skipped $t"
-    done
+    - |
+      for t in $(find .zig-cache/o -type f -name test -executable 2>/dev/null); do
+        kcov --include-path=src/ coverage "$t" || echo "kcov skipped $t"
+      done
   coverage: '/^lines\.*:\s*([\d.]+%)/'
   artifacts:
     when: always
     paths:
-    - coverage/
+      - coverage/
     expire_in: 30 days
   allow_failure: true
 
@@ -433,12 +424,12 @@ test-tsan-unit:
   extends: .zig-host-base
   stage: test
   rules:
-  - if: '$CI_PIPELINE_SOURCE == "schedule"'
-  - if: '$RUN_TSAN == "true"'
-  - when: manual
-    allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$RUN_TSAN == "true"'
+    - when: manual
+      allow_failure: true
   script:
-  - zig build test -Dtsan=true --summary all
+    - zig build test -Dtsan=true --summary all
   allow_failure: true
   timeout: "30m"
 
@@ -446,12 +437,12 @@ test-tsan-integration:
   extends: .zig-host-base
   stage: test
   rules:
-  - if: '$CI_PIPELINE_SOURCE == "schedule"'
-  - if: '$RUN_TSAN == "true"'
-  - when: manual
-    allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$RUN_TSAN == "true"'
+    - when: manual
+      allow_failure: true
   script:
-  - zig build test-integration -Dtsan=true --summary all
+    - zig build test-integration -Dtsan=true --summary all
   allow_failure: true
   timeout: "30m"
 
@@ -459,12 +450,12 @@ test-tsan-stress:
   extends: .zig-host-base
   stage: test
   rules:
-  - if: '$CI_PIPELINE_SOURCE == "schedule"'
-  - if: '$RUN_TSAN == "true"'
-  - when: manual
-    allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$RUN_TSAN == "true"'
+    - when: manual
+      allow_failure: true
   script:
-  - zig build test-stress -Dtsan=true --summary all
+    - zig build test-stress -Dtsan=true --summary all
   allow_failure: true
   timeout: "30m"
 
