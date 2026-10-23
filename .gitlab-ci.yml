@@ -112,41 +112,41 @@ include:
       build_options: "build"
 
   # Zig tests — Linux matrix across optimize modes + integration + stress.
-  - component: gitlab.com/devnw/ci-catalog/zig-test@aad997d40e358eeef7ec943f761498341c37c724
+  - component: gitlab.com/devnw/ci-catalog/zig-test@2364ffad921af103e8512e3bd6c76ad70f3a1018
     inputs:
       tags: ["company", "linux", "x86"]
       zig_version: "0.16.0"
       job_suffix: "-unit-debug"
       test_step: "test"
       optimize: "Debug"
-  - component: gitlab.com/devnw/ci-catalog/zig-test@aad997d40e358eeef7ec943f761498341c37c724
+  - component: gitlab.com/devnw/ci-catalog/zig-test@2364ffad921af103e8512e3bd6c76ad70f3a1018
     inputs:
       tags: ["company", "linux", "x86"]
       zig_version: "0.16.0"
       job_suffix: "-unit-releasesafe"
       test_step: "test"
       optimize: "ReleaseSafe"
-  - component: gitlab.com/devnw/ci-catalog/zig-test@aad997d40e358eeef7ec943f761498341c37c724
+  - component: gitlab.com/devnw/ci-catalog/zig-test@2364ffad921af103e8512e3bd6c76ad70f3a1018
     inputs:
       tags: ["company", "linux", "x86"]
       zig_version: "0.16.0"
       job_suffix: "-unit-releasefast"
       test_step: "test"
       optimize: "ReleaseFast"
-  - component: gitlab.com/devnw/ci-catalog/zig-test@aad997d40e358eeef7ec943f761498341c37c724
+  - component: gitlab.com/devnw/ci-catalog/zig-test@2364ffad921af103e8512e3bd6c76ad70f3a1018
     inputs:
       tags: ["company", "linux", "x86"]
       zig_version: "0.16.0"
       job_suffix: "-unit-releasesmall"
       test_step: "test"
       optimize: "ReleaseSmall"
-  - component: gitlab.com/devnw/ci-catalog/zig-test@aad997d40e358eeef7ec943f761498341c37c724
+  - component: gitlab.com/devnw/ci-catalog/zig-test@2364ffad921af103e8512e3bd6c76ad70f3a1018
     inputs:
       tags: ["company", "linux", "x86"]
       zig_version: "0.16.0"
       job_suffix: "-integration"
       test_step: "test-integration"
-  - component: gitlab.com/devnw/ci-catalog/zig-test@aad997d40e358eeef7ec943f761498341c37c724
+  - component: gitlab.com/devnw/ci-catalog/zig-test@2364ffad921af103e8512e3bd6c76ad70f3a1018
     inputs:
       tags: ["company", "linux", "x86"]
       zig_version: "0.16.0"
