@@ -479,11 +479,27 @@ test-tsan-stress:
 fips-deps:
   extends: .zig-host-base
   stage: build
+  # make deps still checks the version and verifies the active provider.
+  # Include this CI file in the key so image/configuration changes invalidate it.
+  dependencies: []
+  cache:
+    key:
+      prefix: openssl-fips-linux-x86
+      files:
+        - .gitlab-ci.yml
+        - scripts/install-openssl-fips.sh
+    paths:
+      - .fips-ssl/
+    policy: pull-push
   # Pin to x86: fips-deps hands a compiled OpenSSL to test-fips as an
   # artifact, so both jobs must run on the same CPU architecture.
   tags: [company, linux, x86]
   variables:
     OPENSSL_PREFIX: "$CI_PROJECT_DIR/.fips-ssl"
+  # Provider provisioning uses C/Perl, so this job does not install Zig.
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends build-essential perl curl wget sudo gnupg dirmngr python3 ca-certificates
   script:
     - make deps   # builds latest OpenSSL + FIPS provider into $OPENSSL_PREFIX
   artifacts:
