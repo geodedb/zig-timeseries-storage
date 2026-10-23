@@ -5,12 +5,12 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .wal = .{
-            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=v0.1.22#97a8602b00e7431231b6dc9b4a5928073c46c3c1",
-            .hash = "wal-0.1.22-EqPqpgQ1BwC0q08qVDuR8qWuFU-39WPbuXfY55dqDokJ",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=4ce94a0af728b99b8fbc02d6174c0ac2d303683d#4ce94a0af728b99b8fbc02d6174c0ac2d303683d",
+            .hash = "wal-0.1.22-EqPqpi09BwAq5tR30RVCY82P0G7rIi4xGM34uD0oSrhB",
         },
         .uuid = .{
-            .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=v0.1.9#88374241b83ced6c6ec8996b8e5529ee0573bbc5",
-            .hash = "uuid-0.1.9-tL1irrHrHABbxhdPA7uz_Qk5mAXaS6QoDVEKL-mK9twq",
+            .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=c8206cbf2f3abc756b62b9e099715c81a452a2aa#c8206cbf2f3abc756b62b9e099715c81a452a2aa",
+            .hash = "uuid-0.1.9-tL1iruPmHAAJ2ebApUBKroge9t-yDmrcPJ-2A2FEduNj",
         },
         .thread_pool = .{
             // Aligned with upstream geode main (post-d54fab4f) which pins
