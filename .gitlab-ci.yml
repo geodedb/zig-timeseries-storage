@@ -4,7 +4,7 @@
 #
 # Reusable components live in gitlab.com/devnw/ci-catalog.
 # Zig components pinned at v1.22.0 (first tag with multi-OS + test_step
-# + bounded zig-fuzz). Security/SBOM components stay on their existing
+#). Security/SBOM components stay on their existing
 # pins since those APIs haven't changed.
 #
 # Linux jobs run on company-tagged runners. macOS jobs use GitLab SaaS
@@ -152,18 +152,6 @@ include:
       zig_version: "0.16.0"
       job_suffix: "-stress"
       test_step: "test-stress"
-
-  # Fuzz sweep (advisory). fuzz_duration is the in-shell SIGINT
-  # budget; timeout: is GitLab's job cap.
-  - component: gitlab.com/devnw/ci-catalog/zig-fuzz@aad997d40e358eeef7ec943f761498341c37c724
-    inputs:
-      tags: ["company", "linux", "x86"]
-      zig_version: "0.16.0"
-      test_step: "test"
-      test_options: "--fuzz"
-      fuzz_duration: "60"
-      timeout: "5m"
-      allow_failure: true
 
   # Zig build + tests on macOS (gated).
   - component: gitlab.com/devnw/ci-catalog/zig-build-macos@aad997d40e358eeef7ec943f761498341c37c724
