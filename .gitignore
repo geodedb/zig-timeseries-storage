@@ -72,3 +72,6 @@ zig-*/
 
 # Keep the hook environment regression test in the source tree.
 !/scripts/test_hook_env.py
+
+# Retain the real release-signature regression checks.
+!/scripts/test_release_signature.py

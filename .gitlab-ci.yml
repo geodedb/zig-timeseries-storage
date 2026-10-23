@@ -501,6 +501,7 @@ fips-deps:
     - apt-get update -qq
     - apt-get install -y --no-install-recommends build-essential perl curl wget sudo gnupg dirmngr python3 ca-certificates
   script:
+    - python3 scripts/test_release_signature.py
     - make deps   # builds latest OpenSSL + FIPS provider into $OPENSSL_PREFIX
   artifacts:
     paths:
