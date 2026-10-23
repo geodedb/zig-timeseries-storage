@@ -31,6 +31,8 @@ workflow:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       auto_cancel:
         on_job_failure: all
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
     - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
       auto_cancel:
         on_job_failure: all
@@ -526,10 +528,13 @@ test-portable-entropy-macos:
   timeout: 10m
   interruptible: true
   needs: []
+  variables:
+    ZIG_GLOBAL_CACHE_DIR: "$CI_PROJECT_DIR/.zig-global-cache"
   cache:
     key: "zig-${ZIG_VERSION}-macos-aarch64"
     paths:
       - zig-${ZIG_VERSION}/
+      - .zig-global-cache/
   before_script:
     - |
       if [ ! -x "zig-${ZIG_VERSION}/zig" ] || [ "$(zig-${ZIG_VERSION}/zig version)" != "$ZIG_VERSION" ]; then
@@ -576,6 +581,8 @@ test-portable-entropy-macos:
     - zig version
   script:
     - zig test -lc --dep std_shim -Mroot=tests/portable_entropy_test.zig -Mstd_shim=src/std_shim.zig
+    # Exercise the pinned UUID/WAL implementations on the native platform too.
+    - zig build -j2 test test-integration test-wal-recovery --summary all
   # Main, schedules, and RUN_CROSS_OS use the existing full macOS suite.
   # Keep the small required check for MRs/tags without that automatic suite.
   rules:
