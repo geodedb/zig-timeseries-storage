@@ -576,7 +576,7 @@ test-portable-entropy-macos:
     - zig version
   script:
     - zig test -lc --dep std_shim -Mroot=tests/portable_entropy_test.zig -Mstd_shim=src/std_shim.zig
+  # Main, schedules, and RUN_CROSS_OS use the existing full macOS suite.
+  # Keep the small required check for MRs/tags without that automatic suite.
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    - if: '$CI_COMMIT_TAG'
+    - if: '($CI_PIPELINE_SOURCE == "merge_request_event" || $CI_COMMIT_TAG) && $RUN_CROSS_OS != "true"'
