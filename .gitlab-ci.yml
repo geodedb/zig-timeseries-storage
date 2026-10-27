@@ -7,8 +7,9 @@
 #). Security/SBOM components stay on their existing
 # pins since those APIs haven't changed.
 #
-# Linux jobs run on company-tagged runners. macOS jobs use GitLab SaaS
-# (`saas-macos-medium-m1`); Windows jobs use the self-hosted company
+# Linux jobs run on company-tagged runners. macOS jobs use the devnw dedicated
+# Apple Silicon runners (`dedicated` + `macos` + `arm` tags);
+# Windows jobs use the self-hosted company
 # runner group (`company` + `windows` tags). Cross-OS jobs are gated
 # behind rules + allow_failure so pipelines without those runners still
 # pass. Trigger cross-OS runs by setting RUN_CROSS_OS=true or by
@@ -156,21 +157,25 @@ include:
   # Zig build + tests on macOS (gated).
   - component: gitlab.com/devnw/ci-catalog/zig-build-macos@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
+      tags: [dedicated, macos, arm]
       zig_version: "0.16.0"
       build_step: "build"
       build_options: "check"
   - component: gitlab.com/devnw/ci-catalog/zig-test-macos@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
+      tags: [dedicated, macos, arm]
       zig_version: "0.16.0"
       job_suffix: "-unit"
       test_step: "test"
   - component: gitlab.com/devnw/ci-catalog/zig-test-macos@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
+      tags: [dedicated, macos, arm]
       zig_version: "0.16.0"
       job_suffix: "-integration"
       test_step: "test-integration"
   - component: gitlab.com/devnw/ci-catalog/zig-test-macos@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
+      tags: [dedicated, macos, arm]
       zig_version: "0.16.0"
       job_suffix: "-stress"
       test_step: "test-stress"
@@ -528,8 +533,7 @@ hook-env-regression:
 # Exercise OS entropy natively: cross-compilation cannot detect a wrong syscall.
 test-portable-entropy-macos:
   stage: test
-  image: macos-26-xcode-26
-  tags: [saas-macos-medium-m1]
+  tags: [dedicated, macos, arm]
   timeout: 10m
   interruptible: true
   needs: []
