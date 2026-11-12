@@ -1,6 +1,6 @@
 .{
     .name = .timeseries_storage,
-    .version = "0.2.18",
+    .version = "0.2.19",
     .fingerprint = 0x2bf0366724c10ce7,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -13,10 +13,11 @@
             .hash = "uuid-0.1.9-tL1iruPmHAAJ2ebApUBKroge9t-yDmrcPJ-2A2FEduNj",
         },
         .thread_pool = .{
-            // Aligned with upstream geode main (post-d54fab4f) which pins
-            // thread-pool to 39528a3 (WaitGroup completion-broadcast lifetime fix).
-            .url = "git+https://gitlab.com/devnw/zig/thread-pool.git?ref=v0.2.9#1d7275da020a43588c4f1885f7f725d5e8ce079e",
-            .hash = "thread_pool-0.2.9-11B1Bqf7eQDfHhrQAkHk0e2ABigRBFNkFEAmc8t9raZe",
+            // LOCKSTEP with geode: geode passes its own *ThreadPool into
+            // Engine.init, so this pin must be the exact thread_pool hash geode
+            // pins. v0.2.10 carries the work-stealing data-race fixes (SONNY-6375).
+            .url = "git+https://gitlab.com/devnw/zig/thread-pool.git?ref=v0.2.10#698805259aa15131b14cac6798a9e95c64861797",
+            .hash = "thread_pool-0.2.10-11B1BgIlegC4g-vLCPiNdFo1QpYxROwDPX1U5erWrVTB",
         },
         // FIPS-140-3 backend. Resolved ONLY under -Dfips=true (lazy). Pinned
         // to the published v0.1.1 tag -- matches the wal/tls/auth/quic

@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI/CD pipeline
 - Documentation
 
+## [0.2.19] - 2026-11-12
+
+### Changed
+
+- Converge thread_pool v0.2.10, which fixes data races in the pool's
+  work-stealing queues (SONNY-6375). Geode shares `*ThreadPool` with this
+  library, so both must pin the same thread_pool revision.
+
 ## [0.2.13] - 2026-09-15
 
 ### Changed
