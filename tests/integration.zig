@@ -423,6 +423,12 @@ test "integration: P-COMP-002 L1->L2 tiered compaction triggers and cleans up L1
         }
         try eng.appendPoints(series_id, &batch);
         try eng.flush();
+        // `flush()` returns once the segment is durable; the flush worker's
+        // trailing WAL truncate and `triggerCompaction` may still be running.
+        // Let it finish before `compactAll`, or on the last round it can see
+        // the 8th L1 segment and start the L1->L2 pass before the sanity
+        // check below (wal v0.1.23 made an emptying truncate slower).
+        waitForCompactionQuiescent(&eng);
         try eng.compactAll();
         waitForCompactionQuiescent(&eng);
     }
