@@ -1,12 +1,12 @@
 .{
     .name = .timeseries_storage,
-    .version = "0.2.19",
+    .version = "0.2.20",
     .fingerprint = 0x2bf0366724c10ce7,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .wal = .{
-            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=8a17e4080f77f45c6c9169682105dc31fef7ec8d#8a17e4080f77f45c6c9169682105dc31fef7ec8d",
-            .hash = "wal-0.1.22-EqPqppQ5BwBoP4VyV5UqOInJ4UWxA3xfjxdRTfixr7j-",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=v0.1.23#e90dc1e949597cd17ec6d440820f59721c46cfe0",
+            .hash = "wal-0.1.23-EqPqpgZQBwAoa0xblHlawItWiYJwUHuPsLJskTkCehVi",
         },
         .uuid = .{
             .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=c8206cbf2f3abc756b62b9e099715c81a452a2aa#c8206cbf2f3abc756b62b9e099715c81a452a2aa",

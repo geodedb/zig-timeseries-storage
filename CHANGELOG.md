@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI/CD pipeline
 - Documentation
 
+## [0.2.20] - 2026-11-12
+
+### Changed
+
+- Converge wal v0.1.23, which keeps the LSN anchor when compaction empties
+  the log (SONNY-6424). Geode, graph-storage and raft pin the same wal
+  revision.
+
 ## [0.2.19] - 2026-11-12
 
 ### Changed
