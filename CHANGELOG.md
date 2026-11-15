@@ -15,6 +15,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI/CD pipeline
 - Documentation
 
+## [0.2.21] - 2026-11-15
+
+### Fixed
+
+- `Engine.init` no longer truncates `ts.wal` when it cannot read it
+  (SONNY-6615). A plaintext WAL opened with an encryption key, an encrypted
+  WAL opened without one, or an encrypted WAL opened with the wrong key
+  used to be truncated to zero bytes, losing every point not yet flushed.
+  The WAL is now checked read-only before the wal library opens it, and a
+  failed open leaves the file byte-for-byte intact.
+- A corrupt record in the middle of the WAL no longer silently drops the
+  valid records after it. The default `wal_recovery = .fail_closed` refuses
+  to open; `.salvage` cuts the log at the bad record, but only when a valid
+  record precedes it.
+- A genuine torn tail is still truncated, from the first bad record onward
+  only.
+
+### Added
+
+- New `WalError` (and so `EngineError`) members:
+  - `WalEncryptionMismatch`: the WAL was written in the other key mode.
+  - `WalAuthFailed`: no WAL record authenticates under the configured key.
+  - `WalCorrupted`: a corrupt record has valid records after it.
+- `WalConfig.salvage_corrupt_records` (default `false`); the engine sets it
+  from `wal_recovery = .salvage`.
+
+### Changed
+
+- Includes v0.2.19 (thread_pool v0.2.10) and v0.2.20 (wal v0.1.23), which
+  were tagged from a release branch and had not been merged to `main`.
+
 ## [0.2.20] - 2026-11-12
 
 ### Changed
