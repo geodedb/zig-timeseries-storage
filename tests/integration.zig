@@ -21,8 +21,13 @@ const std = @import("std");
 const lib = @import("timeseries_storage");
 const thread_pool = @import("thread_pool");
 
+test {
+    // SONNY-6615: WAL key-mode mismatch / torn-tail / mid-log corruption.
+    _ = @import("wal_open_safety.zig");
+}
+
 test "integration: version is defined" {
-    try std.testing.expectEqualStrings("0.2.18", lib.version);
+    try std.testing.expectEqualStrings("0.2.21", lib.version);
 }
 
 test "integration: engine append + query round-trip" {
@@ -423,6 +428,12 @@ test "integration: P-COMP-002 L1->L2 tiered compaction triggers and cleans up L1
         }
         try eng.appendPoints(series_id, &batch);
         try eng.flush();
+        // `flush()` returns once the segment is durable; the flush worker's
+        // trailing WAL truncate and `triggerCompaction` may still be running.
+        // Let it finish before `compactAll`, or on the last round it can see
+        // the 8th L1 segment and start the L1->L2 pass before the sanity
+        // check below (wal v0.1.23 made an emptying truncate slower).
+        waitForCompactionQuiescent(&eng);
         try eng.compactAll();
         waitForCompactionQuiescent(&eng);
     }
