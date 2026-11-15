@@ -304,6 +304,14 @@ pub const DurabilityMode = enum { batch, per_call };
 ///   falling back to the lossy `readFrom` path; the operator opts in
 ///   to a best-effort recovery that may drop records past the first
 ///   bad one. Intended for forensic recovery, not production use.
+///
+/// Before replay, the wal file itself is vetted (SONNY-6615). Under
+/// both policies a key-mode mismatch fails with `WalEncryptionMismatch`,
+/// a wrong key with `WalAuthFailed`, and a torn tail is truncated from
+/// the first bad record onward. A corrupt record that valid records
+/// follow fails with `WalCorrupted` under `fail_closed`; under `salvage`
+/// the log is cut at that record, provided a valid record precedes it.
+/// A failed open never modifies `ts.wal`.
 pub const WalRecoveryPolicy = enum { fail_closed, salvage };
 
 /// Background-worker error phase. Surfaces *which* worker (flush vs
@@ -995,6 +1003,9 @@ pub const Engine = struct {
             // thread the operator-provided key through. When null
             // the WAL stays plaintext, matching pre-D-9 behaviour.
             .encryption_key = config.encryption_key,
+            // SONNY-6615: `.salvage` also accepts point-in-time recovery
+            // up to a corrupt mid-log record; `.fail_closed` refuses.
+            .salvage_corrupt_records = config.wal_recovery == .salvage,
         });
         errdefer wal.deinit();
 

@@ -6,8 +6,11 @@ const Allocator = std.mem.Allocator;
 const wal_lib = @import("wal");
 const wal_record = @import("wal_record.zig");
 const fs_perm = @import("fs_perm.zig");
+const wal_precheck = @import("wal_precheck.zig");
 const WalRecord = wal_record.WalRecord;
 const TS_IDENTITY_FILE = "ts.uuid";
+const WAL_FILE = "ts.wal";
+const log = std.log.scoped(.timeseries_storage);
 
 /// Errors specific to WAL recovery and integrity checks. Module
 /// functions that can ALSO fail with allocator or file-system errors
@@ -26,12 +29,17 @@ pub const WalError = error{
     UuidMismatch,
     /// A record's payload length exceeded `MAX_WAL_PAYLOAD`.
     WalRecordTooLarge,
-};
+} || wal_precheck.PrecheckError;
 
 /// Configuration for the WAL manager.
 pub const WalConfig = struct {
     encryption_key: ?[32]u8 = null,
     create_identity_if_missing: bool = true,
+    /// Accept a corrupt record that valid records follow as the end of
+    /// the log instead of failing with `WalCorrupted`. The engine sets
+    /// this for `wal_recovery = .salvage`. Key-mode mismatches and wrong
+    /// keys always fail, whatever this is set to.
+    salvage_corrupt_records: bool = false,
 };
 
 pub const ReplayFailureKind = enum {
@@ -109,11 +117,27 @@ pub const WalManager = struct {
     ) !WalManager {
         try ensureTsIdentity(wal_dir, ts_uuid, config.create_identity_if_missing);
 
-        const inner = try wal_lib.WriteAheadLog.init(allocator, wal_dir, "ts.wal", .{
+        // SONNY-6615: the wal library truncates at the last record it can
+        // decode, which wiped the whole file on a key-mode mismatch or a
+        // wrong key. Vet the file read-only first so only a genuine torn
+        // tail reaches the library's truncation.
+        const report = try wal_precheck.check(allocator, wal_dir, WAL_FILE, .{
+            .encryption_key = if (config.encryption_key) |*key| key else null,
+            .salvage_corrupt_records = config.salvage_corrupt_records,
+        });
+
+        const inner = try wal_lib.WriteAheadLog.init(allocator, wal_dir, WAL_FILE, .{
             .encryption_key = config.encryption_key,
             .manual_sync = true,
             .checkpoint = true,
         });
+
+        if (inner.file_end != report.valid_end) {
+            log.err(
+                "ts.wal: wal library recovered to byte {d}, pre-open check expected {d}; the two record scans disagree",
+                .{ inner.file_end, report.valid_end },
+            );
+        }
 
         return WalManager{
             .allocator = allocator,
@@ -342,6 +366,10 @@ fn ensureTsIdentity(wal_dir: std.Io.Dir, ts_uuid: [16]u8, create_if_missing: boo
     }
     if (bytes_read != stored_uuid.len) return error.InvalidData;
     if (!std.mem.eql(u8, &stored_uuid, &ts_uuid)) return error.UuidMismatch;
+}
+
+test {
+    _ = wal_precheck;
 }
 
 test "append records, sync, read back" {

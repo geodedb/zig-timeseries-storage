@@ -108,6 +108,13 @@ test "root: named error sets are reachable and well-formed" {
     // The unioned EngineError must include every constituent set.
     const inherited_wal: EngineError = error.UuidMismatch;
     try std.testing.expect(inherited_wal == error.UuidMismatch);
+    // SONNY-6615: WAL open-safety errors are part of the public surface.
+    const wal_mismatch: EngineError = error.WalEncryptionMismatch;
+    try std.testing.expect(wal_mismatch == error.WalEncryptionMismatch);
+    const wal_auth: WalError = error.WalAuthFailed;
+    try std.testing.expect(wal_auth == error.WalAuthFailed);
+    const wal_corrupt: WalError = error.WalCorrupted;
+    try std.testing.expect(wal_corrupt == error.WalCorrupted);
     const inherited_seg: EngineError = error.BlockTooLarge;
     try std.testing.expect(inherited_seg == error.BlockTooLarge);
     const inherited_man: EngineError = error.ManifestTooLarge;

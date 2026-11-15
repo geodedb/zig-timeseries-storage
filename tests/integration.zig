@@ -21,6 +21,11 @@ const std = @import("std");
 const lib = @import("timeseries_storage");
 const thread_pool = @import("thread_pool");
 
+test {
+    // SONNY-6615: WAL key-mode mismatch / torn-tail / mid-log corruption.
+    _ = @import("wal_open_safety.zig");
+}
+
 test "integration: version is defined" {
     try std.testing.expectEqualStrings("0.2.20", lib.version);
 }
