@@ -6,11 +6,9 @@ const Allocator = std.mem.Allocator;
 const wal_lib = @import("wal");
 const wal_record = @import("wal_record.zig");
 const fs_perm = @import("fs_perm.zig");
-const wal_precheck = @import("wal_precheck.zig");
 const WalRecord = wal_record.WalRecord;
 const TS_IDENTITY_FILE = "ts.uuid";
 const WAL_FILE = "ts.wal";
-const log = std.log.scoped(.timeseries_storage);
 
 /// Errors specific to WAL recovery and integrity checks. Module
 /// functions that can ALSO fail with allocator or file-system errors
@@ -29,7 +27,7 @@ pub const WalError = error{
     UuidMismatch,
     /// A record's payload length exceeded `MAX_WAL_PAYLOAD`.
     WalRecordTooLarge,
-} || wal_precheck.PrecheckError;
+} || wal_lib.RecoveryError;
 
 /// Configuration for the WAL manager.
 pub const WalConfig = struct {
@@ -117,27 +115,16 @@ pub const WalManager = struct {
     ) !WalManager {
         try ensureTsIdentity(wal_dir, ts_uuid, config.create_identity_if_missing);
 
-        // SONNY-6615: the wal library truncates at the last record it can
-        // decode, which wiped the whole file on a key-mode mismatch or a
-        // wrong key. Vet the file read-only first so only a genuine torn
-        // tail reaches the library's truncation.
-        const report = try wal_precheck.check(allocator, wal_dir, WAL_FILE, .{
-            .encryption_key = if (config.encryption_key) |*key| key else null,
-            .salvage_corrupt_records = config.salvage_corrupt_records,
-        });
-
+        // SONNY-6615 / SONNY-6620: since wal v0.1.24 recovery classifies
+        // the record it stops at and fails closed (file untouched) on a
+        // key-mode mismatch, a wrong key, or a corrupt record that valid
+        // records follow; only a genuine torn tail is truncated.
         const inner = try wal_lib.WriteAheadLog.init(allocator, wal_dir, WAL_FILE, .{
             .encryption_key = config.encryption_key,
             .manual_sync = true,
             .checkpoint = true,
+            .salvage_corrupt_records = config.salvage_corrupt_records,
         });
-
-        if (inner.file_end != report.valid_end) {
-            log.err(
-                "ts.wal: wal library recovered to byte {d}, pre-open check expected {d}; the two record scans disagree",
-                .{ inner.file_end, report.valid_end },
-            );
-        }
 
         return WalManager{
             .allocator = allocator,
@@ -368,8 +355,128 @@ fn ensureTsIdentity(wal_dir: std.Io.Dir, ts_uuid: [16]u8, create_if_missing: boo
     if (!std.mem.eql(u8, &stored_uuid, &ts_uuid)) return error.UuidMismatch;
 }
 
-test {
-    _ = wal_precheck;
+// ---------------------------------------------------------------------------
+// WAL open-safety scenarios (SONNY-6615). These pinned the v0.2.21 pre-open
+// check; wal v0.1.24 now classifies recovery itself, so they run through
+// `WalManager.init`. Engine-level coverage is tests/wal_open_safety.zig.
+// ---------------------------------------------------------------------------
+
+const TEST_UUID = [_]u8{0x5C} ** 16;
+const TEST_KEY: [32]u8 = [_]u8{0x3C} ** 32;
+
+fn writeTestWal(dir: std.Io.Dir, key: ?[32]u8, payloads: []const []const u8) !void {
+    var wal = try wal_lib.WriteAheadLog.init(std.testing.allocator, dir, WAL_FILE, .{ .encryption_key = key });
+    defer wal.deinit();
+    for (payloads) |p| _ = try wal.append(p);
+}
+
+fn readTestWal(dir: std.Io.Dir) ![]u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return dir.readFileAlloc(io, WAL_FILE, std.testing.allocator, .unlimited);
+}
+
+/// Replace `ts.wal` and drop the checkpoint sidecar so the next open scans it.
+fn writeRawTestWal(dir: std.Io.Dir, bytes: []const u8) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try dir.writeFile(io, .{ .sub_path = WAL_FILE, .data = bytes });
+    dir.deleteFile(io, WAL_FILE ++ ".ckpt") catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn expectWalUnchanged(dir: std.Io.Dir, expected: []const u8) !void {
+    const after = try readTestWal(dir);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, expected, after);
+}
+
+test "WalManager: missing ts.wal opens as an empty WAL" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var mgr = try WalManager.init(std.testing.allocator, tmp.dir, TEST_UUID, 0, .{});
+    defer mgr.deinit();
+    try std.testing.expectEqual(@as(u64, 0), mgr.currentLsn());
+}
+
+test "WalManager: corrupt record found across a scan-window seam is mid-log" {
+    // Record 2 is ~1 MiB, so record 3's header straddles the end of the
+    // classifier's first 1 MiB scan window; the overlap must still find it.
+    const scan_window: usize = 1024 * 1024;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const big = try std.testing.allocator.alloc(u8, scan_window - 20);
+    defer std.testing.allocator.free(big);
+    @memset(big, 0x61);
+    try writeTestWal(tmp.dir, null, &.{ "first", big, "third" });
+
+    const bytes = try readTestWal(tmp.dir);
+    defer std.testing.allocator.free(bytes);
+    const rec2 = wal_lib.RECORD_HEADER_SIZE + wal_lib.RECORD_CRC_SIZE + "first".len;
+    bytes[rec2 + wal_lib.RECORD_HEADER_SIZE + 10] ^= 0xFF;
+    try writeRawTestWal(tmp.dir, bytes);
+
+    try std.testing.expectError(error.WalCorrupted, WalManager.init(std.testing.allocator, tmp.dir, TEST_UUID, 0, .{}));
+    try expectWalUnchanged(tmp.dir, bytes);
+
+    var mgr = try WalManager.init(std.testing.allocator, tmp.dir, TEST_UUID, 0, .{ .salvage_corrupt_records = true });
+    defer mgr.deinit();
+    try std.testing.expectEqual(@as(u64, 1), mgr.currentLsn());
+    try expectWalUnchanged(tmp.dir, bytes[0..rec2]);
+}
+
+test "WalManager: non-monotonic LSN at the end is a torn tail" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestWal(tmp.dir, null, &.{ "a", "b" });
+
+    const good = try readTestWal(tmp.dir);
+    defer std.testing.allocator.free(good);
+    var stale: [wal_lib.RECORD_HEADER_SIZE + 1 + wal_lib.RECORD_CRC_SIZE]u8 = undefined;
+    wal_lib.record.serializeInto(&stale, 1, "c");
+    const bytes = try std.mem.concat(std.testing.allocator, u8, &.{ good, &stale });
+    defer std.testing.allocator.free(bytes);
+    try writeRawTestWal(tmp.dir, bytes);
+
+    var mgr = try WalManager.init(std.testing.allocator, tmp.dir, TEST_UUID, 0, .{});
+    defer mgr.deinit();
+    try std.testing.expectEqual(@as(u64, 2), mgr.currentLsn());
+    try expectWalUnchanged(tmp.dir, good);
+}
+
+test "WalManager: plaintext frame after encrypted records is a mismatch, not a tail" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestWal(tmp.dir, TEST_KEY, &.{ "a", "b" });
+
+    const good = try readTestWal(tmp.dir);
+    defer std.testing.allocator.free(good);
+    var injected: [wal_lib.RECORD_HEADER_SIZE + 1 + wal_lib.RECORD_CRC_SIZE]u8 = undefined;
+    wal_lib.record.serializeInto(&injected, 3, "c");
+    const bytes = try std.mem.concat(std.testing.allocator, u8, &.{ good, &injected });
+    defer std.testing.allocator.free(bytes);
+    try writeRawTestWal(tmp.dir, bytes);
+
+    try std.testing.expectError(
+        error.WalEncryptionMismatch,
+        WalManager.init(std.testing.allocator, tmp.dir, TEST_UUID, 0, .{ .encryption_key = TEST_KEY }),
+    );
+    try expectWalUnchanged(tmp.dir, bytes);
+}
+
+test "WalManager: partial first record with nothing else is a torn tail" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestWal(tmp.dir, TEST_KEY, &.{"only"});
+    const bytes = try readTestWal(tmp.dir);
+    defer std.testing.allocator.free(bytes);
+    try writeRawTestWal(tmp.dir, bytes[0 .. bytes.len - 3]);
+
+    var mgr = try WalManager.init(std.testing.allocator, tmp.dir, TEST_UUID, 0, .{ .encryption_key = TEST_KEY });
+    defer mgr.deinit();
+    try std.testing.expectEqual(@as(u64, 0), mgr.currentLsn());
+    try expectWalUnchanged(tmp.dir, "");
 }
 
 test "append records, sync, read back" {

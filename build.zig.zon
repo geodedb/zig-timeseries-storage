@@ -1,12 +1,12 @@
 .{
     .name = .timeseries_storage,
-    .version = "0.2.21",
+    .version = "0.2.22",
     .fingerprint = 0x2bf0366724c10ce7,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .wal = .{
-            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=v0.1.23#e90dc1e949597cd17ec6d440820f59721c46cfe0",
-            .hash = "wal-0.1.23-EqPqpgZQBwAoa0xblHlawItWiYJwUHuPsLJskTkCehVi",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=v0.1.24#acd8f6810decf5e3a9e6c9c3056c59003b7bca36",
+            .hash = "wal-0.1.24-EqPqpuQPCABjGgoaO2lYjoNwcfM8d6Cvg04FdJTh3qkM",
         },
         .uuid = .{
             .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=c8206cbf2f3abc756b62b9e099715c81a452a2aa#c8206cbf2f3abc756b62b9e099715c81a452a2aa",
@@ -15,9 +15,10 @@
         .thread_pool = .{
             // LOCKSTEP with geode: geode passes its own *ThreadPool into
             // Engine.init, so this pin must be the exact thread_pool hash geode
-            // pins. v0.2.10 carries the work-stealing data-race fixes (SONNY-6375).
-            .url = "git+https://gitlab.com/devnw/zig/thread-pool.git?ref=v0.2.10#698805259aa15131b14cac6798a9e95c64861797",
-            .hash = "thread_pool-0.2.10-11B1BgIlegC4g-vLCPiNdFo1QpYxROwDPX1U5erWrVTB",
+            // pins. v0.2.10 carries the work-stealing data-race fixes (SONNY-6375);
+            // v0.2.11 (SONNY-6479) is the revision geode and wal v0.1.24 pin.
+            .url = "git+https://gitlab.com/devnw/zig/thread-pool.git?ref=v0.2.11#666b7ac0cc8b92d5773df5e79ea4fd421bd77e99",
+            .hash = "thread_pool-0.2.11-11B1Bk2GegC5mn18xNrkmF0lMrgrWqijO7PXmftrkuSe",
         },
         // FIPS-140-3 backend. Resolved ONLY under -Dfips=true (lazy). Pinned
         // to the published v0.1.1 tag -- matches the wal/tls/auth/quic

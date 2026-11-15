@@ -24,10 +24,14 @@ const thread_pool = @import("thread_pool");
 test {
     // SONNY-6615: WAL key-mode mismatch / torn-tail / mid-log corruption.
     _ = @import("wal_open_safety.zig");
+    // SONNY-6622: a refused post-flush WAL compaction is non-fatal.
+    _ = @import("wal_compaction_refusal.zig");
+    // SONNY-6623: Engine closes its WAL directory handle.
+    _ = @import("engine_descriptors.zig");
 }
 
 test "integration: version is defined" {
-    try std.testing.expectEqualStrings("0.2.21", lib.version);
+    try std.testing.expectEqualStrings("0.2.22", lib.version);
 }
 
 test "integration: engine append + query round-trip" {
