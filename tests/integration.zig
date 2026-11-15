@@ -24,6 +24,8 @@ const thread_pool = @import("thread_pool");
 test {
     // SONNY-6615: WAL key-mode mismatch / torn-tail / mid-log corruption.
     _ = @import("wal_open_safety.zig");
+    // SONNY-6622: a refused post-flush WAL compaction is non-fatal.
+    _ = @import("wal_compaction_refusal.zig");
 }
 
 test "integration: version is defined" {

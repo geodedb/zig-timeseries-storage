@@ -15,6 +15,7 @@ const compaction = @import("compaction.zig");
 const safety = @import("safety.zig");
 const thread_pool = @import("thread_pool");
 const wal_record = @import("wal_record.zig");
+const log = std.log.scoped(.timeseries_storage);
 
 /// Number of level-0 segments that triggers a compaction job.
 /// Chosen to match the level-0 fan-in used by typical LSM designs;
@@ -688,6 +689,14 @@ pub const StatsSnapshot = struct {
     /// via the background error pipeline. Bumps on every recorded
     /// failure, NOT every read attempt.
     segment_integrity_failures: u64,
+    /// Number of post-flush WAL compactions the wal library refused
+    /// (`WalEncryptionMismatch` / `WalAuthFailed` / `WalCorrupted`)
+    /// because some byte of `ts.wal` is not part of a valid record.
+    /// Non-fatal (SONNY-6622): the flush is durable, the WAL file is
+    /// untouched and stays usable, and the next open reports or (for a
+    /// torn tail) truncates the damage. A non-zero value means the WAL
+    /// is not being reclaimed and should be investigated.
+    wal_compactions_refused: u64 = 0,
 };
 
 /// Internal, lock-free counter storage for `Engine`. Each field
@@ -718,6 +727,7 @@ pub const EngineCounters = struct {
 
     wal_records_dropped: std.atomic.Value(u64) = .init(0),
     segment_integrity_failures: std.atomic.Value(u64) = .init(0),
+    wal_compactions_refused: std.atomic.Value(u64) = .init(0),
 
     /// Snapshot every field into a plain-`u64` `StatsSnapshot`.
     /// Each load is `.acquire`; the resulting snapshot is internally
@@ -738,6 +748,7 @@ pub const EngineCounters = struct {
             .compaction_total_ns = self.compaction_total_ns.load(.acquire),
             .wal_records_dropped = self.wal_records_dropped.load(.acquire),
             .segment_integrity_failures = self.segment_integrity_failures.load(.acquire),
+            .wal_compactions_refused = self.wal_compactions_refused.load(.acquire),
         };
     }
 };
@@ -2134,10 +2145,27 @@ pub const Engine = struct {
         // does not double-bump the counters we already incremented
         // and does not try to deinit `flushing_mem` (which we
         // already cleared inside the lock).
-        self.wal.truncate(checkpoint_lsn) catch |err| {
-            self.mu.lockUncancelable(io);
-            self.recordBackgroundErrorLocked(.flush, err);
-            self.mu.unlock(io);
+        //
+        // SONNY-6622: wal v0.1.24 compaction validates the whole log and
+        // refuses, leaving the file untouched and the WAL reopened at its
+        // last valid record, when any byte is not part of a valid record.
+        // That is not a flush failure: the records it would drop are in
+        // the segment and behind the manifest checkpoint, and appends keep
+        // working. Count and log it instead of reporting a background
+        // error; the next open reports or (torn tail) truncates the damage.
+        self.wal.truncate(checkpoint_lsn) catch |err| switch (err) {
+            error.WalEncryptionMismatch, error.WalAuthFailed, error.WalCorrupted => {
+                _ = self.counters.wal_compactions_refused.fetchAdd(1, .release);
+                log.warn(
+                    "ts.wal compaction up to LSN {d} refused after flush ({s}); the WAL is unchanged and stays usable, but is not reclaimed until the damage is repaired",
+                    .{ checkpoint_lsn, @errorName(err) },
+                );
+            },
+            else => {
+                self.mu.lockUncancelable(io);
+                self.recordBackgroundErrorLocked(.flush, err);
+                self.mu.unlock(io);
+            },
         };
 
         self.triggerCompaction() catch |err| {
