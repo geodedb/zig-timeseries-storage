@@ -15,6 +15,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI/CD pipeline
 - Documentation
 
+## [0.2.22] - 2026-11-15
+
+### Fixed
+
+- `Engine` no longer leaks a descriptor on its data directory
+  (SONNY-6623). `Engine.init` opened `data_dir` for the WAL and the wal
+  library only borrows it; `Engine.deinit` now closes it after the WAL is
+  torn down, and `Engine.init` closes it if it fails after the open.
+  Embedders that closed `eng.wal.inner.dir` themselves must stop doing so.
+- A WAL compaction that the wal library refuses after a flush
+  (`WalEncryptionMismatch` / `WalAuthFailed` / `WalCorrupted`) is no longer
+  reported as a flush background error or through `error_callback`
+  (SONNY-6622). The flush is durable and the WAL file is unchanged and
+  stays usable. The refusal is logged and counted.
+
+### Added
+
+- `StatsSnapshot.wal_compactions_refused` (default `0`): post-flush WAL
+  compactions the wal library refused.
+
+### Changed
+
+- wal v0.1.24 (SONNY-6620). Its recovery and compaction fail closed with
+  `WalEncryptionMismatch`, `WalAuthFailed` and `WalCorrupted` and leave the
+  file untouched, and it adds opt-in `salvage_corrupt_records`. The
+  pre-open check added in 0.2.21 (`src/wal_precheck.zig`) is removed in
+  favour of the library's; behaviour, error names and
+  `WalConfig.salvage_corrupt_records` are unchanged. `WalError` now unions
+  `wal.RecoveryError`.
+- thread_pool v0.2.11, the revision wal v0.1.24 and geode pin.
+
 ## [0.2.21] - 2026-11-15
 
 ### Fixed
