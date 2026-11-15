@@ -26,6 +26,8 @@ test {
     _ = @import("wal_open_safety.zig");
     // SONNY-6622: a refused post-flush WAL compaction is non-fatal.
     _ = @import("wal_compaction_refusal.zig");
+    // SONNY-6623: Engine closes its WAL directory handle.
+    _ = @import("engine_descriptors.zig");
 }
 
 test "integration: version is defined" {

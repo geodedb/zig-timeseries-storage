@@ -1006,7 +1006,11 @@ pub const Engine = struct {
         // and publish them atomically.
         try man.publishInitialSnapshot();
 
+        // SONNY-6623: the engine owns this handle (the wal library only
+        // borrows it); `deinit` closes it after `wal.deinit`. errdefer
+        // order is LIFO, so on a later failure `wal.deinit` runs first.
         const wal_dir = try std.Io.Dir.cwd().openDir(io, config.data_dir, .{});
+        errdefer wal_dir.close(io);
         var wal = try wal_manager.WalManager.init(allocator, wal_dir, man.ts_uuid, man.last_checkpoint_lsn, .{
             .create_identity_if_missing = config.create_identity_if_missing,
             // Closes SEC-006 / partial GAP-0001 (WAL portion only).
@@ -1414,7 +1418,12 @@ pub const Engine = struct {
         // internal mutex — safe under engine.mu.
         self.wal.sync() catch {};
 
+        // SONNY-6623: `init` opened `data_dir` for the WAL and the wal
+        // library only borrows it. Close it after `wal.deinit`, which
+        // still writes the checkpoint sidecar through it.
+        const wal_dir = self.wal.inner.dir;
         self.wal.deinit();
+        wal_dir.close(io);
         self.man.deinit();
         // P-LOCK-005: heap-allocated active memtable. Tear down the
         // value AND free the allocation. The flushing slot should
