@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI/CD pipeline
 - Documentation
 
+## [0.2.24] - 2026-11-16
+
+### Changed
+
+- wal v0.1.25 -> v0.1.26 and uuid (untagged `c8206cb`) -> v0.1.10, which
+  carry otel v0.1.29 and json v0.1.21, so timeseries-storage and its
+  consumers resolve a single thread-pool (SONNY-6630).
+
 ## [0.2.23] - 2026-11-15
 
 ### Fixed

@@ -1,16 +1,16 @@
 .{
     .name = .timeseries_storage,
-    .version = "0.2.23",
+    .version = "0.2.24",
     .fingerprint = 0x2bf0366724c10ce7,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .wal = .{
-            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=v0.1.25#eca478cae4784f4dc311acab31659beaea065508",
-            .hash = "wal-0.1.25-EqPqpqU_CACws_QxxCu906MZjIvJFGLkRmXHvLAY_i4U",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=v0.1.26#0c94adb032b85de62cc0a22d40123f8c0211449c",
+            .hash = "wal-0.1.26-EqPqpqU_CAD6CHg4JLglN6xzhhoDxfIlhh9mM95NcQBl",
         },
         .uuid = .{
-            .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=c8206cbf2f3abc756b62b9e099715c81a452a2aa#c8206cbf2f3abc756b62b9e099715c81a452a2aa",
-            .hash = "uuid-0.1.9-tL1iruPmHAAJ2ebApUBKroge9t-yDmrcPJ-2A2FEduNj",
+            .url = "git+https://gitlab.com/devnw/zig/uuid.git?ref=v0.1.10#5547a8a0d86c67315d292f81411f6237ee61cf5c",
+            .hash = "uuid-0.1.10-tL1iroznHACRKPV4rc3sSf8tJtvHw8VfF-Btd4F1giHh",
         },
         .thread_pool = .{
             // LOCKSTEP with geode: geode passes its own *ThreadPool into
