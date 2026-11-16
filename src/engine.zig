@@ -4165,6 +4165,56 @@ test "Engine: batch durability mode background syncer drains the WAL (P-IO-002)"
     try eng.sync();
 }
 
+test "Engine: idle batch syncer does not fdatasync an unchanged WAL (SONNY-6634)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const data_dir = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(data_dir);
+
+    var pool = try thread_pool.ThreadPool.init(allocator, .{ .max_threads = 1 });
+    defer pool.deinit();
+
+    var eng = try Engine.init(allocator, .{
+        .data_dir = data_dir,
+        .max_memtable_points = 1_000_000,
+        .durability_mode = .batch,
+        .wal_sync_interval_ms = 5,
+    }, &pool);
+    defer eng.deinit();
+
+    try eng.startBackgroundSyncer();
+    const idle_ns = 100 * std.time.ns_per_ms;
+
+    // The first tick syncs whatever the open recovered (at most one fdatasync).
+    try waitForSyncCount(&eng, 1);
+
+    // About 20 more ticks with nothing written: no further fdatasync.
+    std.Io.sleep(io, .{ .nanoseconds = idle_ns }, .awake) catch {};
+    try std.testing.expectEqual(@as(u64, 1), eng.wal.syncCount());
+
+    // A write is still made durable by the next tick.
+    try eng.appendPoints(1, &.{.{ .ts = 1, .value = 1 }});
+    try waitForSyncCount(&eng, 2);
+
+    // Idle again: the count stays put.
+    std.Io.sleep(io, .{ .nanoseconds = idle_ns }, .awake) catch {};
+    try std.testing.expectEqual(@as(u64, 2), eng.wal.syncCount());
+}
+
+/// Poll (up to 5 s) until the WAL has been synced `want` times, then
+/// assert it was synced exactly that many times.
+fn waitForSyncCount(eng: *Engine, want: u64) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var waited_ms: u32 = 0;
+    while (eng.wal.syncCount() < want and waited_ms < 5_000) : (waited_ms += 5) {
+        std.Io.sleep(io, .{ .nanoseconds = 5 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    try std.testing.expectEqual(want, eng.wal.syncCount());
+}
+
 test "Engine: stats counters increment on append, query, flush, compaction (P-OBS-001)" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
