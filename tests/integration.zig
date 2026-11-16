@@ -31,7 +31,7 @@ test {
 }
 
 test "integration: version is defined" {
-    try std.testing.expectEqualStrings("0.2.23", lib.version);
+    try std.testing.expectEqualStrings("0.2.24", lib.version);
 }
 
 test "integration: engine append + query round-trip" {
