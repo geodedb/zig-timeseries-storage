@@ -15,6 +15,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI/CD pipeline
 - Documentation
 
+## [0.2.23] - 2026-11-15
+
+### Fixed
+
+- The batch-mode WAL syncer no longer fdatasyncs an unchanged `ts.wal`
+  every `wal_sync_interval_ms` (about ten times a second at the default
+  100 ms) (SONNY-6634). `WalManager.sync()` now skips the fdatasync when
+  nothing was appended since the last successful one; the first sync
+  after open still runs, and a failed sync is retried on the next tick.
+
+### Added
+
+- `WalManager.syncCount()`: the number of fdatasyncs issued against
+  `ts.wal`.
+
 ## [0.2.22] - 2026-11-15
 
 ### Fixed
