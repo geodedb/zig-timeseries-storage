@@ -105,6 +105,14 @@ pub const WalManager = struct {
     /// `*Locked` helpers (e.g. `syncLocked`); public methods take
     /// the lock and delegate.
     mu: std.Io.Mutex = std.Io.Mutex.init,
+    /// Set by every append and cleared only by a successful sync, so
+    /// `sync` can skip the fdatasync when nothing was written since the
+    /// last one (SONNY-6634). `init` starts it set so the first sync
+    /// after open still covers records recovered from a previous run.
+    /// Guarded by `mu`.
+    unsynced: bool = true,
+    /// Number of fdatasyncs issued against `ts.wal` (SONNY-6634).
+    sync_count: std.atomic.Value(u64) = .init(0),
 
     pub fn init(
         allocator: Allocator,
@@ -154,6 +162,8 @@ pub const WalManager = struct {
     /// `self.mu`. Exists so future intra-manager call sites can
     /// chain without re-acquiring the lock.
     fn appendRecordLocked(self: *WalManager, record: *WalRecord) !u64 {
+        // Before the write: a failed append may still have written bytes.
+        self.unsynced = true;
         self.current_lsn += 1;
         record.lsn = self.current_lsn;
 
@@ -171,7 +181,8 @@ pub const WalManager = struct {
         }
     }
 
-    /// Force an fsync against the underlying WAL file.
+    /// Force an fsync against the underlying WAL file. A no-op when
+    /// nothing was appended since the last successful sync.
     ///
     /// Concurrency: takes `self.mu`. Safe to call concurrently with
     /// other `WalManager` methods.
@@ -184,7 +195,15 @@ pub const WalManager = struct {
 
     /// Mutex-held variant of `sync`. Caller MUST hold `self.mu`.
     fn syncLocked(self: *WalManager) !void {
+        if (!self.unsynced) return;
         try self.inner.sync();
+        self.unsynced = false;
+        _ = self.sync_count.fetchAdd(1, .monotonic);
+    }
+
+    /// Number of fdatasyncs this manager has issued against `ts.wal`.
+    pub fn syncCount(self: *const WalManager) u64 {
+        return self.sync_count.load(.monotonic);
     }
 
     pub fn readFrom(self: *WalManager, start_lsn: u64, allocator: Allocator) ![]WalRecord {
@@ -477,6 +496,37 @@ test "WalManager: partial first record with nothing else is a torn tail" {
     defer mgr.deinit();
     try std.testing.expectEqual(@as(u64, 0), mgr.currentLsn());
     try expectWalUnchanged(tmp.dir, "");
+}
+
+test "WalManager: sync skips the fdatasync when nothing was appended since the last one (SONNY-6634)" {
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var mgr = try WalManager.init(allocator, tmp_dir.dir, [_]u8{0xAB} ** 16, 0, .{});
+    defer mgr.deinit();
+
+    // The first sync after open covers whatever recovery found; after
+    // that an unchanged WAL has nothing to make durable.
+    try mgr.sync();
+    try mgr.sync();
+    try mgr.sync();
+    try std.testing.expectEqual(@as(u64, 1), mgr.syncCount());
+
+    var rec = WalRecord{ .lsn = 0, .record_type = .append_points, .payload = "p", .checksum = 0 };
+    _ = try mgr.appendRecord(&rec);
+    try mgr.sync();
+    try std.testing.expectEqual(@as(u64, 2), mgr.syncCount());
+
+    // Nothing written since: the repeat syncs are skipped.
+    try mgr.sync();
+    try mgr.sync();
+    try std.testing.expectEqual(@as(u64, 2), mgr.syncCount());
+
+    _ = try mgr.appendRecord(&rec);
+    _ = try mgr.appendRecord(&rec);
+    try mgr.sync();
+    try std.testing.expectEqual(@as(u64, 3), mgr.syncCount());
 }
 
 test "append records, sync, read back" {
