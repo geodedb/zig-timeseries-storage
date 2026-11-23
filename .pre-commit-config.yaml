@@ -36,7 +36,7 @@ repos:
 
   # Markdown linting
 - repo: https://github.com/igorshubovych/markdownlint-cli
-  rev: v0.50.0
+  rev: v0.50.1
   hooks:
   - id: markdownlint
     args: [--config, .markdownlint.json]
@@ -52,7 +52,7 @@ repos:
 
   # Conventional commits
 - repo: https://github.com/commitizen-tools/commitizen
-  rev: v4.19.3
+  rev: v4.19.4
   hooks:
   - id: commitizen
     stages: [commit-msg]
